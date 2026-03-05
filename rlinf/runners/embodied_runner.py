@@ -280,7 +280,7 @@ class EmbodiedRunner:
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
 
     def set_max_steps(self):
-        self.num_steps_per_epoch = 1
+        self.num_steps_per_epoch = 1 #@# global step 数就是 epoch 数
         self.max_steps = self.num_steps_per_epoch * self.cfg.runner.max_epochs
 
         if (max_steps := self.cfg.runner.get("max_steps", -1)) >= 0:
