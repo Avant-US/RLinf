@@ -23,15 +23,15 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "isaaclab_ppo_gr00t_demo"
+    experiment_name: "isaaclab_ppo_gr00t_demo_001"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 10
+  max_epochs: 1000
   max_steps: -1
 
   only_eval: False
-  val_check_interval: -1
-  save_interval: 20
+  val_check_interval: 200
+  save_interval: 200
   seq_length: 4096
   max_prompt_length: 30
 
@@ -90,13 +90,13 @@ env:
 
   # Override the default values in env/isaaclab_stack_cube
   train:
-    total_num_envs: 16
+    total_num_envs: 64
     max_episode_steps: 448
     max_steps_per_rollout_epoch: 448
     use_fixed_reset_state_ids: True
 
   eval:
-    total_num_envs: 16
+    total_num_envs: 32
     max_episode_steps: 448
     max_steps_per_rollout_epoch: 448
     auto_reset: True
@@ -120,8 +120,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 16
-  global_batch_size: 16
+  micro_batch_size: 32
+  global_batch_size: 512
   seed: 1234
   enable_offload: False
 
