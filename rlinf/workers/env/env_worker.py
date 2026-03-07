@@ -90,7 +90,7 @@ class EnvWorker(Worker):
             )
         self.log_info(f"Env worker initialized with dst_ranks: {self.dst_ranks}")
         self.log_info(f"Env worker initialized with src_ranks: {self.src_ranks}")
-        train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
+        train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train) #@#
         eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
 
         # This is a barrier to ensure all envs' initial setup upon import is done
@@ -137,7 +137,7 @@ class EnvWorker(Worker):
             ):
                 from rlinf.envs.wrappers import CollectEpisode
 
-                env = CollectEpisode(
+                env = CollectEpisode( #@# 用于收集在仿真环境训练时产生的数据,见https://rlinf.readthedocs.io/zh-cn/latest/rst_source/tutorials/components/data_collection.html
                     env,
                     save_dir=env_cfg.data_collection.save_dir,
                     rank=self._rank,

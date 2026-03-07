@@ -67,7 +67,7 @@ class IsaaclabStackCubeEnv(IsaaclabBaseEnv):
 
             env = gym.make(
                 self.isaaclab_env_id, cfg=isaac_env_cfg, render_mode="rgb_array"
-            ).unwrapped
+            ).unwrapped #@# 该env来自 /opt/venv/gr00t/isaaclab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/stack/config/franka/__init__.py 中的 `entry_point="isaaclab.envs:ManagerBasedRLEnv"`即 /opt/venv/gr00t/isaaclab/source/isaaclab/isaaclab/envs/manager_based_rl_env.py,也就是IsaacLab对接 gym.Env 的实现类之一
             return env, sim_app
 
         return make_env_isaaclab
