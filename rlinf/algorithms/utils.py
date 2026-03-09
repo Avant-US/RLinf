@@ -79,7 +79,7 @@ def preprocess_embodied_advantages_inputs(
     if kwargs["reward_type"] == "chunk_level":
         # TODO: need check
         # rewards, dones, loss_mask, loss_mask_sum: [n_chunk_steps, bsz, num_action_chunks] -> [n_chunk_steps, bsz, 1]
-        rewards = rewards.sum(dim=-1, keepdim=True)
+        rewards = rewards.sum(dim=-1, keepdim=True) #@# 按 chunk 汇总reward
         dones = dones.max(dim=-1, keepdim=True)[0]
         if loss_mask is not None:
             loss_mask = loss_mask.max(dim=-1, keepdim=True)[0]
@@ -326,7 +326,7 @@ def preprocess_loss_inputs(
 
     elif logprob_type == "chunk_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz]
-        logprobs = logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
+        logprobs = logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2]) #@# 按 chunk 汇总 logprob
         old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
         if proximal_logprobs is not None:
             proximal_logprobs = proximal_logprobs.reshape(
