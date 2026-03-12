@@ -15,7 +15,7 @@ _**Agent (model gpt-5.4-medium, mode Agent)**_
 <think><details><summary>Thought Process</summary>
 The user is asking me to explain the RLPD (Reinforcement Learning with Prior Data) algorithm mentioned in the Franka documentation. Let me first read the file to understand the context.</details></think>
 
----
+<!---
 
 <tool-use data-tool-type="read" data-tool-name="read_file_v2">
 <details><summary>Tool use: **read_file_v2** • Read file: /home/luogang/SRC/RL/RLinf/docs/source-zh/rst_source/examples/embodied/franka.rst</summary>
@@ -23,7 +23,7 @@ The user is asking me to explain the RLPD (Reinforcement Learning with Prior Dat
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 The user is asking me to explain the RLPD (Reinforcement Learning with Prior Data) algorithm mentioned in the Franka document. Let me look at the relevant section and also search for more implementation details in the codebase.</details></think>
@@ -32,7 +32,7 @@ The user is asking me to explain the RLPD (Reinforcement Learning with Prior Dat
 
 让我进一步查看代码库中 RLPD 的实现细节，以便给出更完整的解释。
 
----
+<!---
 
 <tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
 <details>
@@ -177,7 +177,7 @@ Status: **completed**
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 Now I have a good understanding of RLPD from the documentation. Let me also check if there's the original RLPD config file to provide more context.</details></think>
@@ -265,7 +265,7 @@ _**User**_
 
 请解释一下  SAC（Soft Actor-Critic）算法
 
----
+<!---
 
 _**Agent (model gpt-5.4-medium, mode Agent)**_
 
@@ -283,7 +283,7 @@ _**Agent (model gpt-5.4-medium, mode Agent)**_
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 The user is asking me to explain the SAC (Soft Actor-Critic) algorithm. I have the Chinese documentation from RLinf. Let me provide a comprehensive explanation based on the docs and my knowledge.</details></think>
@@ -601,7 +601,7 @@ Status: **completed**
 </details>
 </tool-use>
 
----
+<!---
 
 <tool-use data-tool-type="read" data-tool-name="read_file_v2">
 <details><summary>Tool use: **read_file_v2** • Read file: /home/luogang/SRC/RL/RLinf/examples/embodiment/config/realworld_peginsertion_rlpd_cnn_async.yaml</summary>
@@ -649,7 +649,7 @@ Status: **completed**
 </details>
 </tool-use>
 
----
+--->
 
 <tool-use data-tool-type="task" data-tool-name="todo_write">
 <details><summary>Tool use: **todo_write** • Todo List</summary>
@@ -1264,7 +1264,7 @@ Using ReadFile to inspect the core files for exact lines sounds like a plan. I m
 
 我已经确认：仓库里没有一个显式命名为 `HIL-SERL` 的完整算法入口，但已经具备它最关键的人在环机制。接下来我补齐论文细节和本仓库的关键代码点，整理成“论文机制 -> RLinf 实现 -> 使用方式/扩展方案”的对应说明。
 
----
+<!---
 
 <tool-use data-tool-type="unknown" data-tool-name="web_fetch">
 <details>
@@ -1361,14 +1361,14 @@ Status: **completed**
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 **Investigating RLinf and HIL-SERL**
 
 I need to look into the `collect_real_data.py` and the config file to understand how RLinf implements HIL-SERL. It's important to check if a reward classifier exists since HIL-SERL uses a binary classifier. The user’s asking how RLinf implements this, so I'll note that it might not have a full HIL-SERL since there's no reward classifier pipeline. Maybe I should inspect the reward usage in the real-world environment config and consider using a dense reward or keyboard wrapper.</details></think>
 
----
+<!---
 
 <tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
 <details>
@@ -1461,7 +1461,7 @@ Status: **completed**
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 **Structuring reward classifier details**
@@ -1471,7 +1471,7 @@ I need to check if any reward classifier pipeline is missing or if there are no 
 
 I need to evaluate several key components of the HIL-SERL paper. It includes a pretrained vision backbone and partially RLPD-based off-policy with demos and corrections. There are human interventions and teleoperation. However, the existence of a binary classifier reward is unclear. It seems there isn't an explicit separate gripper critic or DQN for discrete grasping, and the safety low-level controller might apply to the Franka controller. I may note the absence of these elements and search for relevant terms like "gripper critic" or "DQN" in real-world applications.</details></think>
 
----
+<!---
 
 <tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
 <details>
@@ -1637,14 +1637,14 @@ Status: **completed**
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 **Exploring pretrained backbone**
 
 I think I need to take a closer look at the ResNet utilities to confirm that a pretrained backbone is available. It's essential for my analysis and understanding. Maybe if I read a small section, I'll have a clearer idea of how to utilize it effectively. It’s always interesting to explore these tools and see how they can enhance my work! Let's dive into that and see what I find.</details></think>
 
----
+<!---
 
 <tool-use data-tool-type="read" data-tool-name="read_file_v2">
 <details><summary>Tool use: **read_file_v2** • Read file: /home/luogang/.cursor/worktrees/RLinf__SSH__34.56.5.164_/pdi/rlinf/models/embodiment/modules/resnet_utils.py</summary>
@@ -1668,14 +1668,14 @@ I think I need to take a closer look at the ResNet utilities to confirm that a p
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 **Inspecting reward wrapper config**
 
 I need to take a closer look at the real-world environment wrapper configuration. It seems that the keyboard reward wrapper suggests it might be using human-labeled rewards instead of a classifier. I should search for "keyboard_reward_wrapper" to gather more information. This way, I can better understand how the rewards are structured and make any necessary adjustments. Let's clarify this before moving forward!</details></think>
 
----
+<!---
 
 <tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
 <details>
@@ -1846,7 +1846,7 @@ Status: **completed**
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 **Evaluating the algorithm implementation**
@@ -2293,7 +2293,7 @@ The user is asking me to explain the RLPD (Reinforcement Learning with Prior Dat
 
 让我进一步查看代码库中 RLPD 的实现细节，以便给出更完整的解释。
 
----
+<!---
 
 <tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
 <details>
@@ -2438,7 +2438,7 @@ Status: **completed**
 </details>
 </tool-use>
 
----
+--->
 
 <think><details><summary>Thought Process</summary>
 Now I have a good understanding of RLPD from the documentation. Let me also check if there's the original RLPD config file to provide more context.</details></think>
