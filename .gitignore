@@ -20,3 +20,8 @@ uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
+
+#@#
+ckpt_*
+lerobot/
+starVLA/
