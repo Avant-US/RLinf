@@ -122,3 +122,6 @@ See [AGENTS.md](AGENTS.md) for detailed step-by-step instructions on adding new 
 - [AGENTS.md](AGENTS.md) — Detailed codebase layout and extension guide
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Full code style, commit/PR flow, review process
 - [Official docs](https://rlinf.readthedocs.io/)
+
+## Design Overview
+请参考 RLinf 的论文 `@bt/docs/ov/RLinf Flexible and Efficient Large-scale Reinforcement Learning via Macro-to-Micro Flow Transformation.pdf`, 参考 RLinf 的官网 https://rlinf.readthedocs.io/zh-cn/latest/index.html, 参考 @docs/ 中的各个文档, 也可参考网上与 RLinf 相关的文章与讨论. 参考官方github(https://github.com/RLinf/RLinf)中的Issues, Commits, Pull requests 和 Disscussions 等等. 重要的是要以深入分析本地的 RLinf 代码库(/home/Luogang/SRC/RL/RLinf)为基础, 以本地代码为准, 对 RLinf 的设计架构与实现进行分析, 分析要紧密结合机器人行业和强化学习, 要考虑到软件工程的方方面面, 要写得比它的论文和官方文档都要好(比如考虑更周到, 细致, 方案更好更有可行性等等), 要图文并茂(比如要有架构图,各种UML图,mermaid等等). 关于RLinf的设计分析写在 @bt/docs/ov/RLinf_Architecture_and_Design2.md 中.
