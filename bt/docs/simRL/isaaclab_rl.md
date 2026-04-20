@@ -5327,6 +5327,719 @@ collocated 下 `actor_split_num = compute_split_num(recv=8, send=8*1) = 1`，每
 
 ---
 
+## 附录 D：新增机器人 + 新 RL 任务的三层栈完整路径
+
+> **范围界定**：本附录专攻"**全新机器人 + 基于该机器人的全新 RL 任务**"场景（例如引入 **UR10e + Robotiq 2F-85** 做 peg-insertion）。若只是**新任务复用已有机器人**（Franka / UR10 / G1 等 `isaaclab_assets` 已支持的型号），应使用 §18，本附录只作补充。
+>
+> 与 §18 的差异化对照：
+>
+> | 关注点 | §18 | 附录 D |
+> |---|---|---|
+> | 前提 | 机器人已在 `isaaclab_assets` 中 | 机器人**不在**其中，或其关节/执行器/末端需要改 |
+> | Isaac Sim 侧 | `source setup_conda_env.sh` 即可 | URDF → USD、PhysX 质量/惯量、关节限位、末端坐标系 |
+> | IsaacLab 侧 | 六件套 configclass + `gym.register` | 新增 `ArticulationCfg` + `ActuatorCfg`、IK `body_name` 匹配 |
+> | RLinf 侧 | `_wrap_obs` 对齐已有 obs schema | `action_dim` / state 组成若变 → 改 `action_utils.py`、OpenPI policy、dataconfig、model yaml |
+
+---
+
+### D.1 贯穿示例与顶层路径
+
+**示例任务 ID**：`Isaac-PegInsert-UR10e-IK-Rel-v0`
+
+- **机器人**：6-DOF UR10e（Universal Robots，不在 `isaaclab_assets` 的 Franka/UR10 缺省列表中需要新增 v2.3.2 确认的仅 UR10/UR10e 视具体 fork）。
+- **末端执行器**：Robotiq 2F-85 二指夹爪（非 Isaac Sim 官方 asset，需要独立 URDF + 组合）。
+- **任务**：把圆柱 peg 插入孔位；稀疏终止奖励；IK 相对增量控制；action 维度 6+1=**7D（复用 RLinf π0.5 checkpoint 的维度）**。
+
+#### D.1.1 顶层路径：从 URDF 文件一路"下降"到 RLinf 训练
+
+```mermaid
+flowchart TB
+    subgraph DA["D.2 Isaac Sim 侧"]
+        direction TB
+        U1["URDF / MJCF / OnShape<br/>(ur10e.urdf.xacro + 2f85.urdf)"]
+        U2["xacro + 合并成完整 URDF"]
+        U3["URDF Importer<br/>(isaacsim.asset.importer.urdf)"]
+        U4["ur10e_robotiq.usd<br/>(Articulation prim tree)"]
+        U5["GUI / Python 调参<br/>joint drive, collision, fix_base"]
+        U6["挂末端坐标系 + 腕部相机"]
+        U7["最终 USD 文件<br/>(本地或 Nucleus)"]
+        U1 --> U2 --> U3 --> U4 --> U5 --> U6 --> U7
+    end
+
+    subgraph DB["D.3 IsaacLab 侧"]
+        direction TB
+        L1["isaaclab_assets/robots/ur10e_robotiq.py<br/>UR10E_ROBOTIQ_CFG: ArticulationCfg"]
+        L2["ActuatorCfg (Implicit / IdealPD)<br/>stiffness / damping"]
+        L3["任务 SceneCfg.robot =<br/>UR10E_ROBOTIQ_CFG.replace(...)"]
+        L4["ActionsCfg: IK-Rel<br/>body_name='wrist_3_link'<br/>joint_names=['shoulder_.*','elbow_.*','wrist_.*']"]
+        L5["ObservationsCfg.PolicyCfg<br/>(对齐 RLinf _wrap_obs)"]
+        L6["gym.register(id='Isaac-PegInsert-UR10e-IK-Rel-v0')"]
+        L7["./isaaclab.sh --install 重装"]
+        L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
+        U7 -.usd_path.-> L1
+    end
+
+    subgraph DC["D.4 RLinf 侧"]
+        direction TB
+        R1["rlinf/envs/isaaclab/tasks/peg_insert_ur10e.py<br/>IsaaclabPegInsertUR10eEnv"]
+        R2["REGISTER_ISAACLAB_ENVS +1"]
+        R3["action_utils.prepare_actions_for_isaaclab<br/>(若语义变需加分支)"]
+        R4["openpi/policies/isaaclab_ur10e_policy.py<br/>IsaacLabUR10eOutputs"]
+        R5["openpi/dataconfig/<br/>+ 重算 norm_stats"]
+        R6["env yaml + 顶层 yaml"]
+        R7["bash run_embodiment.sh"]
+        L6 -.task_id.-> R1
+        R1 --> R2 --> R3 --> R4 --> R5 --> R6 --> R7
+    end
+```
+
+与 §18.12 的三层拓扑互补：§18.12 讲"**层**"（谁管什么），本图讲"**流**"（谁先谁后）。
+
+#### D.1.2 本附录回答的三个问题
+
+1. **Isaac Sim 侧**：从 URDF 怎么变成可被 IsaacLab 加载的 USD？调参要调哪些？—— §D.2。
+2. **IsaacLab 侧**：新机器人需要写哪个 Python 文件？IK 怎么接？任务如何复用 `ManagerBasedRLEnv`？—— §D.3。
+3. **RLinf 侧**：动作/状态维度改变时，哪些文件被连锁修改？模型 checkpoint 如何复用？—— §D.4。
+
+**§D.5** 给出完整时序图，**§D.6** 给出 19 步 Checklist，**§D.7** 列出机器人特有踩坑，**§D.8** 列出外部参考。
+
+---
+
+### D.2 Isaac Sim 侧：机器人资产工程（v5.1.0）
+
+本节是 §18.13.2 (A) 的**深化展开**。对"新机器人"场景，Isaac Sim 侧不再是"零代码"而是有实打实的资产工程工作。
+
+#### D.2.1 获取并预处理机器人描述
+
+| 来源 | 处理 | 产物 |
+|---|---|---|
+| ROS 包（如 [`universal_robot`](https://github.com/ros-industrial/universal_robot)） | `xacro ur10e.urdf.xacro > ur10e.urdf`（需装 `ros-noetic-xacro`） | 完整 URDF |
+| Robotiq 2F-85（如 [`robotiq`](https://github.com/ros-industrial/robotiq)） | 同上 xacro；再合并到机械臂 URDF 末端（`<joint type="fixed">` 把 `tool0` 连到 `robotiq_base_link`） | 合并后 URDF |
+| MJCF（MuJoCo） | Isaac Sim 提供 MJCF Importer（扩展 `isaacsim.asset.importer.mjcf`） | `.usd` |
+| OnShape / CAD | Isaac Sim OnShape Importer 扩展 | `.usd` |
+
+**WHY 要合并 URDF**：IsaacLab 的 `ArticulationCfg` 要求**一个 USD 对应一个 articulation root**。如果机械臂和夹爪分开两个 USD，会有两个 articulation；而 `DifferentialInverseKinematicsActionCfg` 只认一个 articulation 内的 `joint_names` 与 `body_name`。
+
+**Robotiq 2F-85 的特殊性**：它的两指通过 4-bar linkage 联动，URDF 里是一个主动关节（`finger_joint`）+ 若干 mimic 关节。Isaac Sim 在导入 mimic 时需要 **"Preserve Joint Limits"** 打开，否则 mimic 被 bake 成固定值。
+
+#### D.2.2 URDF Importer：GUI vs Python
+
+**方式 A（GUI，首次推荐）**：
+
+1. 启动 Isaac Sim：`${ISAAC_PATH}/isaac-sim.sh`。
+2. `Isaac Utils → Workflows → URDF Importer`（或 `File → Import`）。
+3. 选 URDF 文件，配置：
+   - **Fix Base Link**：true（机械臂底座锚定）。
+   - **Merge Fixed Joints**：false（保留 `tool0` 等辅助链）。
+   - **Import Inertia Tensor**：true（否则 PhysX 用默认立方体惯量）。
+   - **Self Collision**：false（URDF 标注的相邻 link 默认不自碰）。
+   - **Create Physics Scene**：false（IsaacLab 自己会建）。
+4. 导出 `.usd` 到本地（如 `${ISAAC_ASSETS_DIR}/ur10e_robotiq.usd`）。
+
+**方式 B（Python，可复现）**：
+
+```python
+# scripts/import_ur10e.py （放在 Isaac Sim 或 IsaacLab 侧运行）
+from isaacsim.asset.importer.urdf import _urdf as urdf_loader
+from omni.isaac.kit import SimulationApp
+
+simulation_app = SimulationApp({"headless": True})
+
+import_config = urdf_loader.ImportConfig()
+import_config.merge_fixed_joints = False
+import_config.fix_base = True
+import_config.import_inertia_tensor = True
+import_config.self_collision = False
+import_config.density = 0.0                       # 使用 URDF 里的 inertia
+import_config.default_drive_type = urdf_loader.UrdfJointTargetType.JOINT_DRIVE_POSITION
+import_config.default_drive_strength = 1e7        # 占位，正式值在 IsaacLab ActuatorCfg 里设
+
+urdf_loader.import_urdf(
+    urdf_path="/path/to/ur10e_robotiq.urdf",
+    import_config=import_config,
+    dest_path="/World/UR10e_Robotiq",
+)
+
+# 保存 stage 到 USD
+from omni.isaac.core.utils.stage import save_stage
+save_stage("/path/to/ur10e_robotiq.usd")
+simulation_app.close()
+```
+
+#### D.2.3 导入后必须验证的 7 项
+
+| # | 验证项 | 方法 | 失败现象 |
+|---|---|---|---|
+| 1 | Articulation root 在机械臂 base link（不是 `/World`） | 选 USD prim 看 `ArticulationRootAPI` | IK 无法解算、仿真时机器人飞散 |
+| 2 | `fix_base = True` | `ArticulationRootAPI.fixedBase` | 机器人整体下落（§D.7 "坐下去") |
+| 3 | 6 关节 limit 都存在 | 选 joint prim 看 `lower/upperLimit` | PhysX fatal: joint limit not set |
+| 4 | Inertia 合理（ixx/iyy/izz 量级 1e-2 ~ 1e0） | Physics Tab 看 inertia | 机器人抽搐、发散 |
+| 5 | 碰撞网格（convex hull 足够简化） | Physics → Collision Groups | step 耗时爆炸 |
+| 6 | 末端 link 存在且命名一致（如 `wrist_3_link`） | Stage 面板搜索 | IK body_name 找不到（§D.7） |
+| 7 | Mimic 关节行为正确（夹爪联动） | GUI 拖动主关节看 mimic 是否跟随 | 夹爪只动一指 |
+
+#### D.2.4 末端坐标系与腕部相机 prim
+
+**末端坐标系的必要性**：`DifferentialInverseKinematicsActionCfg(body_name=...)` 必须指向一个**已存在的 rigid body**。UR10e URDF 通常有 `wrist_3_link` 作为最后一个 link，加 Robotiq 后还会有 `robotiq_base_link`。推荐把 IK 控制点设在 **`tool0`**（UR10e 标准的末端坐标系，Z 轴朝外）或夹爪 TCP（tool center point）。
+
+**腕部相机 prim 的添加**（可在 USD 阶段或 IsaacLab 的 `SceneCfg` 里；通常放 `SceneCfg` 更灵活，见 §D.3）：
+
+```python
+# 示意：在 USD stage 里直接加（非必须）
+import omni.usd
+from pxr import UsdGeom, Sdf
+stage = omni.usd.get_context().get_stage()
+cam = UsdGeom.Camera.Define(stage, Sdf.Path("/World/UR10e_Robotiq/tool0/wrist_cam"))
+# 设 xformOp:translate = (0, 0.05, 0)  相机挂在末端 Z+5cm
+```
+
+#### D.2.5 Isaac Sim 侧独立 smoke test
+
+**WHY 要在 Isaac Sim 侧单独 smoke test**：这能把"资产问题"从后续的"IsaacLab / RLinf 问题"隔离开，比整合后再排错快 10 倍。
+
+```python
+# scripts/test_ur10e_load.py
+from omni.isaac.kit import SimulationApp
+simulation_app = SimulationApp({"headless": True})
+
+from omni.isaac.core import World
+from omni.isaac.core.robots import Robot
+
+world = World()
+world.scene.add_default_ground_plane()
+robot = world.scene.add(Robot(prim_path="/World/UR10e_Robotiq", name="ur10e",
+                              usd_path="/path/to/ur10e_robotiq.usd"))
+world.reset()
+
+for _ in range(60):
+    world.step(render=False)
+    print("joint_pos:", robot.get_joint_positions())
+
+simulation_app.close()
+```
+
+通过 → USD 已正确；后面若有问题必定在 IsaacLab 或 RLinf。
+
+#### D.2.6 Isaac Sim 侧工作量
+
+| 任务 | 新手 | 熟手 |
+|---|---|---|
+| URDF 获取 + xacro 合并 | 0.5–1 天 | 1–2 小时 |
+| URDF → USD + GUI 调参 | 1 天 | 2–4 小时 |
+| 末端坐标系 + 传感器 | 0.5 天 | 1 小时 |
+| 独立 smoke test + 调 PhysX 参数 | 0.5–1 天 | 2–4 小时 |
+| **合计** | **2.5–3.5 天** | **0.5–1 天** |
+
+---
+
+### D.3 IsaacLab 侧：资产层 + 任务层
+
+本节对应 §18.14 的扩展。**新机器人比新任务多一个"资产层"工作**：必须在 `isaaclab_assets` 里先注册 `ArticulationCfg`，任务 `SceneCfg` 才能 `replace(...)` 引用它。
+
+#### D.3.1 写 `ArticulationCfg`
+
+位置（RLinf fork 内新建）：
+
+```
+source/isaaclab_assets/isaaclab_assets/robots/
+├── franka.py                  # 已有：FRANKA_PANDA_CFG
+├── ur10.py                    # 已有：UR10_CFG
+└── ur10e_robotiq.py           # 新建
+```
+
+示意内容（与 IsaacLab 官方 [`robots/franka.py`](https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_assets/isaaclab_assets/robots/franka.py) 同构）：
+
+```python
+# ur10e_robotiq.py (IsaacLab fork 侧，非 RLinf 代码)
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets.articulation import ArticulationCfg
+from isaaclab.sim import UsdFileCfg, RigidBodyPropertiesCfg, ArticulationRootPropertiesCfg
+
+UR10E_ROBOTIQ_CFG = ArticulationCfg(
+    spawn=UsdFileCfg(
+        usd_path="${ISAAC_ASSETS_DIR}/ur10e_robotiq.usd",      # 指向 D.2 产出的 USD
+        activate_contact_sensors=False,
+        rigid_props=RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            max_depenetration_velocity=5.0,
+        ),
+        articulation_props=ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=0,
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.0),
+        joint_pos={
+            "shoulder_pan_joint": 0.0,
+            "shoulder_lift_joint": -1.57,
+            "elbow_joint": 1.57,
+            "wrist_1_joint": -1.57,
+            "wrist_2_joint": -1.57,
+            "wrist_3_joint": 0.0,
+            "finger_joint": 0.0,                # Robotiq 主动关节
+        },
+        joint_vel={".*": 0.0},
+    ),
+    actuators={
+        "arm": ImplicitActuatorCfg(
+            joint_names_expr=["shoulder_.*", "elbow_.*", "wrist_.*"],
+            effort_limit=150.0,                  # UR10e spec
+            velocity_limit=3.14,
+            stiffness=800.0,
+            damping=40.0,
+        ),
+        "gripper": ImplicitActuatorCfg(
+            joint_names_expr=["finger_joint", ".*_inner_finger_joint"],
+            effort_limit=40.0,
+            velocity_limit=2.0,
+            stiffness=1e4,
+            damping=1e2,
+        ),
+    },
+    soft_joint_pos_limit_factor=1.0,
+)
+```
+
+**关键 WHY**：
+
+- `joint_names_expr` 用正则匹配；UR10e 6 关节共享前缀 `shoulder_` / `elbow_` / `wrist_`，一次正则覆盖。
+- `stiffness` / `damping` 需查 UR10e manufacturer spec，**不能拍脑袋**；错值会导致机械臂抽搐或迟钝。
+- `soft_joint_pos_limit_factor=1.0`：不收缩 URDF 声明的 joint limit；若机器人在训练初期大量超 limit，可改成 0.9。
+
+#### D.3.2 Actuators：`ImplicitActuatorCfg` vs `IdealPDActuatorCfg`
+
+| 类型 | 原理 | 优点 | 缺点 | 推荐场景 |
+|---|---|---|---|---|
+| `ImplicitActuatorCfg` | PhysX 内置 PD（C++ 内核） | 速度最快；支持任意 stiffness/damping 量级 | 梯度不可回传；stiffness 变化时需重新初始化 | 所有仿真，**UR10e 推荐** |
+| `IdealPDActuatorCfg` | Python 侧显式 PD 公式 | 梯度可回传（用于可微仿真）；可自定义计算 | 比 Implicit 慢 2–3× | 需要 diff-sim 或特殊控制律 |
+
+**WHY 默认 Implicit**：RL 训练的梯度只需经过 policy，不需要反向穿越 actuator；Implicit 的性能优势决定性。
+
+#### D.3.3 SceneCfg 引用新机器人：对照 Franka 版本
+
+| 行为 | Franka 版本（如 §18.14.3） | UR10e 版本（本附录） |
+|---|---|---|
+| Import | `from isaaclab_assets.robots.franka import FRANKA_PANDA_CFG` | `from isaaclab_assets.robots.ur10e_robotiq import UR10E_ROBOTIQ_CFG` |
+| 引用 | `robot = FRANKA_PANDA_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")` | `robot = UR10E_ROBOTIQ_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")` |
+| 其他 SceneCfg 字段 | `cube` / `table` / `ground` / `table_cam` / `wrist_cam` / `dome_light` | **同左**，只是相机挂点从 `panda_hand` 改成 `tool0` |
+
+#### D.3.4 任务 MDP 的机器人敏感字段
+
+新机器人不只影响 `SceneCfg`，也影响 4 件套：
+
+**(1) ActionsCfg（最敏感）**：
+
+```python
+# IsaacLab fork 侧，非 RLinf 代码
+from isaaclab.controllers import DifferentialIKControllerCfg
+from isaaclab.envs.mdp import (
+    DifferentialInverseKinematicsActionCfg,
+    BinaryJointPositionActionCfg,
+)
+
+@configclass
+class ActionsCfg:
+    arm_action = DifferentialInverseKinematicsActionCfg(
+        asset_name="robot",
+        joint_names=["shoulder_.*", "elbow_.*", "wrist_.*"],   # ★ 必须 UR10e 的 6 关节
+        body_name="wrist_3_link",                              # ★ IK 控制的末端 link 名
+        controller=DifferentialIKControllerCfg(
+            command_type="pose", use_relative_mode=True, ik_method="dls"
+        ),
+        scale=0.5,                                             # ±0.5 的 6D pose 增量
+    )
+    gripper_action = BinaryJointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["finger_joint"],                          # ★ Robotiq 主动关节
+        open_command_expr={"finger_joint": 0.0},
+        close_command_expr={"finger_joint": 0.8},              # 夹紧位置
+    )
+```
+
+**WHY `body_name="wrist_3_link"` 而不是 `tool0`**：`tool0` 在 URDF 里通常是 `fixed` joint 连接的"虚拟 frame"，若 URDF Importer 设了 `merge_fixed_joints=True` 它会消失；稳妥做法是用 `wrist_3_link` 作为 IK 控制点，再在 `controller` 的 `offset` 字段里补末端 tool 的偏移（或在 URDF 里把 `tool0` 改成真实 rigid body）。
+
+**(2) ObservationsCfg（次敏感）**：
+
+- 若 RLinf 复用 stack-cube 的 `_wrap_obs`（§D.4.2 分析），obs term 必须**保持 key 名**：`wrist_cam` / `table_cam` / `eef_pos` / `eef_quat` / `gripper_pos`。
+- `eef_pos` / `eef_quat` 的计算 term（如 IsaacLab 内置的 `mdp.ee_position`）参数要指向 UR10e 的末端 link：
+
+```python
+eef_pos = ObsTerm(func=mdp.body_pose_w, params={"asset_cfg": SceneEntityCfg("robot", body_names=["wrist_3_link"])})
+```
+
+**(3) RewardsCfg**：对 peg-insertion 任务，典型 term 包括：
+
+- `distance_to_hole = RewTerm(mdp.position_error, ...)` —— 稠密引导。
+- `peg_inserted_success = RewTerm(mdp.object_height_within_range, weight=10.0, ...)` —— 稀疏成功信号。
+- **RLinf 的偏好**：§8.4 说明 RLinf 更喜欢**稀疏 0/1**（在 Python 侧 `use_rel_reward=True` 做差分）；可以把 IsaacLab 的 shaped reward 权重调小、`success` 置为主导。
+
+**(4) TerminationsCfg / EventsCfg**：与 Franka 差异不大，主要差异是 `reset_joints_by_scale` 的 `joint_names` 要换成 UR10e 的。
+
+#### D.3.5 `gym.register` 与重装
+
+```python
+# IsaacLab fork 侧的 config/ur10e_robotiq/__init__.py
+import gymnasium as gym
+
+gym.register(
+    id="Isaac-PegInsert-UR10e-IK-Rel-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.peg_insert_ik_rel_env_cfg:PegInsertUR10eIKRelEnvCfg",
+    },
+)
+```
+
+然后：
+
+```bash
+cd ${ISAAC_LAB_PATH}
+./isaaclab.sh --install
+./isaaclab.sh -p scripts/environments/random_agent.py \
+    --task Isaac-PegInsert-UR10e-IK-Rel-v0 --num_envs 4 --headless --enable_cameras
+```
+
+如果看到若干 step 的 obs 输出且无 traceback，则 IsaacLab 侧完工，可以进入 RLinf。
+
+更多细节回看 §18.14.4（`gym.register()` 契约）、§18.14.5（obs schema 对齐）、§18.14.6（IK-Rel 契约）。
+
+---
+
+### D.4 RLinf 侧：动作 / 状态维度的连锁适配
+
+本节是附录 D 的**核心独有内容**。§18 假设维度不变，本节处理维度真的变了的情况。
+
+#### D.4.1 "维度变化连锁改动" 地图
+
+```mermaid
+flowchart LR
+    EnvDim["env 侧维度确定<br/>(由 ActionsCfg 决定)"] --> Check{"action_dim<br/>或 state_dim<br/>与 Franka 一致？"}
+    Check -->|"是 (7D action)"| Reuse["可复用<br/>Franka checkpoint"]
+    Check -->|"否"| Chain["连锁改动 5 处"]
+
+    Chain --> F1["1. env yaml<br/>(init_params.id 必改)"]
+    Chain --> F2["2. 顶层 yaml<br/>actor.model.action_dim"]
+    Chain --> F3["3. rlinf/envs/action_utils.py<br/>prepare_actions_for_isaaclab"]
+    Chain --> F4["4. openpi/policies/<br/>IsaacLab新Outputs.__call__"]
+    Chain --> F5["5. openpi/dataconfig/<br/>norm_stats + repo_id"]
+
+    Reuse --> SameAction["仍需改 1 处：<br/>env yaml init_params.id"]
+```
+
+**结论**：若 UR10e 任务仍是 6D IK-Rel + 1D gripper = **7D**，RLinf 侧可最小化改动（仅 env yaml + 顶层 yaml）；若是 7D IK-Abs、12D joint_pos 或 14D 双臂等，5 处都要改。
+
+#### D.4.2 `_wrap_obs` 与 state 向量
+
+RLinf 的 state 向量是**机器人无关**的：
+
+```78:92:rlinf/envs/isaaclab/tasks/stack_cube.py
+    def _wrap_obs(self, obs):
+        instruction = [self.task_description] * self.num_envs
+        wrist_image = obs["policy"]["wrist_cam"]
+        table_image = obs["policy"]["table_cam"]
+        quat = obs["policy"]["eef_quat"][
+            :, [1, 2, 3, 0]
+        ]  # In isaaclab, quat is wxyz not like libero
+        states = torch.concatenate(
+            [
+                obs["policy"]["eef_pos"],
+                quat2axisangle_torch(quat),
+                obs["policy"]["gripper_pos"],
+            ],
+            dim=1,
+        )
+```
+
+**分析**：
+
+- `eef_pos` (3) + `quat2axisangle` (3) + `gripper_pos` (1) = **7D state**，对 Franka 和 UR10e 完全一致，**不用改**。
+- 只要 IsaacLab 侧的 `ObservationsCfg.PolicyCfg` 提供了同名 key（见 §D.3.4），RLinf 的 `_wrap_obs` 对 UR10e **开箱即用**。
+- 若任务需要关节级观测（例如把 6 个 `joint_pos` 也作为 state 的一部分，用 13D state），则必须：
+  - IsaacLab 侧新增 `joint_pos = ObsTerm(func=mdp.joint_pos_rel, ...)`。
+  - RLinf 侧写一个新 `IsaaclabPegInsertUR10eEnv._wrap_obs`，把 `joint_pos` concat 进 `states`。
+  - 同步改 π0.5 模型的 `state_dim`（默认 7D，新 13D 需要重训 state encoder）。
+
+#### D.4.3 `prepare_actions_for_isaaclab` 的改动条件
+
+RLinf 的 action 分派函数实现：
+
+```80:99:rlinf/envs/action_utils.py
+def prepare_actions_for_isaaclab(
+    raw_chunk_actions,
+    model_type,
+) -> torch.Tensor:
+    """
+    Here reture a general 7 dof action. If the action is modified, please change the output of the model
+    For example, in `RLinf/rlinf/models/embodiment/gr00t/simulation_io.py`
+    """
+    chunk_actions = (
+        torch.from_numpy(raw_chunk_actions)
+        if isinstance(raw_chunk_actions, np.ndarray)
+        else raw_chunk_actions
+    )
+    if SupportedModel(model_type) in [
+        SupportedModel.OPENVLA,
+        SupportedModel.OPENVLA_OFT,
+    ]:
+        chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
+        chunk_actions[..., -1] = torch.sign(chunk_actions[..., -1]) * -1.0
+    return chunk_actions
+```
+
+**内部 TODO 注释**明确写着 "only suitable for action_dim = 7"（类比 `prepare_actions_for_maniskill` 第 31 行的同款 TODO）。
+
+**改动场景分类**：
+
+| 场景 | 是否改此函数 | 怎么改 |
+|---|---|---|
+| UR10e 6D IK-Rel + 1D gripper ({-1,+1}) | **不用改**（维度对齐 Franka） | 直接复用 stack-cube 分支 |
+| UR10e 6D IK-Rel + 1D gripper ([0,1]) | **要改** | 加 `if SupportedEnvType(env_type) == SupportedEnvType.ISAACLAB_UR10E: chunk_actions[..., -1] = (chunk_actions[..., -1] + 1) / 2`（或把转换放到 OpenPI policy，**更推荐**） |
+| UR10e 6D IK-Abs（绝对位姿） | **要改** | 去掉 `sign`；scale 按 UR10e workspace 的量级 |
+| 双臂机器人 14D | **要改** | 加 `env_type` 分支、双 gripper 维度 |
+
+**推荐位置选择**：
+- 若改动**只涉及夹爪 / 单点映射** → 放 **OpenPI policy**（§D.4.4，更 localized）。
+- 若改动**涉及整个维度重排 / env 级转换** → 放 `action_utils.py`（更显式）。
+
+#### D.4.4 OpenPI policy + DataConfig + Normalizer
+
+**三样东西必须一致对齐**：
+
+**(1) OpenPI policy**：`rlinf/models/embodiment/openpi/policies/isaaclab_ur10e_policy.py`（新建）
+
+```python
+# 示意（与 isaaclab_policy.py 同构）
+import dataclasses
+import numpy as np
+from openpi import transforms
+
+@dataclasses.dataclass(frozen=True)
+class IsaacLabUR10eOutputs(transforms.DataTransformFn):
+    def __call__(self, data: dict) -> dict:
+        actions = np.asarray(data["actions"][:, :7])   # [5 chunk, 7]
+        # UR10e 夹爪映射：假设模型输出 [0,1] → IsaacLab 要 {-1,+1}
+        actions[..., -1] = 2.0 * (actions[..., -1] > 0.5) - 1.0
+        return {"actions": actions}
+```
+
+**(2) DataConfig**：`rlinf/models/embodiment/openpi/dataconfig/isaaclab_ur10e_dataconfig.py`（若要 SFT 对接）
+
+- `repo_id`：LeRobot 格式的 UR10e SFT 数据集 HuggingFace repo 名。
+- `norm_stats`：**必须重算**！Franka 的 action scale、workspace 范围与 UR10e 不同，旧的 `RLinf-Pi05-SFT` norm_stats 套在 UR10e 上会**把动作缩放到错误范围**，导致机械臂乱动。
+- 重算命令（OpenPI 规范）：
+
+```bash
+python -m openpi.scripts.compute_norm_stats --config_name pi05_isaaclab_ur10e_peg
+```
+
+**(3) 顶层 yaml**：`examples/embodiment/config/isaaclab_peg_insert_ur10e_ppo_openpi_pi05.yaml`
+
+```yaml
+defaults:
+  - env/isaaclab_peg_insert_ur10e@env.train
+  - env/isaaclab_peg_insert_ur10e@env.eval
+  - model/pi0_5@actor.model
+
+actor:
+  model:
+    action_dim: 7                                    # ★ 与 env 动作空间一致
+    num_action_chunks: 5
+    openpi:
+      config_name: "pi05_isaaclab_ur10e_peg"         # ★ 对应新 DataConfig
+```
+
+#### D.4.5 Checkpoint 复用策略
+
+若你已有 Franka stack-cube 训好的 RLinf-Pi05 checkpoint，要迁移到 UR10e peg-insertion：
+
+```mermaid
+flowchart LR
+    Ckpt["RLinf-Pi05-Stack-Cube<br/>(Franka)"] --> Q1{"action_dim<br/>相同？"}
+    Q1 -->|否| NewSFT["必须重 SFT"]
+    Q1 -->|是<br/>(7D)| Q2{"action semantics<br/>相同？"}
+    Q2 -->|否<br/>(UR10e scale 不同)| ZeroShot["Zero-shot eval<br/>若 SR<0.1"]
+    Q2 -->|是| Direct["直接 RL fine-tune"]
+    ZeroShot --> NewSFT2["UR10e demo 少量 SFT<br/>(10-50 epoch)"]
+    NewSFT2 --> RLFT["RL fine-tune"]
+    Direct --> RLFT
+    NewSFT --> FullSFT["完整 SFT<br/>+ RL fine-tune"]
+```
+
+**经验法则**：
+- 若 UR10e 也是 7D IK-Rel + sign gripper：**先跑 zero-shot eval**。成功率 > 0.3 可直接 RL；< 0.1 需少量 SFT。
+- OpenPI 的 VLM 主干（Gemma / SigLIP）对"视觉-语言-动作"的映射具有较强迁移性，所以 SFT 通常 10-50 epoch 就能从 0 拉到 0.5+。
+- 切记：**新机器人的 norm_stats 必须用新机器人的 demo 数据重算**（即使 action_dim 相同）。
+
+---
+
+### D.5 端到端调用链时序图（三层栈下钻到 IK + PhysX）
+
+本图与 §18.15.2 互补：§18.15.2 只到 `ManagerBasedRLEnv`，本图**下钻到 IK solver 和 PhysX articulation**，给出"一次 `env.step` 内部发生了什么"的完整视图。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Main as RLinf 主进程
+    participant Roll as RolloutWorker
+    participant Model as π0.5 模型
+    participant ActUtil as prepare_actions_<br/>for_isaaclab
+    participant EnvW as IsaaclabBase<br/>Env.chunk_step
+    participant Sub as SubProcIsaacLab<br/>Env
+    participant Child as Isaac Sim 子进程
+    participant ML as ManagerBasedRL<br/>Env.step
+    participant AM as ActionManager
+    participant IK as DifferentialIK<br/>Controller
+    participant Art as Articulation<br/>(UR10e)
+    participant PX as PhysX 5 (GPU)
+    participant OM as Observation<br/>Manager
+
+    Note over Main,PX: ===== 一次 chunk_step (含 5 个 RL step) =====
+    Main->>Roll: 生成 chunk_actions [B,5,7]
+    Roll->>Model: forward_input(obs)
+    Model-->>Roll: action_chunk [B,5,7]
+    Roll->>ActUtil: prepare_actions_for_isaaclab(chunk, model_type)
+    ActUtil-->>Roll: CUDA tensor [B,5,7]
+    Roll->>EnvW: chunk_step(actions)
+
+    loop i in range(5)
+        EnvW->>Sub: step(actions[:, i]) [B,7]
+        Sub->>Child: Pipe.send("step")<br/>Queue.put(action)
+        Child->>ML: isaac_env.step(action)
+        ML->>AM: process_action(action [B,7])
+
+        Note over AM,IK: === arm_action 分支 ===
+        AM->>IK: arm 6D delta [B,6]<br/>current ee pose (from Art)
+        IK->>IK: DLS 逆解<br/>target = current ⊕ delta<br/>J^T (JJ^T + λ²I)^-1 Δx
+        IK-->>AM: target joint pos [B, 6]
+
+        Note over AM,Art: === gripper_action 分支 ===
+        AM->>AM: Binary: a>0 → 0.8, else 0.0
+        AM->>Art: apply_action(joint_target [B,7])
+        Art->>PX: write_joint_pos_target
+
+        Note over ML,PX: === decimation (2) 次 physics step ===
+        loop decim in range(decimation=2)
+            ML->>PX: sim.step(dt=1/120)
+            PX->>PX: Implicit PD: τ = K(q_target-q) - D·q̇
+            PX->>PX: Mass matrix / Jacobian solve
+            PX-->>Art: 更新 joint_pos / joint_vel / body_pose
+        end
+
+        ML->>OM: compute()
+        OM->>Art: 读 joint_pos, body_pose (CUDA)
+        OM-->>ML: obs dict<br/>{policy: {wrist_cam, eef_pos, ...}}
+        ML->>ML: reward / done 计算
+        ML-->>Child: (obs, rew, term, trunc, info)
+        Child->>Sub: obs_queue.put(...)
+        Sub-->>EnvW: step 结果
+    end
+
+    EnvW-->>Roll: chunk 结果 (5 步聚合)
+    Roll-->>Main: Trajectory 入 Channel
+```
+
+**关键下钻点**：
+
+- **步 7-9（IK solver）**：`DifferentialIKControllerCfg(ik_method="dls")` 的 Damped Least Squares 逆运动学。它需要**准确的 Jacobian**，而 Jacobian 由 URDF 的关节层次决定 —— 若 D.2 的 URDF 有错（link 顺序、惯量、fix_base 缺失），这里直接发散。
+- **步 10-11（gripper）**：`BinaryJointPositionActionCfg` 根据 sign 切换开/闭；若 D.3.4 的 `close_command_expr` 值设错（如 `1.0` 而非 `0.8`），夹爪会"**夹死**"超出物理限位。
+- **步 12-15（PhysX PD）**：`ImplicitActuatorCfg.stiffness/damping` 决定 PD 增益；D.3.1 值错 → 抽搐 / 过冲 / 缓慢。
+- **步 16（ObservationManager）**：读 `Articulation.data.body_pos_w[wrist_3_link_id]` 等 —— 若 D.3.4 的 `body_names=["wrist_3_link"]` 拼写错，`KeyError`。
+
+每一处故障都能从这张时序图反推到具体的 `.py` / `.usd` 位置。
+
+---
+
+### D.6 端到端 Checklist（新机器人 + 新任务版）
+
+把 §D.2 / §D.3 / §D.4 合并成一张三层 19 步表（比 §18.17.1 的 18 步多一步"资产层"）：
+
+| # | 层 | 步骤 | 文件 / 动作 | 必需 | 参考 |
+|---|---|---|---|---|---|
+| 0 | Isaac Sim | URDF/MJCF 源文件准备 | `ur10e.urdf.xacro` + `robotiq_2f85.urdf`（xacro 渲染 + 合并） | 必需 | §D.2.1 |
+| 1 | Isaac Sim | URDF → USD 导入 | URDF Importer GUI 或 `scripts/import_ur10e.py` | 必需 | §D.2.2 |
+| 2 | Isaac Sim | 7 项导入后验证 | 见 §D.2.3 验证表 | 必需 | §D.2.3 |
+| 3 | Isaac Sim | 挂末端坐标系 / 腕部相机 prim | GUI 添加 Xform 或 `SceneCfg` 里挂 | 条件必需 | §D.2.4 |
+| 4 | Isaac Sim | 独立加载 USD smoke test | `scripts/test_ur10e_load.py` | 强烈推荐 | §D.2.5 |
+| 5 | IsaacLab | `isaaclab_assets/robots/ur10e_robotiq.py` 写 `UR10E_ROBOTIQ_CFG` | 必需 | §D.3.1 |
+| 6 | IsaacLab | 选 Actuator 类型并填写 stiffness/damping | 同上文件 | 必需 | §D.3.2 |
+| 7 | IsaacLab | 任务 `SceneCfg.robot` 引用 `UR10E_ROBOTIQ_CFG` | `peg_insert_env_cfg.py` | 必需 | §D.3.3 |
+| 8 | IsaacLab | `ActionsCfg`：改 `body_name` 与 `joint_names` 正则 | 同上文件 | 必需 | §D.3.4 |
+| 9 | IsaacLab | `ObservationsCfg.PolicyCfg` 提供 `wrist_cam / table_cam / eef_pos / eef_quat / gripper_pos` 五键 | 同上文件 | 必需 | §D.3.4 + §18.14.5 |
+| 10 | IsaacLab | `gym.register` 新任务 ID | `config/ur10e_robotiq/__init__.py` | 必需 | §D.3.5 + §18.14.4 |
+| 11 | IsaacLab | `./isaaclab.sh --install` 重装 | Shell | 必需 | §18.14.8 |
+| 12 | IsaacLab | `random_agent.py` smoke test | Shell | 强烈推荐 | §D.3.5 + §18.16.2 (A) |
+| 13 | RLinf | `rlinf/envs/isaaclab/tasks/peg_insert_ur10e.py` 新 env 类 | 必需 | §18.2 |
+| 14 | RLinf | `REGISTER_ISAACLAB_ENVS` 加一行 | [rlinf/envs/isaaclab/__init__.py](rlinf/envs/isaaclab/__init__.py) | 必需 | §18.3 |
+| 15 | RLinf | `action_utils.py` 若 action_dim / 夹爪语义变 | [rlinf/envs/action_utils.py](rlinf/envs/action_utils.py) | 条件必需 | §D.4.3 |
+| 16 | RLinf | OpenPI policy `IsaacLabUR10eOutputs` | `rlinf/models/embodiment/openpi/policies/isaaclab_ur10e_policy.py` | 条件必需 | §D.4.4 |
+| 17 | RLinf | OpenPI DataConfig + **重算 norm_stats** | `rlinf/models/embodiment/openpi/dataconfig/isaaclab_ur10e_dataconfig.py` | 条件必需 | §D.4.4 |
+| 18 | RLinf | env yaml + 顶层 yaml | `examples/embodiment/config/env/isaaclab_peg_insert_ur10e.yaml` 等 | 必需 | §18.4–§18.5 |
+| 19 | RLinf | 端到端训练小规模验证 | `bash examples/embodiment/run_embodiment.sh isaaclab_peg_insert_ur10e_ppo_openpi_pi05` | 必需 | §18.10 |
+
+#### D.6.1 与 §18.17.1 的差异
+
+| 差异点 | §18.17.1（只新任务） | §D.6（新机器人 + 新任务） |
+|---|---|---|
+| Isaac Sim 侧 | 2 步（装 + source） | **5 步**（装 + URDF→USD + 调参 + 末端 + smoke test） |
+| IsaacLab 侧"资产层" | 无 | **2 步**（写 `ArticulationCfg` + 选 Actuator） |
+| RLinf 侧连锁改动 | 条件 2 处（policy / dataconfig） | **条件 3 处**（action_utils + policy + dataconfig） |
+| Norm stats | 复用 | **必须重算** |
+
+---
+
+### D.7 踩坑速查表（机器人侧特有）
+
+以下是**仅在"新机器人"场景下出现、而在"新任务 + 已有机器人"场景下不会出现**的典型故障：
+
+| # | 症状 | 最可能根因 | 定位位置 |
+|---|---|---|---|
+| 1 | `gym.error: Invalid ik_method` 或 `IK solver diverged` | `body_name` 指到错误 link（例如 `panda_hand` 复制粘贴未改） | §D.3.4 `ActionsCfg.arm_action.body_name`；对照 §D.2.3 的末端 prim 名 |
+| 2 | 机器人在 reset 时整体"坐下去"或"飞散" | `fix_base` 未设 / articulation root 选错 | §D.2.3 验证项 1-2 |
+| 3 | PhysX fatal: `Joint has no position limit` | URDF 导入时 `fixed_tendon`/`mimic` 关节 limit 丢失 | §D.2.3 验证项 3；重新导入 URDF 并勾选 "Preserve Joint Limits" |
+| 4 | 夹爪只动主指，mimic 关节不跟随 | Robotiq mimic 关节被 `merge_fixed_joints` 合并 | §D.2.2 导入时 `merge_fixed_joints=False` |
+| 5 | 机械臂整体抽搐（高频震荡） | `ImplicitActuatorCfg.stiffness` 设得过高 | §D.3.2 参考 manufacturer spec 重新调 |
+| 6 | 机械臂对动作"迟钝" / 不响应 | `stiffness` 过低 / `damping` 过高 | 同上 |
+| 7 | `KeyError: 'eef_pos'` in `_wrap_obs` | IsaacLab `ObservationsCfg` 没挂 `eef_pos` 或 key 拼写错 | §D.3.4；对照 §18.14.5 key 对齐表 |
+| 8 | 动作空间"无响应"（step 后机器人静止） | OpenPI `norm_stats` 仍是 Franka，动作被缩放到极小 | §D.4.4 **重算 norm_stats** |
+| 9 | 动作尺度"爆炸"（机器人瞬间转到 joint limit） | 同上反向 —— norm_stats 把 UR10e 小 scale 放大成 Franka 大 scale | §D.4.4 |
+| 10 | 训练时 success rate 恒为 0（但 demo 看起来能成功） | Franka checkpoint zero-shot 迁到 UR10e；action semantics 差异大 | §D.4.5 少量 SFT 后再 RL |
+| 11 | Isaac Sim 启动后 2-3 秒 OOM | URDF 的 collision mesh 过复杂（如几十万面） | §D.2.3 验证项 5；GUI 中把 `Collision Approximation` 改成 `Convex Hull` |
+| 12 | 相机视角偏 / 看不到末端 | 腕部相机 prim 挂点错 | §D.2.4 / §D.3.3 |
+| 13 | IK 有效但机器人抖动严重 | `DifferentialIKControllerCfg.scale` 太大，单步 Δpose 超出物理合理范围 | §D.3.4 把 `scale=0.5` 降到 `0.1–0.2` 试试 |
+| 14 | 夹爪完全夹死 / 张不开 | `BinaryJointPositionActionCfg.close_command_expr` 值超 URDF joint upper limit | §D.3.4 对照 URDF 的 `<limit upper="..."/>` |
+
+---
+
+### D.8 外部资源参考
+
+以下链接来自 IsaacSim / IsaacLab 官方文档（版本 v2.3.2 / v5.1.0），不是 RLinf 内部资源：
+
+| 主题 | URL |
+|---|---|
+| Isaac Sim URDF Importer 官方文档 | `https://docs.omniverse.nvidia.com/isaacsim/latest/robot_setup/import_urdf.html` |
+| IsaacLab `Importing a New Asset` 教程 | `https://isaac-sim.github.io/IsaacLab/v2.3.2/source/how-to/import_new_asset.html` |
+| IsaacLab `Writing an Asset Configuration` how-to | `https://isaac-sim.github.io/IsaacLab/v2.3.2/source/how-to/write_articulation_cfg.html` |
+| IsaacLab `Adding a New Robot to Isaac Lab` 教程 | `https://isaac-sim.github.io/IsaacLab/v2.3.2/source/tutorials/01_assets/add_new_robot.html` |
+| IsaacLab Actuator Model（Implicit vs Ideal PD） | `https://isaac-sim.github.io/IsaacLab/v2.3.2/source/overview/core-concepts/actuators.html` |
+| IsaacLab DifferentialInverseKinematicsActionCfg API | `https://isaac-sim.github.io/IsaacLab/v2.3.2/source/api/lab/isaaclab.envs.mdp.html` |
+| IsaacLab v2.3.2 Source API Reference | [https://isaac-sim.github.io/IsaacLab/v2.3.2/index.html](https://isaac-sim.github.io/IsaacLab/v2.3.2/index.html) |
+| Isaac Sim GitHub（新机器人资产 PR 示例） | [https://github.com/isaac-sim/IsaacSim](https://github.com/isaac-sim/IsaacSim) |
+| IsaacLab GitHub（`isaaclab_assets/robots/` 目录） | [https://github.com/isaac-sim/IsaacLab/tree/main/source/isaaclab_assets/isaaclab_assets/robots](https://github.com/isaac-sim/IsaacLab/tree/main/source/isaaclab_assets/isaaclab_assets/robots) |
+| RLinf fork of IsaacLab | [https://github.com/RLinf/IsaacLab](https://github.com/RLinf/IsaacLab) |
+
+**RLinf 内部交叉引用**（本文档内）：
+
+- [§7](#7-环境注册两级路由)：RLinf 两级路由（`SupportedEnvType` + `REGISTER_ISAACLAB_ENVS`），D.6 第 14 步依赖。
+- [§8](#8-isaaclabbaseenv-基类与-chunk_step-语义)：`_wrap_obs` / `chunk_step` 机制，D.4.2 所基。
+- [§9](#9-subprocisaaclabenv-子进程边界关键工程决策)：子进程边界，D.5 时序图所基。
+- §18.12–§18.17：新任务（已有机器人）的 RLinf 侧 Checklist 与 IsaacLab 侧任务定义；**本附录引用但不重复**。
+- [附录 A](#附录-a关键文件索引)：全文件索引；本附录涉及的新文件在既有索引之外。
+
+---
+
 ## 致谢与说明
 
 本分析基于 RLinf `commit` 在本地 `/home/Luogang/SRC/RL/RLinf` 的代码库状态（2026 年 4 月）。文档若与未来版本出现偏差，以仓库实际代码为准；改进建议（§19）为本文作者基于代码观察的个人推断，不代表 RLinf 官方路线图。
