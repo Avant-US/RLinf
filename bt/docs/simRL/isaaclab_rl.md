@@ -5859,8 +5859,8 @@ actor:
 flowchart LR
     Ckpt["RLinf-Pi05-Stack-Cube<br/>(Franka)"] --> Q1{"action_dim<br/>相同？"}
     Q1 -->|否| NewSFT["必须重 SFT"]
-    Q1 -->|是<br/>(7D)| Q2{"action semantics<br/>相同？"}
-    Q2 -->|否<br/>(UR10e scale 不同)| ZeroShot["Zero-shot eval<br/>若 SR<0.1"]
+    Q1 -->|"是(7D)"| Q2{"action semantics<br/>相同？"}
+    Q2 -->|"否<br/>(UR10e scale 不同)"| ZeroShot["Zero-shot eval<br/>若 SR<0.1"]
     Q2 -->|是| Direct["直接 RL fine-tune"]
     ZeroShot --> NewSFT2["UR10e demo 少量 SFT<br/>(10-50 epoch)"]
     NewSFT2 --> RLFT["RL fine-tune"]
