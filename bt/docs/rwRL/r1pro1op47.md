@@ -272,10 +272,10 @@ graph TB
     R1Env --> SafeSup
     SafeSup -.-> R1Ctl
     R1Ctl -->|"target_pose_arm_*<br/>position_control_gripper_*<br/>target_speed_torso / _chassis"| Mobiman
-    Mobiman <-->|HDAS topics| HDAS
-    CamSubs <-- "/hdas/camera_*" --> Cameras
-    SafeSup <-- "/controller" --> HDAS
-    RewardW <-. "only when standalone_realworld=False" .- CamSubs
+    Mobiman <-->|"HDAS topics"| HDAS
+    CamSubs <-->|"/hdas/camera_*"| Cameras
+    SafeSup <-->|"/controller"| HDAS
+    RewardW <-.->|"only when standalone_realworld=False"| CamSubs
 ```
 
 ### 6.3 RLinf 三层映射

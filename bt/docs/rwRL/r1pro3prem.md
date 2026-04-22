@@ -97,8 +97,8 @@ flowchart LR
     ros2Controller --> robotHw[R1ProHardware]
     rolloutGroup <-->|ChannelData| envGroup
     actorGroup <-->|WeightSync| rolloutGroup
-    metrics[MetricsBackend] <-- headNode
-    metrics <-- edgeNode
+    headNode --> metrics[MetricsBackend]
+    edgeNode --> metrics
 ```
 
 ## 3.2 组件部署图（MVP 推荐）
@@ -130,7 +130,7 @@ flowchart TB
 sequenceDiagram
     participant EnvW as EnvWorker
     participant Rollout as RolloutWorker
-    participant Actor as ActorWorker
+    participant ActW as ActorWorker
     participant Robot as R1ProRobot
 
     EnvW->>Robot: applyActionChunk
@@ -138,9 +138,9 @@ sequenceDiagram
     EnvW->>Rollout: sendObs
     Rollout-->>EnvW: actionChunk
     EnvW->>EnvW: buildTrajectory
-    EnvW->>Actor: sendTrajectory
-    Actor->>Actor: updatePolicy
-    Actor-->>Rollout: syncWeights
+    EnvW->>ActW: sendTrajectory
+    ActW->>ActW: updatePolicy
+    ActW-->>Rollout: syncWeights
 ```
 
 ---
