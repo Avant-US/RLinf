@@ -240,7 +240,7 @@ flowchart LR
 ```
 
 ### 6.2 组件部署图（推荐：Disaggregated 2-Node）
-
+??? 相机不是应该由ROS2统一交互吗
 ```mermaid
 graph TB
     subgraph GPUNode["Node rank 0: GPU Server (label: gpu)"]
