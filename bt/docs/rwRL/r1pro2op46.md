@@ -217,9 +217,9 @@ sequenceDiagram
     participant EnvW as EnvWorker (Orin)
     participant Channel as Channel (Ray)
     participant Rollout as RolloutWorker (GPU)
-    participant Actor as ActorWorker (GPU)
+    participant ActW as ActorWorker (GPU)
     
-    Note over Orin,Actor: === 一次交互循环 (10Hz) ===
+    Note over Orin,ActW: === 一次交互循环 (10Hz) ===
     
     rect rgb(230, 255, 230)
         Note over Orin,EnvW: 1. 感知
@@ -246,10 +246,10 @@ sequenceDiagram
     end
     
     rect rgb(255, 230, 230)
-        Note over EnvW,Actor: 4. 训练 (异步)
-        EnvW->>Actor: trajectory 通过 Channel 传输
-        Actor->>Actor: SAC/PPO 梯度更新
-        Actor->>Rollout: sync_weights (非阻塞)
+        Note over EnvW,ActW: 4. 训练 (异步)
+        EnvW->>ActW: trajectory 通过 Channel 传输
+        ActW->>ActW: SAC/PPO 梯度更新
+        ActW->>Rollout: sync_weights (非阻塞)
     end
 ```
 

@@ -1,7 +1,27 @@
 # RLinf 接入 Galaxea R1 Pro 真机强化学习设计与实现方案（Prem v1）
 
 > 面向 `RLinf` 与 `Galaxea R1 Pro` 的可落地工程方案。  
-> 目标不是“写一个看起来很完整的设想”，而是给出一份可以直接指导开发与联调的实施文档：有代码锚点、有系统边界、有风险兜底、有阶段验收。
+> 目标不是“写一个看起来很完整的设想”，而是给出一份可以直接指导开发与联调的实施文档：有代码锚点、有系统边界、有风险兜底、有阶段验收。    
+> Prmp: 你是一个机器人与强化学习领域的专家, 你计划要用RLinf连接galaxea公司的R1 Pro机器人做真机强化学习. 请参考以及深入分析如下资料:
+
++ 参考RLinf做真机强化学习相关的资料:
+  - RLinf 的论文 `@bt/docs/ov/RLinf Flexible and Efficient Large-scale Reinforcement Learning via Macro-to-Micro Flow Transformation.pdf`, 参考 RLinf 的官网 https://rlinf.readthedocs.io/en/latest/index.html 
+  - 参考 @docs/ 中的各个rst与md文档, 参考 @bt/docs/ 中的各个md文档. 
+  - 参考官方github(https://github.com/RLinf/RLinf)中的Issues, Commits, Pull requests 和 Disscussions 等等. 
+  - 参考网上与 RLinf 相关的文章与讨论. 
+  - 参考 RLinf 对接 Franka 机器臂做真机强化学习的例子: [Real-World RL with Franka](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/franka.html), [Real-World RL with Franka (Reward Model)](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/franka_reward_model.html), [RL-based Sim-Real Co-Training](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/co_training.html), [Real-World Franka with ZED Cameras and Robotiq Gripper](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/franka_zed_robotiq.html), [Real-World Franka with GELLO Teleoperation](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/franka_gello.html), [HG-DAgger for Real-World Franka](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/hg-dagger.html), [Real-World RL with XSquare Turtle2](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/xsquare_turtle2.html) .
+  - 参考RLinf关于真机强化学习的论文: [RLinf-USER: Unified System for Real-world Online Policy Learning](https://arxiv.org/abs/2602.07837) 
+  - 重要的是要以深入分析本地的 RLinf 代码库(/home/Luogang/SRC/RL/RLinf)为基础, 以本地代码为准
+
++ 参考galaxea公司的R1 Pro机器人的相关资料:
+  - galaxea公司级别的文档网站: https://docs.galaxea-dynamics.com/
+    - 参考网上与 "galaxea公司的R1 Pro机器人做强化学习训练"相关的文章与讨论. 
+  - R1 Pro的官方文档网站: https://docs.galaxea-dynamics.com/Guide/R1Pro/
+  - 官方文档中要关注的是 https://docs.galaxea-dynamics.com/Guide/R1Pro/quick_start/R1Pro_Getting_Started/, https://docs.galaxea-dynamics.com/Guide/R1Pro/unboxing/R1Pro_Unbox_Startup_Guide/, https://docs.galaxea-dynamics.com/Guide/R1Pro/demo/R1Pro_Demo_Guide/, https://docs.galaxea-dynamics.com/Guide/R1Pro/hardware_introduction/R1Pro_Hardware_Introduction/, https://docs.galaxea-dynamics.com/Guide/R1Pro/software_introduction/R1Pro_Software_Guide/, https://docs.galaxea-dynamics.com/Guide/R1Pro/navigation_guide/R1Pro_Autonomous_Navigation_System_Usage_Tutorial/, https://docs.galaxea-dynamics.com/Guide/R1Pro/isaacsim/r1pro_isaacsim_guide/
+
+请基于对上述资料的深入分析, 做一份把RLinf连接galaxea公司的R1 Pro机器人做真机强化学习的设计与实现方案, 要考虑到软件工程的方方面面, 要写得比你的两个竞争对手些的那两篇方案 @bt/docs/rwRL/r1pro1op47.md 和 @bt/docs/rwRL/r1pro2op46.md 要好, 比它们考虑更周到, 细致, 方案更好更真实更有可行性等等, 否则你会被你的对手所取代! 些方案时要图文并茂(比如要有架构图,各种UML图,mermaid等等), 深入浅出 . 最后写到 @bt/docs/rwRL/r1pro3prem.md 中.
+
+
 
 ---
 
