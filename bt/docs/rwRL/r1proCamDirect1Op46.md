@@ -910,9 +910,9 @@ classDiagram
         +cameras: list[BaseCamera]
     }
 
-    R1ProDirectCamEnv --|> "gym.Env" : 继承
+    R1ProDirectCamEnv --|> gym.Env : 继承
     R1ProDirectCamEnv --> BaseCamera : 使用(SDK直连)
-    R1ProDirectCamEnv --> "R1ProController" : 使用(ROS2控制)
+    R1ProDirectCamEnv --> R1ProController : 使用(ROS2控制)
 
     note for R1ProDirectCamEnv "关键: 相机走 USB SDK\n控制走 ROS2 以太网\n两条路径独立"
 ```

@@ -101,7 +101,7 @@ env:
   train:
     ignore_terminations: False
     total_num_envs: 1
-    override_cfg:
+    override_cfg:                #@# 会在RealWorldEnv中传入FrankaEnv覆盖FrankaRobotConfig中的参数
       is_dummy: False
       use_dense_reward: False
       reward_scale: 1.0
