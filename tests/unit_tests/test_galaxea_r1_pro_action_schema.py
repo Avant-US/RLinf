@@ -19,6 +19,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from rlinf.envs.realworld.galaxear.r1_pro_action_schema import (
     ActionSchema,
@@ -81,9 +82,9 @@ def test_split_single_arm():
     a = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, -0.7], dtype=np.float32)
     d = s.split(a)
     assert "right_xyz" in d and "right_rpy" in d and "right_gripper" in d
-    np.testing.assert_allclose(d["right_xyz"], [0.1, 0.2, 0.3])
-    np.testing.assert_allclose(d["right_rpy"], [0.4, 0.5, 0.6])
-    assert d["right_gripper"] == -0.7
+    np.testing.assert_allclose(d["right_xyz"], [0.1, 0.2, 0.3], rtol=1e-6)
+    np.testing.assert_allclose(d["right_rpy"], [0.4, 0.5, 0.6], rtol=1e-6)
+    assert d["right_gripper"] == pytest.approx(-0.7)
 
 
 def test_split_full_action():

@@ -20,6 +20,14 @@ use_spacemouse: false
 use_gello: false
 keyboard_reward_wrapper: single_stage
 
+# Disable the Franka-style wrappers that assume `tcp_pose` / single-arm
+# 7D action with gripper at slot 6.  Galaxea exposes per-arm pose keys
+# and an action schema sized by stage (M1 = 7).  See pick_place env
+# subconfig for the rationale.
+no_gripper: false
+use_relative_frame: false
+use_quat2euler_wrapper: false
+
 # Same key as the default variant; main_images dimension does not
 # change with the backend, only the underlying transport.
 main_image_key: wrist_right

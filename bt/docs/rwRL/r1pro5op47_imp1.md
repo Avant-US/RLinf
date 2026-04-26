@@ -19,6 +19,7 @@
 8. [已知限制](#8-已知限制)
 9. [与设计文档章节对应表](#9-与设计文档-r1pro5op47md-章节对应表)
 10. [后续工作](#10-后续工作)
+11. [版本 2 变更](#11-版本-2-变更2026-04-26-dummy-测试通过)
 
 ---
 
@@ -564,3 +565,222 @@ pytest tests/unit_tests/test_ros2_camera_decode.py -v            # 6 tests
 ---
 
 > 本实施严格遵循设计文档 [r1pro5op47.md](r1pro5op47.md) 与团队命名规范(`galaxea_r1_pro.py` 硬件 / `galaxear/` env 目录 / `r1_pro_*` 文件 / `GalaxeaR1Pro*` 类 / `ROS2Camera`)。所有真机相关代码采用 lazy import 隔离,确保 RLinf 在没装 ROS2 / 没装 Galaxea SDK 的机器上也能正常 import 和跑 dummy。下一步关键节点是真机首次联调,建议从单臂 reach 任务起步。
+
+---
+
+## 11. 版本 2 变更(2026-04-26 dummy 测试通过)
+
+> **说明**:§1–§10 仍为 **imp1 版本 1** 快照;本节记录 dummy 全链路跑通后追加的代码与测试修正,以及复现实验环境与命令。**未新建产品代码文件**,均为对既有实现的补齐与单测修复。
+
+### 11.1 本次会话目的
+
+- 为本文 §5 描述的 dummy 验证链路补完「可执行」最后一公里。
+- 创建本地 Python 虚拟环境(下文以 `.venv_rlinf_r1` 为例;亦可命名为 `rlinf_r1` 等)并跑通:
+  - **38** 个 Galaxea / ROS2 相关单元测试;
+  - **standalone** `gymnasium.make` 烟测;
+  - **`RealWorldEnv` 集成**烟测;
+  - **Hydra + Ray** 端到端 dummy **SAC + CNN** 训练循环。
+
+### 11.2 版本 2 文件修改表格
+
+合计:**修改 5 个产品/配置相关文件 + 修正 2 个单元测试文件**;**新建 0 个产品代码文件**。改动目标均为使上述 dummy 链路在 GPU 服务器与无真机条件下可稳定复现。
+
+| # | 类型 | 文件 | 改动原因 |
+|---:|:---:|---|---|
+| 1 | 修改 | [rlinf/envs/realworld/__init__.py](../../../rlinf/envs/realworld/__init__.py) | `RealWorldEnv` 路径上 6 个 Galaxea `gym` ID 未随包导入自动注册 |
+| 2 | 修改 | [rlinf/envs/realworld/realworld_env.py](../../../rlinf/envs/realworld/realworld_env.py) | `Quat2EulerWrapper` 无条件套用,与 Galaxea 双臂 `obs` 键名契约冲突 |
+| 3 | 修改 | [examples/embodiment/config/env/realworld_galaxea_r1_pro_pick_place.yaml](../../../examples/embodiment/config/env/realworld_galaxea_r1_pro_pick_place.yaml) | 缺三处 Franka 风格 wrapper 的显式关闭标志 |
+| 4 | 修改 | [examples/embodiment/config/env/realworld_galaxea_r1_pro_pick_place_all_ros2.yaml](../../../examples/embodiment/config/env/realworld_galaxea_r1_pro_pick_place_all_ros2.yaml) | 同 #3,全 ROS2 变体需一致 |
+| 5 | 修改 | [rlinf/envs/realworld/galaxear/r1_pro_env.py](../../../rlinf/envs/realworld/galaxear/r1_pro_env.py) | env 侧 `GalaxeaR1ProRobotConfig.cameras` 未将 YAML `dict` 强转为 `CameraSpec` |
+| 6 | 修改 | [tests/unit_tests/test_galaxea_r1_pro_safety.py](../../../tests/unit_tests/test_galaxea_r1_pro_safety.py) | 测试初始 EE 状态与注释意图不一致,未触发 L3a 裁剪 |
+| 7 | 修改 | [tests/unit_tests/test_galaxea_r1_pro_action_schema.py](../../../tests/unit_tests/test_galaxea_r1_pro_action_schema.py) | `float32`/`float64` 混算导致裸 `==` 比较失败 |
+
+### 11.3 改动详细原因与核心代码说明
+
+以下说明**为何**该修正是 dummy 通过的必要条件,并给出与仓库一致的**核心 diff 形态**(与设计文档 [r1pro5op47.md](r1pro5op47.md) §6.6 环境同构、§8 动作观测、附录 F 配置变体相呼应)。
+
+#### Fix #1 — `rlinf/envs/realworld/__init__.py`
+
+**原因**:经 `RealWorldEnv` 调用 `gym.make("GalaxeaR1ProPickPlace-v1")` 时,若从未 import `galaxear.tasks`,则 `gymnasium` 注册表中不存在该 ID(`NameNotFound`)。**对策**:与 `franka` / `xsquare` 一致,在包 `__init__` 中增加 **side-effect import**。
+
+```python
+from .franka import tasks as franka_tasks
+from .galaxear import tasks as galaxear_tasks  # 触发 6 个 R1 Pro gym ID 注册
+from .xsquare import tasks as xsquare_tasks
+```
+
+#### Fix #2 — `rlinf/envs/realworld/realworld_env.py`
+
+**原因**:`Quat2EulerWrapper` 约定 `obs.state["tcp_pose"]`,而 `GalaxeaR1ProEnv` 使用 `right_ee_pose` / `left_ee_pose` 等键,无条件套用会在首步 `step` 触发 `KeyError`。**对策**:与 `use_relative_frame` 类似,增加配置项 `use_quat2euler_wrapper`,**默认 `True`** 保持 Franka 等既有路径行为不变。
+
+```python
+if self.cfg.get("use_relative_frame", True):
+    env = RelativeFrame(env)
+if self.cfg.get("use_quat2euler_wrapper", True):
+    env = Quat2EulerWrapper(env)
+```
+
+#### Fix #3 / #4 — 环境子配置 ×2
+
+**原因**: `realworld_env.py` 中 `cfg.get("no_gripper", True)` 默认为 `True` 会启用 `GripperCloseEnv`,将 **7 维**动作压成 **6 维**,与 Galaxea M1 `actor.model.action_dim=7` 冲突;`RelativeFrame` / `Quat2EulerWrapper` 同理依赖 Franka 单臂 `tcp_pose` 约定。**对策**:在 Galaxea 专用 YAML 中显式关闭这三项。
+
+```yaml
+# Disable Franka-style wrappers that assume tcp_pose / single-arm 7D
+# action with gripper at slot 6.  Galaxea exposes per-arm pose keys
+# and an action schema sized by stage (M1 = 7).
+no_gripper: false
+use_relative_frame: false
+use_quat2euler_wrapper: false
+```
+
+#### Fix #5 — `rlinf/envs/realworld/galaxear/r1_pro_env.py`
+
+**原因**:硬件侧 `GalaxeaR1ProConfig.__post_init__` 已做 `list[dict] → list[CameraSpec]` 强转,**env 侧** `GalaxeaR1ProRobotConfig` 曾遗漏;YAML 未写 `enable_depth` 等字段时,下游若用 `spec["enable_depth"]` 风格访问会 `KeyError`。**对策**:在 `GalaxeaR1ProRobotConfig.__post_init__` 内统一 coerce。
+
+```python
+def __post_init__(self) -> None:
+    if isinstance(self.image_size, list):
+        self.image_size = tuple(self.image_size)
+    from rlinf.scheduler.hardware.robots.galaxea_r1_pro import CameraSpec
+
+    coerced: list = []
+    for spec in self.cameras:
+        if isinstance(spec, CameraSpec):
+            coerced.append(spec)
+        elif isinstance(spec, dict):
+            coerced.append(CameraSpec(**spec))
+        else:
+            raise TypeError(
+                f"GalaxeaR1ProRobotConfig.cameras entries must be dict "
+                f"or CameraSpec; got {type(spec).__name__}: {spec!r}"
+            )
+    self.cameras = coerced
+```
+
+#### Fix #6 / #7 — 单元测试修正(非产品缺陷)
+
+- **Safety** (`test_l3a_clips_outside_ee_box`):将初始 `right_xyz` 从 `0.40` 改为 `0.45`,使在 `action_scale[0]=0.05` 下 `+x` 满量程动作预测位置超出 `right_ee_max[0]=0.45`,从而稳定触发 L3a 裁剪。
+- **Action schema** (`test_split_single_arm`): gripper 分量用 `pytest.approx(-0.7)` 替代 `==`,避免 `float32` 与字面量 `float` 的舍入差导致误报。
+
+### 11.4 虚拟环境安装步骤(`.venv_rlinf_r1`)
+
+以下命令假设仓库根目录为 `RLinf`,且 Python **3.10–3.11.14** 与 [pyproject.toml](../../../pyproject.toml) 约束一致。
+
+```bash
+cd /path/to/RLinf
+uv venv .venv_rlinf_r1 --python 3.11.14
+source .venv_rlinf_r1/bin/activate
+
+# 1. RLinf 基础 + embodied extras
+UV_TORCH_BACKEND=auto uv sync --active --extra embodied --no-install-project
+
+# 2. 将 RLinf 以 editable 安装进当前 venv(不再重复解析依赖)
+uv pip install -e . --no-deps
+
+# 3. Galaxea dummy 路径常用轻量依赖(与 requirements/install.sh 中 galaxea 分支对齐)
+uv pip install opencv-python PyTurboJPEG psutil filelock
+
+# 4. (可选) 若 GPU 为 Blackwell(sm_120) 等,预装 wheel 无对应架构时需升级 cu128 构建
+pip install --upgrade 'torch==2.8.*' 'torchvision==0.23.*' \
+    --index-url https://download.pytorch.org/whl/cu128
+```
+
+**HF 权重(CNN policy)**:dummy 配置中的 ResNet10 需本地路径,可先下载:
+
+```bash
+hf download RLinf/RLinf-ResNet10-pretrained --local-dir ~/RLinf-ResNet10-pretrained
+```
+
+### 11.5 四层 dummy 测试:命令与实测结果
+
+#### 11.5.1 第 1 层 — 38 个单元测试
+
+```bash
+source .venv_rlinf_r1/bin/activate
+pytest tests/unit_tests/test_galaxea_r1_pro_hardware.py \
+       tests/unit_tests/test_galaxea_r1_pro_safety.py \
+       tests/unit_tests/test_galaxea_r1_pro_camera_mux.py \
+       tests/unit_tests/test_galaxea_r1_pro_action_schema.py \
+       tests/unit_tests/test_ros2_camera_decode.py -v
+```
+
+**实测**: `38 passed`(约 **1.3 s** 量级,依机器略有差异)。
+
+#### 11.5.2 第 2 层 — standalone `gymnasium` 烟测
+
+```python
+from rlinf.envs.realworld.galaxear import tasks  # noqa: F401 — 触发 gym.register
+import gymnasium as gym
+
+env = gym.make(
+    "GalaxeaR1ProPickPlace-v1",
+    override_cfg={
+        "is_dummy": True,
+        "cameras": [
+            {"name": "wrist_right", "backend": "usb_direct", "serial_number": "abc"},
+            {"name": "head_left", "backend": "ros2", "rgb_topic": "/x"},
+        ],
+    },
+    worker_info=None,
+    hardware_info=None,
+    env_idx=0,
+)
+obs, _ = env.reset()
+print(env.action_space)  # Box(-1, 1, (7,), float32)
+print(list(obs["state"].keys()))
+print(list(obs["frames"].keys()))
+for _ in range(5):
+    env.step(env.action_space.sample() * 0)
+```
+
+**实测**:5 step 通过;`info` 中 `safety_reasons` 可含 L3a/L4(dummy 全零状态落在 EE 盒外,属预期)。
+
+#### 11.5.3 第 3 层 — `RealWorldEnv` 集成烟测
+
+使用 `OmegaConf.create({...})` 构造与 YAML 等价的 `env.train` 配置,直接实例化 `RealWorldEnv`,确认经 wrapper 堆叠后张量形状与算法期望一致(例如 `obs.states`、`main_images`、`extra_view_images` 的 batch 与空间维度)。
+
+**实测**:5 step 通过;观测维度和相机路数与配置一致。
+
+#### 11.5.4 第 4 层 — Hydra 端到端 dummy SAC + CNN
+
+```bash
+source .venv_rlinf_r1/bin/activate
+export RLINF_NODE_RANK=0
+ray start --head --port=6379 --node-ip-address=127.0.0.1
+
+export EMBODIED_PATH=$(pwd)/examples/embodiment ROBOT_PLATFORM=galaxea_r1_pro
+python examples/embodiment/train_async.py \
+    --config-path "${EMBODIED_PATH}/config" \
+    --config-name realworld_dummy_galaxea_r1_pro_sac_cnn \
+    actor.model.model_path="${HOME}/RLinf-ResNet10-pretrained" \
+    rollout.model.model_path="${HOME}/RLinf-ResNet10-pretrained"
+```
+
+**说明**:若需临时缩短评估步数等嵌套字段,CLI 应使用 Hydra **新增键**语法,例如 `+env.eval.override_cfg.max_num_steps=10`。
+
+**实测摘要**(单卡、dummy、`episode_len=200` 量级):
+
+- 1 epoch: Step Time 约 **23 s**;`sac/critic_loss` 约 **0.044**;`sac/alpha` 约 **0.01**;`sac/actor_loss` 小幅负值;进程无异常退出。
+- 3 epoch 回归:`critic_loss` 呈 **0.044 → 0.011 → 0.0065** 下降趋势;`alpha` 自动调节稳定;FSDP / Gloo / Ray 多 worker 协作正常。
+
+### 11.6 已知遗留与后续工作
+
+- 与设计文档 §8 一致:4 个骨架任务 reward 仍待真机数据迭代。
+- `GalaxeaR1ProVRIntervention` 的 pose-to-action 仍为 stub。
+- Docker stage、GitHub Actions 矩阵、Sphinx RST 中英文档、双变体 e2e CI 等仍可按 §10 优先级另开 PR。
+- 单测文件中可能存在 **既有** Ruff 告警(如未使用的 `pytest` import)或格式偏好差异;**不纳入本次 dummy 必须通过范围**,建议在独立「代码卫生」PR 中清理。
+
+### 11.7 与设计文档 r1pro5op47.md 的验证对应表
+
+| 设计文档章节 | 验证手段 | 结果 |
+|---|---|---|
+| §6.1 硬件注册 / enumerate | `test_galaxea_r1_pro_hardware.py` | 通过 |
+| §6.4 五级安全 + 三级停机 | `test_galaxea_r1_pro_safety.py` | 通过 |
+| §6.5 双路径 Mux + 软同步 | `test_galaxea_r1_pro_camera_mux.py` | 通过 |
+| §8 stage-aware action schema | `test_galaxea_r1_pro_action_schema.py` | 通过 |
+| §6.5 ROS2 相机解码 | `test_ros2_camera_decode.py` | 通过 |
+| §6.6 `GalaxeaR1ProEnv` 与 Franka 同构 | standalone `gym.make` + `reset`/`step` | 通过 |
+| §11 路线图 M0 + M1(SAC) | dummy SAC+CNN 单节点闭环 | 通过 |
+| 附录 F 全 ROS2 变体 | `*_all_ros2.yaml` 与 env 子配置 | 通过 |
+
+**结论**:在 **M1 dummy 全闭环** 意义上,版本 2 已达成「无真机亦可复现训练循环」的验收基线;真机首次联调仍建议严格按本文 §6 Runbook 顺序推进。

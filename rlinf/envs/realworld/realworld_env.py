@@ -116,7 +116,8 @@ class RealWorldEnv(gym.Env):
 
         if self.cfg.get("use_relative_frame", True):
             env = RelativeFrame(env)
-        env = Quat2EulerWrapper(env)
+        if self.cfg.get("use_quat2euler_wrapper", True):
+            env = Quat2EulerWrapper(env)
 
         # ── Galaxea R1 Pro specific wrappers (config-driven, opt-in) ──
         # Importing here keeps Franka / Turtle2 paths free of any

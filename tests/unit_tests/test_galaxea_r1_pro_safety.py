@@ -88,8 +88,9 @@ def test_l3a_clips_outside_ee_box():
                                 dtype=np.float32)
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     schema = _schema_single_arm()
-    state = _state_with_ee(right_xyz=(0.40, 0.05, 0.35))
-    # +x action would push EE to 0.45 + 0.05*1.0 = 0.50 (above limit 0.45).
+    # State at 0.45 + a +x action of 1.0 with action_scale[0]=0.05 would
+    # push the predicted EE x to 0.50 -- above the configured 0.45 limit.
+    state = _state_with_ee(right_xyz=(0.45, 0.05, 0.35))
     a = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
     info = sup.validate(a, state, schema)
     assert info.clipped is True

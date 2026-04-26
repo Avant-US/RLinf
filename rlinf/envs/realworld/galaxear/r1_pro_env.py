@@ -130,6 +130,24 @@ class GalaxeaR1ProRobotConfig:
     def __post_init__(self) -> None:
         if isinstance(self.image_size, list):
             self.image_size = tuple(self.image_size)
+        # Coerce camera dicts coming from YAML / override_cfg into
+        # CameraSpec instances so downstream code can rely on dataclass
+        # attribute access (with type-correct defaults for fields like
+        # enable_depth that may be omitted in YAML).
+        from rlinf.scheduler.hardware.robots.galaxea_r1_pro import CameraSpec
+
+        coerced: list = []
+        for spec in self.cameras:
+            if isinstance(spec, CameraSpec):
+                coerced.append(spec)
+            elif isinstance(spec, dict):
+                coerced.append(CameraSpec(**spec))
+            else:
+                raise TypeError(
+                    f"GalaxeaR1ProRobotConfig.cameras entries must be dict "
+                    f"or CameraSpec; got {type(spec).__name__}: {spec!r}"
+                )
+        self.cameras = coerced
         # No numpy coercion here -- keep dataclass picklable; numpy
         # arrays are constructed at use site (env.step / safety).
 
