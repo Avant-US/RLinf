@@ -1,0 +1,39 @@
+# Env subconfig for the all-ROS 2 variant: both wrist and head
+# cameras travel via ROS 2 (no USB-direct).  See appendix F of
+# bt/docs/rwRL/r1pro5op47.md for the design rationale.
+
+env_type: realworld
+
+total_num_envs: null
+
+auto_reset: true
+ignore_terminations: true
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 200
+max_episode_steps: 200
+
+use_spacemouse: false
+use_gello: false
+keyboard_reward_wrapper: single_stage
+
+# Same key as the default variant; main_images dimension does not
+# change with the backend, only the underlying transport.
+main_image_key: wrist_right
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: GalaxeaR1ProPickPlace-v1
+  num_envs: null
+
+use_galaxea_r1_pro_joystick: false
+use_galaxea_r1_pro_vr: false
+use_galaxea_r1_pro_dual_arm_collision: false
+use_galaxea_r1_pro_action_smoother: true

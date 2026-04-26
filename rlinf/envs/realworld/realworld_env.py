@@ -117,6 +117,35 @@ class RealWorldEnv(gym.Env):
         if self.cfg.get("use_relative_frame", True):
             env = RelativeFrame(env)
         env = Quat2EulerWrapper(env)
+
+        # ── Galaxea R1 Pro specific wrappers (config-driven, opt-in) ──
+        # Importing here keeps Franka / Turtle2 paths free of any
+        # rclpy / Galaxea SDK references at module import time.
+        if not env.config.is_dummy and (
+            self.cfg.get("use_galaxea_r1_pro_joystick", False)
+            or self.cfg.get("use_galaxea_r1_pro_vr", False)
+            or self.cfg.get("use_galaxea_r1_pro_dual_arm_collision", False)
+            or self.cfg.get("use_galaxea_r1_pro_action_smoother", False)
+        ):
+            from rlinf.envs.realworld.galaxear.r1_pro_wrappers import (
+                GalaxeaR1ProActionSmoother,
+                GalaxeaR1ProDualArmCollisionWrapper,
+                GalaxeaR1ProJoystickIntervention,
+                GalaxeaR1ProVRIntervention,
+            )
+
+            if self.cfg.get("use_galaxea_r1_pro_joystick", False):
+                env = GalaxeaR1ProJoystickIntervention(
+                    env, gripper_enabled=gripper_enabled,
+                )
+            if self.cfg.get("use_galaxea_r1_pro_vr", False):
+                env = GalaxeaR1ProVRIntervention(
+                    env, gripper_enabled=gripper_enabled,
+                )
+            if self.cfg.get("use_galaxea_r1_pro_dual_arm_collision", False):
+                env = GalaxeaR1ProDualArmCollisionWrapper(env)
+            if self.cfg.get("use_galaxea_r1_pro_action_smoother", False):
+                env = GalaxeaR1ProActionSmoother(env)
         return env
 
     @staticmethod

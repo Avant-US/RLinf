@@ -18,7 +18,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic" "starvla" "lingbotvla" "dreamzero")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "galaxea_r1_pro")
 
 #=======================Utility Functions=======================
 
@@ -675,6 +675,10 @@ install_env_only() {
             install_common_embodied_deps
             install_habitat_env
             ;;
+        galaxea_r1_pro)
+            install_common_embodied_deps
+            install_galaxea_r1_pro_env
+            ;;
         *)
             echo "Environment '$ENV_NAME' is not supported for env-only installation." >&2
             exit 1
@@ -835,6 +839,32 @@ install_franka_env() {
 
 install_xsquare_turtle2_env() {
     uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/xsquare_turtle_basics.git
+}
+
+install_galaxea_r1_pro_env() {
+    # Galaxea R1 Pro real-world env: rclpy / ROS 2 Humble / Galaxea
+    # SDK live OUTSIDE the venv (apt + colcon).  Here we only install
+    # the lightweight Python deps used by the EnvWorker side
+    # (camera Mux, USB direct path, JPEG decode).  The Orin must be
+    # set up separately according to bt/docs/rwRL/r1pro5op47_imp1.md.
+    uv pip install icmplib opencv-python pyrealsense2 PyTurboJPEG
+    if ! python -c "import rclpy" >/dev/null 2>&1; then
+        echo ""
+        echo "[install][galaxea_r1_pro] rclpy is NOT importable from this venv."
+        echo "[install][galaxea_r1_pro] On the controller / camera node (typically Orin),"
+        echo "[install][galaxea_r1_pro] install ROS 2 Humble system packages and source them"
+        echo "[install][galaxea_r1_pro] BEFORE \`ray start\`:"
+        echo ""
+        echo "[install][galaxea_r1_pro]   sudo apt install ros-humble-ros-base \\"
+        echo "[install][galaxea_r1_pro]                    ros-humble-cv-bridge \\"
+        echo "[install][galaxea_r1_pro]                    ros-humble-rmw-fastrtps-cpp"
+        echo "[install][galaxea_r1_pro]   source /opt/ros/humble/setup.bash"
+        echo "[install][galaxea_r1_pro]   source \$GALAXEA_INSTALL_PATH/setup.bash"
+        echo ""
+        echo "[install][galaxea_r1_pro] Or use ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh"
+        echo "[install][galaxea_r1_pro] which sources the right scripts and exports DDS env vars."
+    fi
+    echo "[install][galaxea_r1_pro] env ready."
 }
 
 install_robotwin_env() {

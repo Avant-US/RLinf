@@ -1,0 +1,45 @@
+# Env subconfig for the Galaxea R1 Pro pick-place task (default
+# dual-path camera deployment: wrist USB direct + head ROS 2).
+
+env_type: realworld
+
+total_num_envs: null
+
+auto_reset: true
+ignore_terminations: true
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 200
+max_episode_steps: 200
+
+# Disable Franka-style spacemouse / GELLO; we use Galaxea-specific
+# joystick / VR wrappers instead (opt-in below).
+use_spacemouse: false
+use_gello: false
+keyboard_reward_wrapper: single_stage
+
+# Main image fed to ``obs.main_images``.  In the default deployment
+# the right wrist D405 (USB direct) gives the lowest-latency
+# in-hand view.  Override to ``head_left`` if your task benefits
+# more from a wide-angle scene shot.
+main_image_key: wrist_right
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: GalaxeaR1ProPickPlace-v1
+  num_envs: null
+
+# Galaxea R1 Pro specific intervention switches (off by default;
+# RealWorldEnv._create_env reads these to decide whether to attach
+# the corresponding wrapper).
+use_galaxea_r1_pro_joystick: false
+use_galaxea_r1_pro_vr: false
+use_galaxea_r1_pro_dual_arm_collision: false
+use_galaxea_r1_pro_action_smoother: true

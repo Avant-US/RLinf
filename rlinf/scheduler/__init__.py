@@ -19,6 +19,7 @@ from .hardware import (
     AcceleratorType,
     AcceleratorUtil,
     FrankaHWInfo,
+    GalaxeaR1ProHWInfo,
     HardwareInfo,
     Turtle2HWInfo,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "AcceleratorType",
     "HardwareInfo",
     "FrankaHWInfo",
+    "GalaxeaR1ProHWInfo",
     "Turtle2HWInfo",
     "CollectiveGroupOptions",
     "Cluster",

@@ -24,7 +24,36 @@ import numpy as np
 
 @dataclass
 class CameraInfo:
-    """Descriptor for a single camera device."""
+    """Descriptor for a single camera device.
+
+    Backwards compatible with existing Franka / Turtle2 callers: the
+    ``backend / rgb_topic / depth_topic / stale_threshold_ms /
+    align_depth_to_color`` fields all have safe defaults so callers
+    that pass only ``(name, serial_number, camera_type, ...)`` keep
+    behaving exactly as before.
+
+    Args:
+        name: Logical name used in the observation dict.
+        serial_number: USB SDK serial (RealSense / ZED).  May be empty
+            when ``backend == "ros2"``.
+        camera_type: Legacy SDK selector for usb_direct path:
+            ``"realsense"`` / ``"rs"`` / ``"zed"``.
+        resolution: ``(width, height)``.
+        fps: Capture frame rate.
+        enable_depth: Whether to return a 4-channel ``[bgr, depth]``
+            stack instead of plain BGR.
+        backend: ``"usb_direct"`` (default; uses RealSense / ZED SDK)
+            or ``"ros2"`` (subscribes to ROS 2 image topic).
+        rgb_topic: ROS 2 RGB topic; required when
+            ``backend == "ros2"``.  Topics ending in ``/compressed``
+            are decoded with TurboJPEG / OpenCV; raw image topics use
+            the configured pixel encoding.
+        depth_topic: Optional ROS 2 depth topic
+            (``sensor_msgs/Image`` with ``16UC1`` or ``32FC1``).
+        stale_threshold_ms: Frames older than this (wall clock minus
+            the most recent ROS header stamp) are reported as stale.
+        align_depth_to_color: For RealSense; align depth to color.
+    """
 
     name: str
     serial_number: str
@@ -32,6 +61,12 @@ class CameraInfo:
     resolution: tuple[int, int] = (640, 480)
     fps: int = 15
     enable_depth: bool = False
+    # ── New (default-safe) fields for the dual-path camera Mux. ──
+    backend: str = "usb_direct"
+    rgb_topic: Optional[str] = None
+    depth_topic: Optional[str] = None
+    stale_threshold_ms: float = 200.0
+    align_depth_to_color: bool = True
 
 
 class BaseCamera(ABC):

@@ -26,12 +26,24 @@ __all__ = [
 def create_camera(camera_info: CameraInfo) -> BaseCamera:
     """Factory that instantiates the right camera backend from *camera_info*.
 
-    Supported ``camera_info.camera_type`` values:
+    Dispatch order:
 
-    * ``"realsense"`` / ``"rs"`` — Intel RealSense (requires ``pyrealsense2``)
-    * ``"zed"`` — Stereolabs ZED (requires the ZED SDK / ``pyzed``)
+    1. Explicit ``camera_info.backend == "ros2"`` (preferred for cross-host
+       deployments such as Galaxea R1 Pro head GMSL or all-ROS2 variant)
+       returns a :class:`ROS2Camera`.
+    2. ``camera_info.camera_type == "ros2"`` is treated as a synonym for
+       backend selection (legacy YAML compatibility).
+    3. ``camera_info.camera_type == "zed"`` returns a :class:`ZEDCamera`
+       (requires the Stereolabs ZED SDK / ``pyzed``).
+    4. ``camera_info.camera_type in ("realsense", "rs")`` returns a
+       :class:`RealSenseCamera` (requires ``pyrealsense2``).
     """
-    camera_type = camera_info.camera_type.lower()
+    backend = (camera_info.backend or "usb_direct").lower()
+    camera_type = (camera_info.camera_type or "realsense").lower()
+    if backend == "ros2" or camera_type == "ros2":
+        from .ros2_camera import ROS2Camera
+
+        return ROS2Camera(camera_info)
     if camera_type == "zed":
         from .zed_camera import ZEDCamera
 
@@ -39,5 +51,6 @@ def create_camera(camera_info: CameraInfo) -> BaseCamera:
     if camera_type in ("realsense", "rs"):
         return RealSenseCamera(camera_info)
     raise ValueError(
-        f"Unsupported camera_type={camera_type!r}. Supported types: 'realsense', 'zed'."
+        f"Unsupported camera: backend={backend!r}, camera_type={camera_type!r}. "
+        "Supported types: 'realsense', 'zed', 'ros2'."
     )
