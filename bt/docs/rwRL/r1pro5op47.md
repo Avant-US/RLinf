@@ -2010,6 +2010,94 @@ flowchart LR
 
 图 6.4.1:五级安全闸门流程。每级失败都会写入 `safety_info` 并被 `MetricLogger` 收集。
 
+##### ***L1 schema validate***
+L1 schema validate 是五级闸门的第一道检查，验证策略网络输出的 action 向量是否格式合法：
+
+shape — 维度是否正确。不同阶段 action 维度不同（M1 单臂=7, M2 双臂=14, M3 含躯干=18, M4 含底盘=21），action 向量长度必须与当前 ActionSchema.action_dim 一致。
+
+dtype — 数据类型是否为浮点数（float32）。防止策略输出整数、布尔值等意外类型。
+
+range [-1, 1] — 每个元素是否在归一化区间 [-1, 1] 内。策略网络输出经过 tanh 激活，理论上在此范围内；L1 用 np.clip 强制裁剪越界值，然后由 ActionSchema 的 action_scale 乘以缩放因子转换为实际物理量（例如 ×0.05m 得到位移增量）。
+
+在 r1_pro_safety.py 的 validate() 方法中，L1 对应的就是入口处的 shape 断言和 clip 操作 — 这是最轻量的检查，确保后续 L2-L5 拿到的数据格式没问题。
+
+##### ***L2 per-joint limit***
+L2 per-joint limit 是对机械臂每个关节施加的两类物理约束：
+1. q_min / q_max — 关节位置极限（单位：弧度）。每个关节有自己的运动范围，超出会导致机械碰撞或结构损坏。例如 R1 Pro 7-DOF 臂：
+
+|关节|q_min|q_max|含义|
+|---|---|---|---|
+|J1|-2.7|2.7|基座旋转，±155°|
+|J2|-1.8|1.8|肩俯仰，±103°|
+|J4|-3.0|0.0|肘关节，只能向一侧弯|
+|J6|-0.1|3.7|腕关节，不对称范围|
+
+2. max_velocity（arm_qvel_max） — 关节角速度极限（单位：rad/s）。防止关节转速过快导致惯性力过大。近端关节（J1-J4）限 3.0 rad/s，远端关节（J5-J7）限 5.0 rad/s — 远端力臂短、惯量小，可以转得更快。
+L2 的作用：在 L1 验证 action 格式合法之后、L3 做笛卡尔空间安全框之前，L2 在关节空间检查："如果执行这个动作，各关节的位置和速度是否会超限？" 如果超限则裁剪或拒绝。
+当前实现状态：SafetyConfig 中定义了这些参数，但 r1_pro_safety.py 的 validate() 方法里 L2 只有注释占位，实际并未执行检查 — 因为当前控制模式是笛卡尔空间（EE pose），没有直接的关节角反馈。L3a（TCP 安全框）和 L4（速度上限）间接提供了部分保护。
+
+##### ***L3 TCP safety box per arm***
+L3 是笛卡尔空间（工作空间）层面的两道碰撞防护，分 L3a 和 L3b：
+L3a — TCP safety box per arm（末端安全框）
+给每只手臂的 TCP（Tool Center Point，即末端执行器）划定一个三维矩形工作区域：
+Copy code to clipboard
+right_ee_min: [-0.05, -0.45, -0.10]   # x/y/z 下界（米）
+right_ee_max: [ 0.55,  0.15,  0.50]   # x/y/z 上界（米）
+策略输出一个动作后，predict_arm_ee_pose() 预测执行后的 EE 目标位置。如果目标超出这个框，_rewrite_arm_action() 会反算出一个裁剪后的 action，使 EE 刚好停在框的边界上 — 而不是简单地丢弃动作。这样策略仍能沿允许的方向运动。
+L3b — dual-arm collision spheres（双臂碰撞球）
+双臂场景下，用球体近似左右手臂末端，检测两球之间距离：
+Copy code to clipboard
+dual_arm_min_distance: 0.10   # 最小安全距离（米）
+dual_arm_collision_radius: 0.08  # 各臂球体半径
+当两个 EE 球心距离 < min_distance 时，冻结双臂动作（输出零），防止左右手互撞。r1_pro_wrappers.py 中的 DualArmCollisionWrapper 还提供了更外层的减速区（soft slow-zone），在距离接近阈值时逐渐降低动作幅度，与 L3b 的硬冻结互补。
+
+##### ***L4 vel / acc / jerk caps***
+L4 是对所有运动部件的动态量上限约束，防止动作过快、过猛、过抖：
+
+vel（velocity） — 速度上限。限制末端执行器/底盘/躯干每个控制周期的最大运动速度。
+acc（acceleration） — 加速度上限。限制速度的变化率，防止突然起停产生过大惯性力。
+jerk — 加加速度（急动度）上限。限制加速度的变化率，让运动更平滑，减少机械振动。
+这三个量逐级约束，形成"速度→加速度→急动度"的平滑性保障链。
+
+覆盖的四类运动部件：
+
+|部件|	约束量|	SafetyConfig 参数|	含义|
+|---|---|---|---|
+|linear（手臂平移）| vel| max_ee_vel: 0.5 m/s|	EE 的 xyz 平移速度|
+|angular（手臂旋转）|	vel|	max_ee_angular_vel: 1.0 rad/s|	EE 的 rpy 旋转速度|
+|chassis（底盘）|	vel|	max_chassis_linear_vel: 0.3 m/s|	底盘平移速度|
+|torso（躯干升降/俯仰）|	vel|	max_torso_vel: 0.2 m/s|	躯干关节速度|
+
+在 r1_pro_safety.py 的 _apply_velocity_caps() 中，实现方式是将 action 各分量按 action_scale 换算为物理速度后，与上限对比，超限则等比缩放整个分量（而非逐元素裁剪），保持运动方向不变。
+
+当前实现状态：vel cap 已实现；acc 和 jerk cap 在代码中尚未实现（设计文档提到但代码只做了速度层），这是 safety_2.md 中记录的 P2 gap 之一。
+
+##### ***L5 system watchdog***
+L5 是系统级看门狗，监控机器人硬件和通信的健康状态，检测的五类异常：
+
+|子项|	全称|	含义|	触发条件|
+|---|---|---|---|
+|SWD|	Safety Watchdog|	硬件安全看门狗信号|	控制器上报 swd_status == DOWN — 通常意味着底层安全链路断开|
+|BMS|	Battery Management System|	电池管理系统|	电量 < bms_soc_critical（默认 15%）或温度过高 — 电量不足时电机可能突然失力|
+|status_errors	|控制器错误状态|	硬件/驱动器报错列表|	robot_state.status_errors 非空 — 如电机过温、编码器故障、CAN 总线错误|
+|feedback_age|	反馈信号陈旧度|	ROS2 话题多久没更新|	feedback_age_ms > stale_threshold_ms（默认 500ms）— 说明通信中断或节点挂了|
+|A2 fall risk|	跌倒风险（A2 构型）|	机体倾斜角过大	|pitch/roll > fall_risk_threshold（默认 15°）— R1 Pro 双足站立时有倾倒风险|
+
+与 L1-L4 的本质区别：L1-L4 检查的是"这个 action 安全吗"（动作层面），L5 检查的是"这台机器人现在还能动吗"（系统层面）。即使 action 完全合法，只要 L5 任一项触发，都会进入关断流程。
+
+关断等级映射（在 r1_pro_safety.py 的 validate() 中）：
+
+```
+SWD DOWN        → emergency_stop（最高级，硬件安全链路断了）
+BMS critical    → safe_stop（中级，还有时间减速停机）
+status_errors   → safe_stop
+feedback_age    → soft_hold（最低级，可能只是暂时通信抖动，零速等待恢复）
+A2 fall risk    → soft_hold + 动作衰减 0.5×（降低幅度但不完全冻结）
+```
+
+当前实现状态：feedback_age 检测已实现；SWD/BMS/status_errors 依赖 hdas_msg 包（HDAS CAN 总线消息），在 r1_pro_controller.py 中做了 graceful fallback — 如果 hdas_msg 未安装，这三项的回调不注册，L5 对应检查自动跳过。
+
+
 #### 6.4.3 三级停机
 
 | 等级 | 触发条件 | 动作 |

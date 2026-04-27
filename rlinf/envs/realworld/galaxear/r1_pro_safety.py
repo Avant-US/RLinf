@@ -187,7 +187,7 @@ class GalaxeaR1ProSafetySupervisor:
             info.safe_action = np.zeros_like(info.safe_action)
             info.emergency_stop = True
             info.reason.append("L1:non_finite_action")
-        clipped = np.clip(info.safe_action, -1.0, 1.0)
+        clipped = np.clip(info.safe_action, -1.0, 1.0)  #@#TODO 这里是不是要保证之前就归一化到[-1,1]或其它范围???
         if not np.array_equal(clipped, info.safe_action):
             info.clipped = True
             info.reason.append("L1:clipped_to_unit_box")
