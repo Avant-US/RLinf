@@ -847,7 +847,7 @@ install_galaxea_r1_pro_env() {
     # the lightweight Python deps used by the EnvWorker side
     # (camera Mux, USB direct path, JPEG decode).  The Orin must be
     # set up separately according to bt/docs/rwRL/r1pro5op47_imp1.md.
-    uv pip install icmplib opencv-python pyrealsense2 PyTurboJPEG
+    uv pip install icmplib opencv-python pyrealsense2 PyTurboJPEG psutil filelock
     if ! python -c "import rclpy" >/dev/null 2>&1; then
         echo ""
         echo "[install][galaxea_r1_pro] rclpy is NOT importable from this venv."

@@ -976,8 +976,8 @@ gantt
 
 交付物：
 
-- `requirements/install.sh` 新增 `--env galaxea_r1pro`（安装 rclpy + turbojpeg + R1 Pro `mobiman` python 客户端 + icmplib）。
-- Dockerfile 新 stage `galaxea_r1pro`（继承 embodied base + ROS2 Humble）。
+- `requirements/install.sh` 新增 `--env galaxea_r1_pro`（安装 rclpy + turbojpeg + R1 Pro `mobiman` python 客户端 + icmplib）。
+- Dockerfile 新 stage `galaxea_r1_pro`（继承 embodied base + ROS2 Humble）。
 - `ray_utils/realworld/setup_before_ray_r1pro.sh`（source ROS2 + galaxea install + 设置 `RLINF_NODE_RANK/RLINF_COMM_NET_DEVICES`）。
 - `rlinf/scheduler/hardware/robots/galaxea.py` 骨架 + 单元测试（`tests/unit_tests/test_galaxea_hardware.py`，hardware config 序列化/反序列化）。
 - YAML：`examples/embodiment/config/env/realworld_r1pro_dummy.yaml` + `realworld_dummy_r1pro_sac_cnn.yaml`。
@@ -1101,7 +1101,7 @@ toolkits/realworld_check/
 ├── test_r1pro_camera.py                              # 新增
 ├── test_r1pro_controller.py
 └── test_r1pro_safety.py
-requirements/install.sh                                # 修改：--env galaxea_r1pro
+requirements/install.sh                                # 修改：--env galaxea_r1_pro
 docker/                                                # 修改：galaxea_r1pro stage
 tests/
 ├── unit_tests/
@@ -1303,14 +1303,14 @@ python train_async.py --config-name "$CONFIG_NAME"
 
 ```bash
 # Add new env target
-SUPPORTED_ENVS="maniskill libero isaaclab calvin metaworld behavior robocasa ... xsquare_turtle2 galaxea_r1pro"
+SUPPORTED_ENVS="maniskill libero isaaclab calvin metaworld behavior robocasa ... xsquare_turtle2 galaxea_r1_pro"
 
 install_galaxea_r1pro() {
     # rclpy via apt is ROS-native; for venv use 'ros2 environment' + sourced install
     pip install icmplib PyTurboJPEG pyyaml
     # Optional: galaxea python client if provided (from ~/galaxea/install)
     # Note: rclpy binding is distributed via /opt/ros/humble; do NOT pip install rclpy
-    echo "[install] galaxea_r1pro env prepared (rclpy must come from sourced ROS 2 Humble install)."
+    echo "[install] galaxea_r1_pro env prepared (rclpy must come from sourced ROS 2 Humble install)."
 }
 ```
 
@@ -1348,7 +1348,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install env
-        run: bash requirements/install.sh embodied --env galaxea_r1pro
+        run: bash requirements/install.sh embodied --env galaxea_r1_pro
       - name: Dummy e2e
         run: |
           export RLINF_NODE_RANK=0
@@ -1385,7 +1385,7 @@ jobs:
 | F1 | 相机话题 > 200ms 未更新 | 控制回路停滞 | DDS 掉包 / 驱动崩溃 | `R1ProROSCamera` last_stamp watchdog | SafetySupervisor 触发 `SAFE_PAUSE`；runner 标记 `info["camera_timeout"]` | 高 |
 | F2 | HDAS feedback_status_arm errors 非零 | 手臂停摆 | 遇碰撞 / 过流 | 控制器 subscribe `feedback_status_arm_*` | `clear_errors` + `go_to_rest`；重复 3 次失败则进入 `FATAL` | 高 |
 | F3 | `ROS_DOMAIN_ID` 冲突 | 与邻居机器交叉控制 | 未设/误设 | 环境变量检查 + 启动时 topic echo 健康检查 | 拒绝启动，打印清晰告警 | 中 |
-| F4 | rclpy 与 rospy 混装 | ImportError 或 topic 错乱 | 安装污染 | install 脚本检查 | 隔离 venv；不允许 rospy 出现在 galaxea_r1pro env | 中 |
+| F4 | rclpy 与 rospy 混装 | ImportError 或 topic 错乱 | 安装污染 | install 脚本检查 | 隔离 venv；不允许 rospy 出现在 galaxea_r1_pro env | 中 |
 | F5 | BMS 电量 < 阈值 | 训练中途掉电 | 长时间训练 / 未充电 | `/hdas/bms` capital 字段 | 阶段性 `SAFE_PAUSE` + 告警 | 中 |
 | F6 | 权重同步卡住 | actor / rollout 不同步 | NCCL 通信丢包 | `time/weight_sync_ms` 异常 | 降级到全同步；超时重试；最终 `ray kill` | 中 |
 | F7 | CAN 未起 | 控制器启动即失败 | 上电后未 `can.sh` | `setup_before_ray_r1pro.sh` 检查 | 自动尝试一次；再失败明确报错 | 低 |

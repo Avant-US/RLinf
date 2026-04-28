@@ -6109,6 +6109,615 @@ runner:
 >
 > 否则继续使用默认双路径,享受 ~ 5 ms wrist 延迟带来的高频闭环优势。两条路径**始终**通过同一份 `GalaxeaR1ProCameraMux` 抽象,可随时按 YAML 切换,无需改代码。
 
+#### F.14 全 ROS2 部署实施手册与静态联通性验证
+
+##### F.14.0 一句话定位
+
+> 本节是 F.3.1 系统部署图的**可执行落地版**:从拆箱到跑通第一个 episode,每一步都给出具体命令、期望输出和故障排查;特别提供**不移动机器人即可验证 GPU Server ↔ Orin ↔ R1 Pro 三者联通**的完整方案。
+
+##### F.14.1 前置条件
+
+在开始部署之前,确认以下条件已满足:
+
+| 类别 | 条件 | 验证方式 |
+|------|------|---------|
+| **硬件** | R1 Pro 已上电,Orin 可 SSH | `ssh nvidia@<r1pro_ip>` |
+| **硬件** | GPU Server 有 ≥ 1 块 NVIDIA GPU | `nvidia-smi` |
+| **硬件** | 1 GbE M12 网线已连接 Orin ↔ GPU Server(或同一二层交换机) | 物理检查 |
+| **软件(Orin)** | ROS2 Humble 已安装 | `ros2 --version` |
+| **软件(Orin)** | Galaxea SDK 已安装(`~/galaxea/install/setup.bash` 存在) | `ls ~/galaxea/install/setup.bash` |
+| **软件(Orin)** | `realsense2_camera` 包已安装 | `ros2 pkg list \| grep realsense` |
+| **软件(GPU Server)** | Python 3.10-3.11 + RLinf 仓库已 clone | `python --version && ls rlinf/` |
+| **软件(GPU Server)** | ROS2 Humble 已安装(至少 `ros-humble-ros-base`) | `ros2 --version` |
+| **软件(GPU Server)** | Ray 已安装 | `ray --version` |
+| **网络** | 两台机器在同一子网,可互 ping | `ping <对端IP>` |
+| **网络** | UDP 7400-7500 端口未被防火墙拦截 | `nc -uvz <对端IP> 7400` |
+
+> 工程提示:全 ROS2 变体下,GPU Server **不需要**安装 Galaxea SDK / `hdas_msg` / `pyrealsense2`(§ G.10 依赖差异表)。GPU Server 端的 ROS2 仅用于 `rclpy` 订阅 image topic。
+
+##### F.14.2 分步实施流程
+
+以下 5 个 Phase 按顺序执行。每个 Phase 结束时有"检查点",通过后再进入下一 Phase。
+
+###### Phase 1: 物理连接与网络配置(~15 分钟)
+
+**目标**: GPU Server 与 Orin 通过有线网络互通,延迟 < 1 ms。
+
+```bash
+# ── 在 GPU Server 上 ────────────────────────────────────────────
+# 1.1 确认网口与 IP
+ip addr show                             # 找到连接 Orin 的网口(如 eth0 / enp6s0)
+# 如果未配 IP,手动配:
+sudo ip addr add 192.168.1.100/24 dev eth0
+sudo ip link set eth0 up
+
+# 1.2 ping Orin
+ping -c 5 <r1pro_ip>                     # 期望 avg < 1 ms
+# 例: ping -c 5 192.168.1.10
+
+# ── 在 Orin 上 ──────────────────────────────────────────────────
+# 1.3 确认 IP 与反向 ping
+ip addr show
+ping -c 5 <gpu_server_ip>               # 期望 avg < 1 ms
+```
+
+**检查点 1**:
+
+| 检查项 | 期望 | 通过? |
+|--------|------|------|
+| GPU Server → Orin ping | avg < 1 ms, 0% loss | |
+| Orin → GPU Server ping | avg < 1 ms, 0% loss | |
+
+> 如果 ping 不通:检查网线物理连接、IP 是否同网段、是否有防火墙(`sudo iptables -L -n`)。
+
+###### Phase 2: Orin 端 R1 Pro 启动 + 全部相机 ROS2 节点(~10 分钟)
+
+**目标**: Orin 上 CAN 启动、HDAS/mobiman 运行、4 路相机 topic 正常发布。
+
+```bash
+# ── 在 Orin 上 ──────────────────────────────────────────────────
+# 2.1 CAN 启动
+tmux new -s r1pro
+bash ~/can.sh
+ip link show can0                        # 期望: state UP
+
+# 2.2 source SDK
+source ~/galaxea/install/setup.bash
+
+# 2.3 启动 R1 Pro 全套驱动
+cd ~/galaxea/install/startup_config/share/startup_config/script
+./robot_startup.sh boot ../sessions.d/ATCStandard/R1PROBody.d/
+# 等待约 30 秒,确认所有 ROS2 节点起来
+
+# 2.4 如果 startup 未自动启腕部 D405,手动启动(参见 F.8.2)
+# 多开一个 tmux 窗口:
+ros2 launch realsense2_camera rs_launch.py \
+    camera_namespace:=hdas \
+    camera_name:=camera_wrist_right \
+    serial_no:='"230322272869"' \
+    enable_color:=true enable_depth:=true \
+    align_depth.enable:=true \
+    rgb_camera.color_profile:=640x480x30 \
+    depth_module.depth_profile:=640x480x30 \
+    image_transport.compressed.enable:=true
+
+# 2.5 如果需要 wrist_left,再开一个窗口启对称的 launch
+
+# 2.6 健康检查
+ros2 topic hz /hdas/feedback_arm_right                              # 期望 > 100 Hz
+ros2 topic hz /hdas/camera_wrist_right/color/image_raw/compressed   # 期望 ~ 30 fps
+ros2 topic hz /hdas/camera_head/left_raw/image_raw_color/compressed # 期望 ~ 30 fps
+ros2 topic echo --once /hdas/bms                                     # 检查 capital_pct
+ros2 topic echo --once /controller                                   # SWD 应为 UP
+```
+
+**检查点 2**:
+
+| 检查项 | 期望 | 通过? |
+|--------|------|------|
+| `can0` state | UP | |
+| `/hdas/feedback_arm_right` Hz | > 100 | |
+| 每路相机 compressed topic Hz | ≥ 25 fps | |
+| `/hdas/bms` capital_pct | > 25% | |
+| `/controller` SWD | UP | |
+
+###### Phase 3: GPU Server 端 ROS2 环境 + Ray 集群(~10 分钟)
+
+**目标**: GPU Server 能发现 Orin 的 ROS2 topic;Ray 双节点集群建立。
+
+```bash
+# ── 在 GPU Server 上 ────────────────────────────────────────────
+# 3.1 source ROS2
+source /opt/ros/humble/setup.bash
+
+# 3.2 设置跨主机 DDS 关键环境变量
+export ROS_DOMAIN_ID=72                  # 与 Orin 一致
+export ROS_LOCALHOST_ONLY=0              # 必须!默认 1 会阻止跨主机
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+# 3.3 可选:配置 FastDDS XML profile(参见 §10.6)
+# 如果已有 ~/fastdds_profile.xml:
+export FASTRTPS_DEFAULT_PROFILES_FILE=~/fastdds_profile.xml
+
+# 3.4 验证跨主机 ROS2 topic 可见
+ros2 daemon stop && ros2 daemon start    # 清理旧 discovery 缓存
+ros2 topic list                          # 应能看到 Orin 发布的 /hdas/* topics
+
+# 3.5 启动 Ray head 节点
+cd ~/RLinf
+export RLINF_NODE_RANK=0
+source ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh
+ray start --head --port=6379 --node-ip-address=<gpu_server_ip>
+
+# ── 在 Orin 上(新 tmux 窗口) ──────────────────────────────────
+# 3.6 加入 Ray 集群
+cd ~/RLinf
+export RLINF_NODE_RANK=1
+source ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh
+ray start --address=<gpu_server_ip>:6379
+
+# ── 回到 GPU Server 上 ─────────────────────────────────────────
+# 3.7 验证 Ray 集群
+ray status                               # 应显示 2 nodes
+```
+
+**检查点 3**:
+
+| 检查项 | 期望 | 通过? |
+|--------|------|------|
+| GPU Server `ros2 topic list` 能看到 Orin 的 `/hdas/*` topics | 可见 | |
+| `ray status` 显示节点数 | 2 nodes | |
+| 两端 `echo $ROS_DOMAIN_ID` | 都是 72 | |
+| 两端 `echo $ROS_LOCALHOST_ONLY` | 都是 0 | |
+
+> 如果 `ros2 topic list` 看不到 Orin 的 topic:
+> 1. 检查 `ROS_LOCALHOST_ONLY` 是否为 0(最常见原因)
+> 2. 检查 `ROS_DOMAIN_ID` 两端一致
+> 3. `ros2 daemon stop && ros2 daemon start` 重启 daemon
+> 4. 检查防火墙 `sudo ufw status`(若启用,`sudo ufw allow 7400:7500/udp`)
+
+###### Phase 4: 跨主机 ROS2 图像 + 控制 topic 联通验证(~10 分钟)
+
+**目标**: GPU Server 能实时接收 Orin 发布的图像数据,延迟在预算内。
+
+```bash
+# ── 在 GPU Server 上 ────────────────────────────────────────────
+# 4.1 验证相机 topic 帧率(跨主机订阅)
+ros2 topic hz /hdas/camera_wrist_right/color/image_raw/compressed
+# 期望 ~ 30 fps(如果帧率明显低于 Orin 上测得的值,说明跨主机丢帧)
+
+ros2 topic hz /hdas/camera_head/left_raw/image_raw_color/compressed
+# 期望 ~ 30 fps
+
+# 4.2 验证图像延迟
+ros2 topic delay /hdas/camera_wrist_right/color/image_raw/compressed
+# 期望 p50 < 20 ms, p95 < 40 ms
+
+ros2 topic delay /hdas/camera_head/left_raw/image_raw_color/compressed
+# 期望 p50 < 25 ms, p95 < 50 ms
+
+# 4.3 验证控制反馈 topic(GPU Server 跨主机订阅)
+ros2 topic hz /hdas/feedback_arm_right
+# 期望 > 100 Hz(即使跨主机也不应低于 90 Hz)
+
+# 4.4 可选:验证深度 topic
+ros2 topic hz /hdas/camera_wrist_right/aligned_depth_to_color/image_raw
+# 期望 ~ 30 fps
+
+# 4.5 查看一帧图像(可选,需要 GUI)
+# ros2 run rqt_image_view rqt_image_view /hdas/camera_wrist_right/color/image_raw/compressed
+
+# 4.6 带宽监控
+nload -m -i 100M                         # 查看 GbE 利用率
+# M2 双臂预计 250-310 Mbps(参见 F.4.3),不应超过 700 Mbps
+```
+
+**检查点 4**:
+
+| 检查项 | 期望 | 通过? |
+|--------|------|------|
+| 跨主机 wrist image fps | ≥ 25 | |
+| 跨主机 head image fps | ≥ 25 | |
+| wrist image delay p95 | < 80 ms | |
+| head image delay p95 | < 80 ms | |
+| feedback Hz 跨主机 | > 90 | |
+| GbE 带宽利用率 | < 700 Mbps | |
+
+###### Phase 5: RLinf 全 ROS2 训练启动(~5 分钟)
+
+**目标**: RLinf 使用全 ROS2 YAML 成功启动训练,CameraMux 4 路图像正常采集。
+
+```bash
+# ── 仅在 GPU Server 上执行 ──────────────────────────────────────
+# 5.1 先跑 dummy 模式验证配置正确性(不连真机相机,不发控制)
+cd ~/RLinf
+python examples/embodiment/train_embodied_agent.py \
+    --config-name realworld_galaxea_r1_pro_right_arm_rlpd_cnn_async_all_ros2 \
+    env.train.override_cfg.is_dummy=true \
+    runner.max_steps=50
+
+# 期望:50 步内无报错退出,TensorBoard 有 loss 曲线
+
+# 5.2 真机训练(确认 Phase 2 的 Orin 端节点仍在运行)
+bash examples/embodiment/run_realworld_galaxea_r1_pro.sh \
+     realworld_galaxea_r1_pro_right_arm_rlpd_cnn_async_all_ros2
+
+# 观察启动日志:
+#   - "GalaxeaR1ProController up on node_rank=1" ← controller 在 Orin 上
+#   - "ROS2Camera(wrist_right) connected" ← 4 路相机订阅成功
+#   - "SafetySupervisor initialized" ← 安全闸门就绪
+```
+
+**检查点 5**:
+
+| 检查项 | 期望 | 通过? |
+|--------|------|------|
+| dummy 模式 50 步无报错 | 通过 | |
+| 真机启动日志出现 controller on node_rank=1 | 是 | |
+| 4 路 ROS2Camera connected | 是 | |
+| 第一个 episode 开始(obs 正常) | 是 | |
+
+##### F.14.3 部署正确性验证矩阵
+
+部署完成后,按以下 5 层逐层验证,任何一层失败则不进入下一层:
+
+```mermaid
+flowchart TB
+    L1["Layer 1: 物理层<br/>网线 + CAN + USB + GMSL"]
+    L2["Layer 2: 网络层<br/>IP 互通 + 延迟 < 1 ms"]
+    L3["Layer 3: ROS2 DDS 层<br/>跨主机 topic 可见 + 帧率正常"]
+    L4["Layer 4: Ray 集群层<br/>2 节点 + RPC 可达"]
+    L5["Layer 5: RLinf 应用层<br/>Worker 启动 + 数据流通 + 安全闸门"]
+
+    L1 --> L2 --> L3 --> L4 --> L5
+```
+
+| 层 | 验证命令 | 期望结果 | 失败时排查 |
+|---|---|---|---|
+| **L1 物理** | `ip link show can0`(Orin) | state UP | 检查 CAN 线 / `bash ~/can.sh` |
+| | `ip link show eth0`(两端) | state UP | 检查网线 / 网口 |
+| **L2 网络** | `ping -c 10 <对端IP>` | 0% loss, avg < 1 ms | IP / 子网 / 防火墙 |
+| | `iperf3 -c <对端IP> -t 5` | ≥ 900 Mbps | 网线质量 / 全双工 |
+| **L3 ROS2** | GPU Server: `ros2 topic list \| grep hdas` | 能看到 Orin topics | `ROS_LOCALHOST_ONLY` / `DOMAIN_ID` |
+| | GPU Server: `ros2 topic hz /hdas/camera_*` | ≥ 25 fps | DDS profile / 带宽 |
+| | GPU Server: `ros2 topic delay /hdas/camera_*` | p95 < 80 ms | 网络拥塞 / Orin CPU |
+| **L4 Ray** | `ray status` | 2 nodes | `RLINF_NODE_RANK` / Ray 端口 |
+| | `ray list actors` | controller 在 Orin IP | YAML `controller_node_rank` |
+| **L5 RLinf** | dummy 模式 50 步 | 无报错 | YAML 配置 / 依赖缺失 |
+| | 真机首个 episode | obs 正常,safety 无告警 | 相机 stale / CAN 断 |
+
+##### F.14.4 静态联通性验证(不移动机器人)
+
+> **核心需求**:在不发送任何运动指令(`send_arm_pose` / `target_pose`)的前提下,验证 GPU Server ↔ Orin ↔ R1 Pro physical body 三者之间的数据通路是畅通的。这在首次 bring-up、网络变更后、SDK 升级后尤为重要。
+
+以下验证全部为**只读操作**,不会触发任何关节运动。
+
+###### F.14.4.1 GPU Server ↔ Orin 网络联通
+
+```bash
+# ── 在 GPU Server 上 ────────────────────────────────────────────
+# (a) 基础 ping
+ping -c 20 <r1pro_ip>
+# 通过标准: 0% loss, avg < 1 ms, max < 5 ms
+
+# (b) 带宽测试(需 Orin 端先起 iperf3 server)
+# Orin 端: iperf3 -s
+# GPU Server 端:
+iperf3 -c <r1pro_ip> -t 10
+# 通过标准: ≥ 900 Mbps (GbE 理论上限 ~ 940 Mbps)
+
+# (c) 端口可达性(DDS discovery 端口)
+nc -uvz <r1pro_ip> 7400
+# 通过标准: Connection succeeded
+```
+
+###### F.14.4.2 GPU Server ↔ Orin ROS2 DDS 联通
+
+```bash
+# ── 确保两端环境变量一致 ──────────────────────────────────────────
+# 两端都执行:
+export ROS_DOMAIN_ID=72
+export ROS_LOCALHOST_ONLY=0
+source /opt/ros/humble/setup.bash
+
+# ── 在 Orin 上:发布一个测试 topic ─────────────────────────────────
+ros2 topic pub /rlinf_test/ping std_msgs/msg/String "data: 'hello_from_orin'" -r 1
+
+# ── 在 GPU Server 上:订阅该 topic ──────────────────────────────────
+ros2 topic echo /rlinf_test/ping --once
+# 通过标准: 收到 "data: 'hello_from_orin'"
+
+# ── 反向验证:GPU Server 发布,Orin 订阅 ──────────────────────────
+# GPU Server:
+ros2 topic pub /rlinf_test/pong std_msgs/msg/String "data: 'hello_from_gpu'" -r 1
+# Orin:
+ros2 topic echo /rlinf_test/pong --once
+# 通过标准: 收到 "data: 'hello_from_gpu'"
+
+# ── 清理测试 topic ─────────────────────────────────────────────────
+# Ctrl+C 停止 pub 即可,DDS 会自动清理
+
+# ── 验证真实相机 topic 跨主机可见 ──────────────────────────────────
+# 在 GPU Server 上:
+ros2 topic list | grep hdas
+# 通过标准: 能看到以下 topic(至少):
+#   /hdas/feedback_arm_right
+#   /hdas/camera_wrist_right/color/image_raw/compressed
+#   /hdas/camera_head/left_raw/image_raw_color/compressed
+#   /hdas/bms
+
+# 验证 topic 类型匹配
+ros2 topic info /hdas/camera_wrist_right/color/image_raw/compressed
+# 应显示 Type: sensor_msgs/msg/CompressedImage, Publisher count: 1
+```
+
+###### F.14.4.3 GPU Server ↔ Orin Ray 集群联通
+
+```bash
+# ── 在 GPU Server 上(已 ray start --head) ──────────────────────
+ray status
+# 通过标准:
+#   2 nodes (GPU server + Orin)
+#   Total Resources: CPU=XX, ...
+
+# Ray RPC 可达性测试(不涉及任何 RLinf/机器人代码):
+python3 -c "
+import ray
+ray.init(address='auto')
+@ray.remote
+def hello(hostname):
+    import socket
+    return f'Hello from {socket.gethostname()}, asked by {hostname}'
+
+# 在本地节点执行
+local_result = ray.get(hello.remote('gpu_server'))
+print(f'Local: {local_result}')
+
+# 在 Orin 节点执行
+import socket
+nodes = ray.nodes()
+orin_node = [n for n in nodes if n['Alive'] and n['NodeManagerAddress'] != socket.gethostname()]
+if orin_node:
+    # 指定资源调度到 Orin
+    print(f'Orin node found: {orin_node[0][\"NodeManagerAddress\"]}')
+    print('Ray cluster connectivity: OK')
+else:
+    print('WARNING: Only 1 node visible, Orin not joined')
+"
+# 通过标准: 打印 "Ray cluster connectivity: OK"
+```
+
+###### F.14.4.4 Orin ↔ R1 Pro physical body 联通(CAN + HDAS + 传感器)
+
+> 以下命令全部在 Orin 上执行,验证 Orin 通过 CAN 总线与 R1 Pro 本体的通信正常。**不发送任何运动指令**。
+
+```bash
+# ── CAN 总线层 ──────────────────────────────────────────────────
+# (a) CAN 接口状态
+ip link show can0
+# 通过标准: state UP, qlen 1000
+
+# (b) CAN 帧收发(只读监听,不发送)
+candump can0 -n 20
+# 通过标准: 能收到 CAN 帧(HDAS 周期性上报),格式如:
+#   can0  181   [8]  XX XX XX XX XX XX XX XX
+# 如果 20 帧内无数据,说明 CAN 物理连接有问题
+
+# ── HDAS 驱动层 ──────────────────────────────────────────────────
+# (c) 关节反馈(只读)
+ros2 topic echo -n 1 /hdas/feedback_arm_right
+# 通过标准: 收到 JointState 消息,包含 position / velocity / effort 字段
+# position 应为 7 个浮点数(7 DOF 关节角),值在合理范围内(约 -3.14 ~ 3.14)
+
+# (d) 反馈频率
+ros2 topic hz /hdas/feedback_arm_right
+# 通过标准: average rate > 100 Hz
+
+# (e) BMS 电池状态(只读)
+ros2 topic echo -n 1 /hdas/bms
+# 通过标准: capital_pct > 25%(低于 25% 不应开始训练)
+
+# (f) SWD 急停控制器状态(只读)
+ros2 topic echo -n 1 /controller
+# 通过标准: SWD 字段为 UP(如果为 DOWN,需要先复位急停)
+
+# (g) 错误码检查(只读)
+ros2 topic echo -n 1 /hdas/feedback_status_arm_right
+# 通过标准: error_code 全为 0,没有报错
+
+# ── 相机层 ──────────────────────────────────────────────────────
+# (h) 腕部 D405 USB 枚举(Orin USB 口)
+rs-enumerate-devices
+# 通过标准: 列出 D405 设备,Serial Number 与 YAML 中配置一致
+
+# (i) 腕部相机 ROS2 topic
+ros2 topic hz /hdas/camera_wrist_right/color/image_raw/compressed
+# 通过标准: ≥ 25 fps
+
+# (j) 头部 GMSL 相机 ROS2 topic
+ros2 topic hz /hdas/camera_head/left_raw/image_raw_color/compressed
+# 通过标准: ≥ 25 fps
+
+# (k) Orin CPU 占用
+mpstat -P ALL 1 5
+# 通过标准: 总 CPU 占用 < 70%(全 ROS2 模式下预计 50-60%,参见 F.4.2)
+```
+
+###### F.14.4.5 GPU Server → Orin → R1 Pro 端到端联通(只读,不发运动指令)
+
+> 这是最关键的验证:从 GPU Server 发起,经过 Orin,读取 R1 Pro 本体的传感器数据,**完整走通 F.3.1 部署图中的数据回路**,但不触发任何机械臂运动。
+
+```bash
+# ── 在 GPU Server 上执行 ────────────────────────────────────────
+# (a) 跨主机读取关节状态(验证 GPU Server → GbE → Orin → CAN → R1 Pro → 返回)
+ros2 topic echo -n 3 /hdas/feedback_arm_right
+# 通过标准: 收到 3 条关节反馈,position 字段有合理值
+# 这证明: GPU Server 的 ROS2 订阅 → 跨网 DDS → Orin HDAS → CAN → 电机编码器 → 返回链路畅通
+
+# (b) 跨主机读取图像(验证 GPU Server ← GbE ← Orin ← USB ← D405)
+ros2 topic echo -n 1 /hdas/camera_wrist_right/color/image_raw/compressed \
+    --field header.stamp
+# 通过标准: 收到 timestamp,且 stamp 与当前时间差 < 1 秒
+# 这证明: 腕部 D405 → Orin USB → realsense2_camera → JPEG encode → DDS → GbE → GPU Server 链路畅通
+
+# (c) 跨主机读取头部图像
+ros2 topic echo -n 1 /hdas/camera_head/left_raw/image_raw_color/compressed \
+    --field header.stamp
+# 通过标准: 同上
+
+# (d) 跨主机读取 BMS 与 SWD(验证安全链路)
+ros2 topic echo -n 1 /hdas/bms
+ros2 topic echo -n 1 /controller
+# 通过标准: 数据与 Orin 本地读到的一致
+
+# (e) Ray RPC 端到端验证(模拟 Controller 在 Orin 上的行为,只读)
+python3 -c "
+import ray, os, time
+ray.init(address='auto')
+
+@ray.remote(num_cpus=0.1)
+class OrinProbe:
+    def __init__(self):
+        os.environ['ROS_DOMAIN_ID'] = '72'
+        os.environ['ROS_LOCALHOST_ONLY'] = '0'
+        import rclpy
+        from sensor_msgs.msg import JointState
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = rclpy.create_node('rlinf_connectivity_probe')
+        self._last_joint = None
+        self._sub = self._node.create_subscription(
+            JointState, '/hdas/feedback_arm_right',
+            lambda msg: setattr(self, '_last_joint', list(msg.position)),
+            10
+        )
+        # spin once to get first message
+        rclpy.spin_once(self._node, timeout_sec=2.0)
+
+    def get_joint_positions(self):
+        import rclpy
+        rclpy.spin_once(self._node, timeout_sec=1.0)
+        return self._last_joint
+
+    def cleanup(self):
+        self._node.destroy_node()
+
+# 在 Orin 节点上创建探测 actor
+# (Ray 会根据资源自动调度到有空闲 CPU 的节点)
+probe = OrinProbe.remote()
+time.sleep(2)  # 等待订阅建立
+
+joints = ray.get(probe.get_joint_positions.remote())
+if joints and len(joints) == 7:
+    print(f'Joint positions (7 DOF): {[round(j, 3) for j in joints]}')
+    print('END-TO-END CONNECTIVITY TEST: PASSED')
+    print('  GPU Server --[Ray RPC]--> Orin --[rclpy sub]--> HDAS --[CAN]--> R1 Pro motor encoders')
+else:
+    print(f'WARNING: Got joints={joints}, expected 7 values')
+    print('END-TO-END CONNECTIVITY TEST: FAILED')
+
+ray.get(probe.cleanup.remote())
+ray.shutdown()
+"
+```
+
+> 测试 (e) 的意义:它**精确复现了 RLinf 运行时 Controller 在 Orin 上读取关节反馈的完整路径**(Ray RPC → Orin 进程 → rclpy 订阅 → HDAS → CAN → 电机),但不发布任何 `target_pose`,因此机械臂完全静止。如果这个测试通过,说明训练时 Controller 的反馈链路必然畅通。
+
+###### F.14.4.6 全链路 RLinf Dummy 验证(零硬件依赖)
+
+```bash
+# ── 在 GPU Server 上 ────────────────────────────────────────────
+# 用 is_dummy=true 跑完整 RLinf 训练管线,验证:
+#   - YAML 解析正确
+#   - WorkerGroup 创建 / 调度正确
+#   - Channel 数据流通畅
+#   - Actor / Rollout / Env / Reward 四个 Worker 协同工作
+#   - SAC replay buffer 正常
+
+cd ~/RLinf
+python examples/embodiment/train_embodied_agent.py \
+    --config-name realworld_galaxea_r1_pro_right_arm_rlpd_cnn_async_all_ros2 \
+    env.train.override_cfg.is_dummy=true \
+    runner.max_epochs=1 \
+    runner.max_steps=100
+
+# 通过标准:
+#   - 无 Python 异常
+#   - 日志中出现 "training step" 若干次
+#   - TensorBoard 日志目录中有 events.out.tfevents.* 文件
+```
+
+##### F.14.4.7 静态联通性验证汇总表
+
+| # | 验证项 | 命令位置 | 涉及链路 | 通过标准 |
+|---|--------|---------|---------|---------|
+| 1 | 网络 ping | 双向 | GPU ↔ Orin (GbE) | 0% loss, < 1 ms |
+| 2 | 网络带宽 | GPU→Orin | GPU ↔ Orin (GbE) | ≥ 900 Mbps |
+| 3 | DDS ping/pong | 双向 | GPU ↔ Orin (ROS2 DDS) | 双向收到消息 |
+| 4 | 相机 topic 跨主机 | GPU Server | Orin→GbE→GPU (image) | ≥ 25 fps, p95 < 80 ms |
+| 5 | 关节反馈跨主机 | GPU Server | R1 Pro→CAN→Orin→GbE→GPU | 收到 7 DOF 数据 |
+| 6 | BMS/SWD 跨主机 | GPU Server | R1 Pro→CAN→Orin→GbE→GPU | 数据合理 |
+| 7 | Ray 双节点 | GPU Server | GPU ↔ Orin (Ray gRPC) | 2 nodes |
+| 8 | Ray RPC 端到端 | GPU Server | GPU→Ray→Orin→rclpy→HDAS→CAN→R1 Pro | 7 关节角 |
+| 9 | RLinf dummy | GPU Server | 全 RLinf Worker 管线 | 100 步无报错 |
+
+> 工程提示:验证项 1-7 可在 10 分钟内完成;验证项 8 需要 Orin 上装了 RLinf + rclpy,约 2 分钟;验证项 9 约 3-5 分钟。建议写成脚本 `toolkits/realworld_check/test_all_ros2_connectivity.sh`,每次部署后一键运行。
+
+```mermaid
+flowchart LR
+    subgraph "验证覆盖的三段链路"
+        GPU["GPU Server"]
+        GbE["1 GbE M12"]
+        Orin["R1 Pro Orin"]
+        CAN["CAN bus"]
+        Body["R1 Pro Body<br/>(motors + cameras + BMS)"]
+
+        GPU <-->|"验证 1-4,7"| GbE
+        GbE <-->|"验证 3-6"| Orin
+        Orin <-->|"验证 CAN + HDAS"| CAN
+        CAN <-->|"验证 F.14.4.4"| Body
+    end
+
+    subgraph "端到端验证"
+        E2E["验证 8: Ray RPC → rclpy → HDAS → CAN → motor encoder → 返回"]
+        E2E -.-> GPU
+        E2E -.-> Body
+    end
+```
+
+图 F.14.1:静态联通性验证覆盖的链路。验证 8(Ray RPC 端到端)是唯一一个**从 GPU Server 出发、经过全部中间节点、到达 R1 Pro 物理本体并返回**的验证,且全程只读不触发运动。
+
+##### F.14.5 常见部署失败排查表
+
+| 症状 | 最可能原因 | 排查命令 | 解决方案 |
+|------|-----------|---------|---------|
+| GPU Server `ros2 topic list` 看不到 Orin topics | `ROS_LOCALHOST_ONLY=1`(默认值) | `echo $ROS_LOCALHOST_ONLY` | `export ROS_LOCALHOST_ONLY=0`(两端) |
+| 能看到 topic 但 `ros2 topic hz` 为 0 | `ROS_DOMAIN_ID` 不一致 | `echo $ROS_DOMAIN_ID`(两端) | 统一为 72 |
+| topic 有数据但帧率很低(< 10 fps) | 网络带宽不足或 Orin CPU 饱和 | `nload`; `mpstat -P ALL 1 5`(Orin) | 降低分辨率/帧率;关闭非必要 topic |
+| `ray status` 只显示 1 节点 | Orin 未 `ray start` 或 `RLINF_NODE_RANK` 未设 | `ray status`; Orin 端检查 | 按 Phase 3 步骤重新加入 |
+| Ray RPC 超时 | 防火墙拦截 Ray 端口(6379/8265) | `nc -z <对端> 6379` | 开放 Ray 端口 |
+| `rclpy.init()` 在 Orin 上失败 | 未 `source /opt/ros/humble/setup.bash` | `which ros2` | 重新 source |
+| `candump can0` 无数据 | CAN 线断开或 `can0` 未 UP | `ip link show can0` | `bash ~/can.sh`; 检查物理线缆 |
+| D405 在 Orin 上不枚举 | USB 松动 / Hub 供电不足 | `rs-enumerate-devices` | 重插 USB; 检查 Hub |
+| 训练启动后 `frame_age_p95 > 250 ms` | Orin JPEG 编码慢 / 网络抖动 | `ros2 topic delay ...`; `mpstat` | 降低 wrist 帧率到 15 fps |
+| dummy 模式报 `ModuleNotFoundError: rclpy` | GPU Server 未 source ROS2 | `python -c "import rclpy"` | `source /opt/ros/humble/setup.bash` 后重试 |
+| `/hdas/bms` 显示 `capital_pct < 25` | 电量过低 | 直接查看 | 充电至 > 40% 再训练 |
+| `ros2 daemon` 死锁 / 缓存过旧 | DDS daemon 状态异常 | — | `ros2 daemon stop && ros2 daemon start` |
+
+##### F.14.6 部署耗时估算
+
+| 阶段 | 首次部署 | 后续重启(已配好) |
+|------|---------|----------------|
+| Phase 1: 物理+网络 | 15 min | 2 min(ping 验证) |
+| Phase 2: Orin 启动 | 10 min | 5 min(`robot_startup.sh` + 健康检查) |
+| Phase 3: GPU Server + Ray | 10 min | 3 min(`ray start` + `ray status`) |
+| Phase 4: DDS 联通验证 | 10 min | 3 min(topic hz/delay) |
+| Phase 5: RLinf 启动 | 5 min(dummy) + 2 min(真机) | 2 min(直接真机) |
+| F.14.4 静态联通验证(全部) | 15 min | 5 min(脚本化后) |
+| **合计** | **~ 65 min** | **~ 20 min** |
+
+> 工程提示:首次部署的大部分时间花在环境变量调试和 DDS 跨主机排查上。建议首次部署时严格按 Phase 顺序执行并在每个检查点停下来确认;第二次起可以用脚本一键跑通 Phase 1-4 的验证。
+
 ---
 
 ### 附录 G:Controller 跨节点部署落地指南

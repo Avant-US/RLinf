@@ -20,6 +20,8 @@
 9. [与设计文档章节对应表](#9-与设计文档-r1pro5op47md-章节对应表)
 10. [后续工作](#10-后续工作)
 11. [版本 2 变更](#11-版本-2-变更2026-04-26-dummy-测试通过)
+12. [与 M0 的差距](#12-与-m0-的差距)
+13. [R1Pro 虚拟环境与 ROS2](#13-r1pro-虚拟环境与-ros2)
 
 ---
 
@@ -784,3 +786,419 @@ python examples/embodiment/train_async.py \
 | 附录 F 全 ROS2 变体 | `*_all_ros2.yaml` 与 env 子配置 | 通过 |
 
 **结论**:在 **M1 dummy 全闭环** 意义上,版本 2 已达成「无真机亦可复现训练循环」的验收基线;真机首次联调仍建议严格按本文 §6 Runbook 顺序推进。
+
+---
+
+## 12. 与 M0 的差距
+
+> 本节以设计文档 [r1pro5op47.md](r1pro5op47.md) **§11.2 M0 准备**（交付物 + 退出标准）与 **§12 配置与代码骨架**（完整文件清单）为基准,逐项审计本实施（imp1 版本 1 + 版本 2）的实际覆盖度,识别差距并给出补完建议。
+>
+> 审计日期:2026-04-27
+
+### 12.1 审计方法
+
+以 `r1pro5op47.md` §11.2 中列出的 **7 项交付物**和 **3 条退出标准**为 checklist,逐项检查代码库中对应文件是否存在、功能是否可用。在此基础上,对照 §12 完整文件清单补充标注 M0 级别但未在 §11.2 明确列出的差距项。
+
+### 12.2 M0 交付物逐项对照
+
+| # | §11.2 M0 要求 | 实际状态 | 差距说明 |
+|---:|:---:|---|---|
+| D1 | `requirements/install.sh` 增加 `--env galaxea_r1_pro` | ✅ **已完成** | `install_galaxea_r1_pro_env()` 已实装(L844-868);安装 `icmplib opencv-python pyrealsense2 PyTurboJPEG`,rclpy 走 ROS2 系统包 |
+| D2 | `docker/` 增加 `galaxea_r1_pro` stage(继承 embodied base + ROS2 Humble) | ❌ **缺失** | [docker/Dockerfile](../../../docker/Dockerfile) 现有 16 个 stage(maniskill / libero / franka / isaaclab 等),**无 `galaxea_r1_pro`**。需新增 `embodied-galaxea_r1_pro-image` stage |
+| D3 | `ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh` | ✅ **已完成** | 含 ROS2 source / Galaxea SDK source / `ROS_DOMAIN_ID` / `ROS_LOCALHOST_ONLY=0` / CAN 检查 / rclpy 校验 |
+| D4 | `rlinf/scheduler/hardware/robots/galaxea_r1_pro.py` 骨架 + 单测 | ✅ **超额完成** | **422 行完整实现**（非骨架）:GalaxeaR1ProRobot / Config / HWInfo / CameraSpec + 7 项 enumerate 校验;单测 8 个 |
+| D5 | `examples/embodiment/config/env/realworld_galaxea_r1_pro_dummy.yaml` | ❌ **缺失** | M0 要求独立的 dummy env 子配置;实际仅有 `realworld_galaxea_r1_pro_pick_place.yaml` 和 `realworld_galaxea_r1_pro_pick_place_all_ros2.yaml`。dummy 主配置 `realworld_dummy_galaxea_r1_pro_sac_cnn.yaml` 内联了 env 配置,功能等价,但与设计文档的文件拆分约定不一致 |
+| D6 | `examples/embodiment/config/realworld_dummy_galaxea_r1_pro_sac_cnn.yaml` | ✅ **已完成** | 存在;imp1 §11.5.4 已验证 Hydra + Ray dummy 训练循环 |
+| D7 | `examples/embodiment/run_realworld_galaxea_r1_pro.sh` | ✅ **已完成** | 异步训练入口包装;默认配置名 `realworld_galaxea_r1_pro_right_arm_rlpd_cnn_async` |
+
+**小结**:7 项交付物中 **5 项已完成**,**2 项缺失**(Docker stage、dummy env 子配置)。
+
+### 12.3 M0 退出标准逐项对照
+
+| # | §11.2 退出标准 | 实际状态 | 差距说明 |
+|---:|:---:|---|---|
+| E1 | `bash examples/embodiment/run_realworld_async.sh realworld_dummy_galaxea_r1_pro_sac_cnn` 在公共 CI runner 上启动 ActorGroup / RolloutGroup / EnvWorker,跑 100 步无崩溃 | ✅ **本地通过** | imp1 §11.5.4 记录:单卡 dummy,3 epoch `critic_loss` 从 0.044 → 0.011 → 0.0065 稳定下降,进程无异常退出。**但尚未在 CI runner 上验证** |
+| E2 | `tests/e2e_tests/embodied/realworld_dummy_galaxea_r1_pro_sac_cnn.yaml` 通过 `r1pro-dummy-e2e` CI job | ❌ **缺失** | e2e YAML fixture **已存在**;但 [.github/workflows/embodied-e2e-tests.yml](../../../.github/workflows/embodied-e2e-tests.yml) 中**无 galaxea 专用 job**。现有 25+ 个 e2e job 均不涵盖 R1 Pro |
+| E3 | `test_galaxea_r1_pro_hardware.py` / `test_galaxea_r1_pro_safety.py` / `test_ros2_camera_decode.py` 全部通过 | ✅ **超额完成** | 实际 **5 个测试文件、38 个测试**全部通过(比 M0 要求的 3 个文件多 2 个:action_schema + camera_mux) |
+
+**小结**:3 条退出标准中 **2 条满足**(E1 本地通过 + E3),**1 条缺失**(E2 CI job 未配置)。
+
+### 12.4 §12 文件清单补充差距
+
+设计文档 §12 列出了完整的新增文件树。以下文件在 §12 中有列但 imp1 尚未实装:
+
+| 文件 | §12 定位 | 实际状态 | 归属阶段 |
+|---|---|---|---|
+| `toolkits/realworld_check/test_galaxea_r1_pro_camera.py` | 现场相机冒烟脚本 | ❌ 缺失 | M0 / M1 交界 |
+| `toolkits/realworld_check/test_galaxea_r1_pro_controller.py` | 现场控制器冒烟脚本 | ❌ 缺失 | M0 / M1 交界 |
+| `toolkits/realworld_check/test_galaxea_r1_pro_safety.py` | 现场安全冒烟脚本 | ❌ 缺失 | M0 / M1 交界 |
+| `examples/embodiment/collect_data_galaxea_r1_pro.sh` | 数据采集入口 | ❌ 缺失 | M1 |
+| `examples/embodiment/config/realworld_collect_data_galaxea_r1_pro.yaml` | 采集配置 | ❌ 缺失 | M1 |
+| `examples/embodiment/config/realworld_eval_galaxea_r1_pro.yaml` | 评估配置 | ❌ 缺失 | M1 |
+| `examples/embodiment/config/env/realworld_galaxea_r1_pro_safety_default.yaml` | 默认安全参数集 | ❌ 缺失 | M0 / M1 交界 |
+| `examples/embodiment/config/env/realworld_galaxea_r1_pro_dummy.yaml` | dummy env 子配置 | ❌ 缺失 | M0(同 D5) |
+| `examples/embodiment/config/env/realworld_galaxea_r1_pro_dual_arm_handover.yaml` | M2 双臂 env 配置 | ❌ 缺失 | M2 |
+| `examples/embodiment/config/env/realworld_galaxea_r1_pro_whole_body_cleanup.yaml` | M3 全身 env 配置 | ❌ 缺失 | M3 |
+| M1 级别主训练配置(`right_arm_async_ppo_pi05` / `dual_arm_*` / `whole_body_*`) | 多个 | ❌ 缺失 | M1-M4 |
+
+### 12.5 差距分级与优先级
+
+将全部差距按**对 M0 退出的阻塞程度**分级:
+
+#### P0 — M0 阻塞(不补完则无法宣称 M0 达标)
+
+| ID | 差距 | 原因 |
+|---|---|---|
+| **G1** | Docker `galaxea_r1_pro` stage 缺失 | §11.2 明确列为交付物;CI runner 依赖 Docker 镜像 |
+| **G2** | CI workflow 无 `r1pro-dummy-e2e` job | §11.2 退出标准 E2 直接要求 |
+
+#### P1 — M0 推荐(不阻塞退出标准,但与设计文档的文件约定不一致)
+
+| ID | 差距 | 原因 |
+|---|---|---|
+| **G3** | `realworld_galaxea_r1_pro_dummy.yaml` (env 子配置) 缺失 | §11.2 列为交付物;当前 dummy 主配置内联了 env 块,功能等价但不符合文件拆分规范 |
+| **G4** | `realworld_galaxea_r1_pro_safety_default.yaml` 缺失 | §12 列出;安全参数硬编码在 `SafetyConfig` dataclass 默认值中,真机前应独立配置文件化 |
+| **G5** | `toolkits/realworld_check/` 三个冒烟脚本缺失 | §12 列出;真机联调时需要快速验证相机/控制器/安全,但 dummy 阶段不阻塞 |
+
+#### P2 — M1+ 可延后(设计文档明确归属后续里程碑)
+
+| ID | 差距 | 归属 |
+|---|---|---|
+| G6 | `collect_data_galaxea_r1_pro.sh` + 采集/评估 YAML | M1 |
+| G7 | M2-M4 的 env 子配置和主训练配置 | M2-M4 |
+| G8 | `r1_pro_safety.py` L190 TODO(归一化范围待确认) | M1(真机前) |
+| G9 | CI matrix 双变体(`default` / `all_ros2`) | M1 |
+| G10 | RST 中英文档 | M1 |
+
+### 12.6 补完建议
+
+#### G1 — Docker `galaxea_r1_pro` stage(P0,~2h)
+
+在 [docker/Dockerfile](../../../docker/Dockerfile) 中新增 stage,参照 `embodied-franka-image` 模式:
+
+```dockerfile
+# ── galaxea_r1_pro ──
+FROM embodied-base-image AS embodied-galaxea_r1_pro-image
+# ROS2 Humble desktop (已有 base 中的 Ubuntu 22.04)
+RUN apt-get update && apt-get install -y ros-humble-desktop python3-colcon-common-extensions \
+    && rm -rf /var/lib/apt/lists/*
+# Galaxea 轻量依赖(rclpy 从 ROS2 系统包;Galaxea SDK 不进镜像,Orin 端独立)
+RUN pip install --no-cache-dir icmplib opencv-python pyrealsense2 PyTurboJPEG
+COPY ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh /workspace/ray_utils/realworld/
+```
+
+需同步更新 [.github/workflows/docker-build.yml](../../../.github/workflows/docker-build.yml) 的 build matrix。
+
+#### G2 — CI `r1pro-dummy-e2e` job(P0,~1h)
+
+在 [.github/workflows/embodied-e2e-tests.yml](../../../.github/workflows/embodied-e2e-tests.yml) 中新增 job,参照 `embodied-cnn-realworld-dummy-sac-test`:
+
+```yaml
+embodied-cnn-realworld-galaxea-r1-pro-dummy-sac-test:
+  runs-on: embodied
+  needs: build
+  container:
+    image: ${{ needs.build.outputs.image }}  # 使用 galaxea_r1_pro 镜像
+  steps:
+    - uses: actions/checkout@v4
+    - name: Galaxea R1 Pro dummy SAC test
+      run: |
+        bash tests/e2e_tests/embodied/run.sh realworld_dummy_galaxea_r1_pro_sac_cnn
+```
+
+e2e YAML fixture [tests/e2e_tests/embodied/realworld_dummy_galaxea_r1_pro_sac_cnn.yaml](../../../tests/e2e_tests/embodied/realworld_dummy_galaxea_r1_pro_sac_cnn.yaml) 已存在,无需新建。
+
+#### G3 — dummy env 子配置(P1,~30min)
+
+新建 `examples/embodiment/config/env/realworld_galaxea_r1_pro_dummy.yaml`,从 `realworld_dummy_galaxea_r1_pro_sac_cnn.yaml` 中抽取 `env.train.override_cfg` 块:
+
+```yaml
+# Galaxea R1 Pro dummy env 子配置
+# 用途: is_dummy=true 的最小 env 描述,可被 dummy / pick_place / reach 等主配置引用
+init_params:
+  id: GalaxeaR1ProPickPlace-v1
+override_cfg:
+  is_dummy: true
+  step_frequency: 10.0
+  cameras:
+    - { name: wrist_right, backend: usb_direct, serial_number: "000000000000" }
+    - { name: head_left,  backend: ros2,  rgb_topic: /dummy }
+# Disable Franka-style wrappers
+no_gripper: false
+use_relative_frame: false
+use_quat2euler_wrapper: false
+```
+
+然后将 `realworld_dummy_galaxea_r1_pro_sac_cnn.yaml` 中的 `env.train` 改为 `defaults: [env/realworld_galaxea_r1_pro_dummy]` 引用。
+
+#### G4 — 安全默认参数 YAML(P1,~30min)
+
+新建 `examples/embodiment/config/env/realworld_galaxea_r1_pro_safety_default.yaml`,从 `SafetyConfig` dataclass 默认值提取:
+
+```yaml
+# 默认安全参数集(与 r1_pro_safety.py SafetyConfig 默认值一致)
+bms_low_pct: 25
+feedback_stale_threshold_ms: 200
+max_linear_step_m: 0.05
+max_angular_step_rad: 0.15
+right_ee_min: [0.15, -0.35, 0.05]
+right_ee_max: [0.55, 0.15, 0.45]
+# ... (其余字段从 SafetyConfig 提取)
+```
+
+#### G5 — 现场冒烟脚本(P1,~3h)
+
+在 [toolkits/realworld_check/](../../../toolkits/realworld_check/) 下新增 3 个脚本,参照 `test_franka_camera.py` / `test_franka_controller.py` 模式:
+
+- `test_galaxea_r1_pro_camera.py`:rclpy 订阅 head / wrist 各一帧,打印分辨率 + fps + 时延
+- `test_galaxea_r1_pro_controller.py`:RPC `get_state()` 读 7-DoF qpos,打印 + 校验范围
+- `test_galaxea_r1_pro_safety.py`:构造极端 action 走一遍 `validate()`,打印 L1-L5 结果
+
+### 12.7 M0 达成度总结
+
+| 维度 | 要求项数 | 已满足 | 缺失 | 达成率 |
+|---|:---:|:---:|:---:|:---:|
+| §11.2 交付物 | 7 | 5 | 2 (D2 Docker, D5 dummy env YAML) | **71%** |
+| §11.2 退出标准 | 3 | 2 | 1 (E2 CI job) | **67%** |
+| 合计(P0 阻塞项) | — | — | **2** (G1 Docker + G2 CI) | — |
+| 合计(P1 推荐项) | — | — | **3** (G3 + G4 + G5) | — |
+| 合计(P2 后续项) | — | — | **5** (G6-G10) | — |
+
+**结论**:
+
+- **核心代码层面**:imp1 已 **超额完成** M0 要求 — M0 仅要求"骨架 + dummy 能跑",实际交付了 ~5000 行完整实现(含 5 级安全、双路径相机、6 个任务)+ 38 个单测 + 4 层 dummy 验证链路。代码实现已达到 **M1 准入**水平。
+- **CI / Docker / 配置规范层面**:存在 **2 个 P0 缺口**(Docker stage + CI job)和 **3 个 P1 缺口**(文件拆分规范)。P0 缺口预计 **~3 小时**可补完,P1 缺口预计 **~4 小时**。
+- **建议路径**:先补完 G1 + G2(P0),跑通 CI;再在同一 PR 或下一 PR 中补 G3-G5(P1);G6-G10(P2)按 M1-M4 路线图自然推进。补完 P0 + P1 后即可正式宣称 **M0 达标**。
+
+---
+
+## 13. R1Pro 虚拟环境与 ROS2
+
+> 本节讨论 Galaxea R1 Pro 真机 RL 场景下 **Python 虚拟环境 (venv) 与 ROS2 (rclpy) 如何共存** 的问题。这是真机部署工程师最常遇到的首个障碍,因此单独成章,给出问题分析、当前方案和可操作的验证步骤。
+>
+> 日期:2026-04-28
+
+### 13.1 问题背景
+
+RLinf 的 Galaxea R1 Pro 集成涉及两类 Python 依赖:
+
+| 类别 | 来源 | 安装方式 | 使用节点 |
+|---|---|---|---|
+| **RL 训练 + 相机 USB 直连** | PyPI / GitHub | `pip` / `uv pip` | GPU Server |
+| **ROS2 通信(rclpy + 消息包）** | apt(`ros-humble-*`) | `apt install` | GPU Server / Orin 均可能需要 |
+
+两者冲突的根源:**rclpy 不在 PyPI 上发布**,只随 ROS2 系统包安装到 `/opt/ros/humble/lib/python3.10/...`,而 RLinf 的 `install.sh` 创建的 venv 使用 Python 3.11 且默认**不继承系统 site-packages**。
+
+### 13.2 两种安装路径对比
+
+当前文档中出现了两种 venv 安装方式,功能等价但细节不同:
+
+| 维度 | `install.sh embodied --env galaxea_r1_pro` | §11.4 手动安装 |
+|---|---|---|
+| **venv 创建** | `uv venv .venv --python 3.11.14` | `uv venv .venv_rlinf_r1 --python 3.11.14` |
+| **RLinf 同步** | `uv sync --active --no-install-project` | `uv sync --active --extra embodied --no-install-project` + `uv pip install -e . --no-deps` |
+| **通用 embodied 依赖** | `install_common_embodied_deps` 自动安装(含 `common.txt` + `sys_deps.sh` + NVIDIA 环境变量写入 `activate`） | 不执行,靠 `uv sync --extra embodied` 覆盖 |
+| **Galaxea 专属依赖** | `uv pip install icmplib opencv-python pyrealsense2 PyTurboJPEG psutil filelock` | `uv pip install opencv-python PyTurboJPEG psutil filelock` |
+| **rclpy 安装** | 不安装;打印提示信息 | 不安装 |
+| **NVIDIA env vars** | 写入 `activate` 脚本 | 不写入(需手动或靠 `setup_before_ray` 脚本） |
+
+**推荐**:新环境首次搭建使用 `install.sh`,确保 NVIDIA 环境变量和通用依赖齐全;已有环境增量调试时可按 §11.4 手动操作。
+
+### 13.3 rclpy 为什么不在 venv 内安装
+
+尝试将 rclpy 纳入 venv 会撞上 **三道硬障碍**:
+
+#### 障碍 1:不在 PyPI 上
+
+rclpy 由 ROS2 构建系统 (colcon / ament) 编译,发布为 apt 包 `ros-humble-rclpy`,**没有** `pip install rclpy` 路径。相关的消息包(`sensor_msgs`、`geometry_msgs`、`hdas_msg` 等)同理。
+
+#### 障碍 2:Python 大版本不匹配
+
+| 组件 | Python 版本 |
+|---|---|
+| ROS2 Humble apt 包中的 rclpy `.so` | **3.10**（Ubuntu 22.04 系统 Python） |
+| RLinf `install.sh` 创建的 venv | **3.11.14** |
+
+两者 ABI 不兼容。即使把 `/opt/ros/humble/lib/python3.10/dist-packages/rclpy` 软链进 venv,`import rclpy` 也会因 `.so` 加载失败而抛出 `ImportError`。
+
+#### 障碍 3:uv venv 隔离
+
+`uv venv` 默认创建**不继承系统 site-packages** 的隔离环境(`--system-site-packages` 非默认行为）。即使用 `--system-site-packages` 打开,仍受 Python 3.11 vs 3.10 的 ABI 约束。
+
+**结论**:在当前 RLinf 的 Python 3.11 + ROS2 Humble 组合下,**rclpy 无法通过 venv 内安装解决**。这不是 `install.sh` 的缺陷,而是 ROS2 发行策略与 Python 版本周期错位的客观限制。
+
+### 13.4 当前解决方案:系统级 rclpy + 脚本注入
+
+RLinf 的设计选择是:**rclpy 留在系统级,通过 `setup_before_ray` 脚本在 `ray start` 之前注入 ROS2 环境到 venv 的 `PYTHONPATH` 中**。
+
+#### 注入链路
+
+```text
+source .venv/bin/activate                              # ① 激活 venv
+source setup_before_ray_galaxea_r1_pro.sh              # ② 注入 ROS2
+  ├─ source /opt/ros/humble/setup.bash                 #    → PYTHONPATH += /opt/ros/humble/lib/python3/dist-packages
+  ├─ source ~/galaxea/install/setup.bash               #    → PYTHONPATH += hdas_msg 等消息包路径
+  ├─ export ROS_DOMAIN_ID / ROS_LOCALHOST_ONLY / DDS   #    → 跨主机通信配置
+  └─ CAN link check                                    #    → Orin 端 soft check
+ray start ...                                          # ③ 启动 Ray,Worker 进程继承 PYTHONPATH
+```
+
+核心机制:ROS2 的 `setup.bash` 把 `/opt/ros/humble/lib/python3/dist-packages`（注意路径中是 `python3` 而非 `python3.10`）加入 `PYTHONPATH`。Ray Worker 进程 fork 后继承此环境变量,`import rclpy` 即可成功。
+
+#### 为什么可行
+
+关键路径是 `/opt/ros/humble/lib/python3/dist-packages/` — 这里面放的是**纯 Python 文件**和指向 `python3.10` 子目录的 `.so` 的引用。在实际运行中:
+
+- **Orin 节点**:系统 Python 就是 3.10,rclpy `.so` ABI 匹配,无问题。
+- **GPU Server 节点**:在默认**双路径**形态下,Controller 跑在 Orin(node_rank=1),GPU Server 的 EnvWorker 只需要 `pyrealsense2`（USB 直连相机）和 ROS2Camera（头部相机）。ROS2Camera 通过 rclpy 订阅话题 — 此时 GPU Server 必须安装 ROS2 Humble 且 Python 需为 3.10 或兼容版本。
+
+#### 与 Franka ROS1 方案的类比
+
+RLinf 已有先例 — Franka 环境的 `install_franka_env()` 函数（[install.sh:788-838](../../../requirements/install.sh)）:
+
+```bash
+source /opt/ros/noetic/setup.bash                     # 系统级 ROS1
+catkin_make ...                                        # 编译控制器包
+echo "source /opt/ros/noetic/setup.bash" >> "$VENV_DIR/bin/activate"   # 写入 activate
+echo "source $ROS_CATKIN_PATH/devel/setup.bash" >> "$VENV_DIR/bin/activate"
+```
+
+Franka 方案比 R1 Pro 更激进 — 直接把 `source` 命令写入 venv 的 `activate` 脚本,每次激活 venv 自动注入 ROS1。R1 Pro 当前选择了更保守的 `setup_before_ray` 脚本方式。
+
+**可考虑的改进**:参照 Franka 模式,在 `install_galaxea_r1_pro_env()` 末尾将 ROS2 source 命令写入 `activate`:
+
+```bash
+# 候选改进(尚未实装)
+if [ -f /opt/ros/humble/setup.bash ]; then
+    echo "source /opt/ros/humble/setup.bash" >> "$VENV_DIR/bin/activate"
+fi
+if [ -f "${GALAXEA_INSTALL_PATH:-$HOME/galaxea/install}/setup.bash" ]; then
+    echo "source ${GALAXEA_INSTALL_PATH:-$HOME/galaxea/install}/setup.bash" >> "$VENV_DIR/bin/activate"
+fi
+```
+
+这样每次 `source .venv/bin/activate` 后 rclpy 自动可用,无需额外记忆 `source setup_before_ray...`。但需注意:
+
+- ROS2 `setup.bash` 会修改 `LD_LIBRARY_PATH` 等变量,可能与 venv 中的 PyTorch / CUDA 库冲突;需在真机上验证。
+- `setup_before_ray` 脚本仍需执行,因为它还负责 `RLINF_NODE_RANK`、`ROS_DOMAIN_ID` 等 RLinf 专属变量。
+
+### 13.5 三种相机连接模式的 venv 需求矩阵
+
+| 连接模式 | GPU Server venv 需要 rclpy? | GPU Server 需装 ROS2? | Orin 需要 rclpy? | 说明 |
+|---|:---:|:---:|:---:|---|
+| **Dummy**（`is_dummy=True`） | 否 | 否 | 否 | CameraMux 返回零矩阵,不创建真实相机 |
+| **双路径**（默认:腕部 USB + 头部 ROS2） | **是** | **是** | 是（Controller） | GPU Server 的 EnvWorker 通过 ROS2Camera 订阅头部相机话题 |
+| **全 ROS2**（腕部 + 头部均走 ROS2） | **是** | **是** | 是（Controller + 相机节点） | GPU Server 的 EnvWorker 通过 ROS2Camera 订阅所有相机话题 |
+
+**重要结论**:只要涉及 ROS2Camera（即非 dummy 模式下有 `backend: ros2` 的相机),GPU Server 的 venv 就需要能 `import rclpy`。双路径与全 ROS2 在 venv 需求上没有差异 — 区别仅在于 Orin 端是否需要额外启动 `realsense2_camera` 节点。
+
+### 13.6 GPU Server 节点的 ROS2 可用性验证
+
+部署前在 GPU Server 上执行以下检查:
+
+```bash
+# 1. 确认 ROS2 Humble 已安装
+dpkg -l | grep ros-humble-ros-base
+# 期望: ii  ros-humble-ros-base  ...
+
+# 2. 确认系统 Python 与 ROS2 rclpy 匹配
+/usr/bin/python3 --version
+# 期望: Python 3.10.x（Ubuntu 22.04 默认）
+
+# 3. 激活 venv + 注入 ROS2 后验证 rclpy 可导入
+source .venv/bin/activate
+source ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh
+python -c "import rclpy; print('rclpy OK:', rclpy.__path__)"
+# 期望: rclpy OK: ['/opt/ros/humble/lib/python3/dist-packages/rclpy']
+
+# 4. 确认 rclpy 使用的 Python 版本(关键!)
+python -c "
+import sys; print('venv python:', sys.version)
+import rclpy._rclpy_pybind11
+print('rclpy native module loaded OK')
+"
+# 如果 venv Python 为 3.11 而 rclpy .so 编译于 3.10,
+# 此步骤会报 ImportError — 说明 Python 版本不匹配,见 §13.7
+
+# 5. 确认跨主机 ROS2 通信(GPU Server → Orin)
+export ROS_DOMAIN_ID=72
+export ROS_LOCALHOST_ONLY=0
+ros2 topic list
+# 期望: 可以看到 /hdas/feedback_arm_right 等 Orin 端话题
+```
+
+**如果步骤 4 失败**:说明 venv 的 Python 3.11 与系统 rclpy 的 Python 3.10 ABI 不兼容。解决方案见 §13.7。
+
+### 13.7 已知限制与可能的改进方向
+
+#### 限制 1:Python 3.11 venv 无法加载 rclpy 原生模块
+
+当 `install.sh` 以 Python 3.11.14 创建 venv 时,`import rclpy` 的纯 Python 部分可能通过 `PYTHONPATH` 注入成功,但 `_rclpy_pybind11.cpython-310-*.so` 无法被 Python 3.11 解释器加载,最终 `import rclpy` 仍然失败。
+
+**方案 A:GPU Server 端 venv 降级到 Python 3.10**
+
+```bash
+# 在 GPU Server 上用 Python 3.10 创建 venv
+PYTHON_VERSION=3.10 bash requirements/install.sh embodied --env galaxea_r1_pro
+# 或手动:
+uv venv .venv_rlinf_r1 --python 3.10
+```
+
+优势:零额外依赖,rclpy `.so` ABI 直接匹配。
+
+代价:
+
+- 需验证 RLinf + PyTorch + FSDP 在 Python 3.10 上的兼容性(RLinf 官方支持 3.10-3.11.14)。
+- GPU Server 和 Orin 可使用同一 Python 版本,简化运维。
+- `pyproject.toml` 约束 `python>=3.10`,理论上兼容,但需跑一轮完整单测确认。
+
+**方案 B:从源码编译 rclpy for Python 3.11**
+
+```bash
+# 在 GPU Server 上用 colcon 从源码编译 rclpy
+mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
+vcs import . < /opt/ros/humble/share/ros2/repos/ros2.repos  # 拉取 rclpy 源码
+cd ~/ros2_ws
+colcon build --packages-select rclpy --cmake-args -DPYTHON_EXECUTABLE=$(which python3.11)
+source ~/ros2_ws/install/setup.bash
+```
+
+优势:venv 保持 Python 3.11,不影响其他 RLinf 功能。
+
+代价:
+
+- 编译依赖重(`rcl`、`rcutils`、`rmw` 等 C 库都需要编译)。
+- 后续 ROS2 更新时需要重新编译。
+- Orin 端也需要同步编译(若 Orin 也用 3.11 venv)。
+
+**方案 C:等待 ROS2 Jazzy(长远)**
+
+ROS2 Jazzy(2024 年 5 月发布,Ubuntu 24.04)绑定 Python 3.12。若 RLinf 和部署环境升级到 Ubuntu 24.04 + Jazzy,Python 版本对齐问题自动消失。但这是长远路径,不适用于当前 M0/M1 阶段。
+
+#### 限制 2:Orin 端 venv 创建
+
+Orin 出厂系统为 Ubuntu 22.04 + Python 3.10。在 Orin 上创建 venv 时:
+
+- `install.sh` 默认 `PYTHON_VERSION=3.11.14` → uv 会尝试下载 Python 3.11 → 可能因 ARM64 二进制不可用而失败。
+- **建议**:Orin 端显式使用 `PYTHON_VERSION=3.10 bash requirements/install.sh ...`,或直接使用系统 Python,不创建 venv(Orin 上 RLinf 只跑 Controller Worker,依赖较少）。
+
+#### 推荐的真机部署 Python 版本策略
+
+| 节点 | Python 版本 | venv | 理由 |
+|---|---|---|---|
+| **GPU Server** | **3.10**（降级） | `.venv`（`install.sh` 创建） | 与系统 rclpy ABI 匹配;RLinf 兼容 3.10 |
+| **Orin** | **3.10**（系统默认） | 可选;直接用系统 Python 亦可 | 出厂即 3.10;rclpy / hdas_msg 已随 ROS2 装好 |
+
+此策略的核心取舍:**牺牲 Python 3.11 的微小语言特性换取 rclpy 原生可用性**,在真机 RL 场景下是合理的 — 训练代码的 Python 版本要求不严苛,而 rclpy 的可用性直接决定相机数据链路是否畅通。
+
+#### 落地检查清单
+
+真机部署前逐项确认:
+
+- [ ] GPU Server 上 `python --version` 输出 3.10.x
+- [ ] `source .venv/bin/activate && python -c "import rclpy"` 成功
+- [ ] `source setup_before_ray_galaxea_r1_pro.sh` 无报错
+- [ ] `ros2 topic list` 可见 Orin 端话题
+- [ ] `python -c "import torch; print(torch.cuda.is_available())"` 输出 `True`
+- [ ] 38 个 Galaxea 单元测试全部通过
+- [ ] dummy SAC 训练循环 100 步无异常退出
