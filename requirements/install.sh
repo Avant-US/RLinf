@@ -655,8 +655,16 @@ install_dreamzero_model() {
 }
 
 install_env_only() {
-    create_and_sync_venv
     SKIP_ROS=${SKIP_ROS:-0}
+    # Per-env Python version overrides — must be set BEFORE create_and_sync_venv.
+    # galaxea_r1_pro requires Python 3.10 to match the ROS2 Humble rclpy .so ABI
+    # on Ubuntu 22.04 (system Python is 3.10; rclpy .so is compiled for 3.10).
+    case "$ENV_NAME" in
+        galaxea_r1_pro)
+            PYTHON_VERSION="3.10.12"
+            ;;
+    esac
+    create_and_sync_venv
     case "$ENV_NAME" in
         franka)
             uv sync --extra franka --active $NO_INSTALL_RLINF_CMD
@@ -676,6 +684,11 @@ install_env_only() {
             install_habitat_env
             ;;
         galaxea_r1_pro)
+            if [ "$SKIP_ROS" -ne 1 ]; then
+                if [ "$NO_ROOT" -eq 0 ]; then
+                    bash $SCRIPT_DIR/embodied/ros2_humble_install.sh
+                fi
+            fi
             install_common_embodied_deps
             install_galaxea_r1_pro_env
             ;;
@@ -842,27 +855,45 @@ install_xsquare_turtle2_env() {
 }
 
 install_galaxea_r1_pro_env() {
-    # Galaxea R1 Pro real-world env: rclpy / ROS 2 Humble / Galaxea
-    # SDK live OUTSIDE the venv (apt + colcon).  Here we only install
-    # the lightweight Python deps used by the EnvWorker side
-    # (camera Mux, USB direct path, JPEG decode).  The Orin must be
-    # set up separately according to bt/docs/rwRL/r1pro5op47_imp1.md.
+    # Galaxea R1 Pro real-world env: rclpy / ROS2 Humble / Galaxea SDK live OUTSIDE
+    # the venv (apt + colcon).  Here we install the lightweight Python deps used by
+    # the EnvWorker side (camera Mux, USB direct path, JPEG decode) and wire up the
+    # venv so that ROS2 is auto-sourced on every `source .venv/bin/activate`.
+    # The Orin must be set up separately per bt/docs/rwRL/r1pro5op47_imp1.md.
+
+    # Source ROS2 now so that the rclpy importability check below works.
+    # set +euo pipefail: ROS2 setup.bash may reference unbound variables.
+    set +euo pipefail
+    source /opt/ros/humble/setup.bash 2>/dev/null || true
+    set -euo pipefail
+
     uv pip install icmplib opencv-python pyrealsense2 PyTurboJPEG psutil filelock
+
+    # Write ROS2 source commands into the venv activate script so that
+    # `source .venv/bin/activate` automatically injects ROS2 into PYTHONPATH.
+    # This mirrors install_franka_env's pattern for ROS1 Noetic (§13.4 of imp1.md).
+    if [ -f /opt/ros/humble/setup.bash ]; then
+        echo "source /opt/ros/humble/setup.bash" >> "$VENV_DIR/bin/activate"
+    fi
+    local galaxea_install="${GALAXEA_INSTALL_PATH:-$HOME/galaxea/install}"
+    if [ -f "${galaxea_install}/setup.bash" ]; then
+        echo "source ${galaxea_install}/setup.bash" >> "$VENV_DIR/bin/activate"
+    fi
+
     if ! python -c "import rclpy" >/dev/null 2>&1; then
         echo ""
         echo "[install][galaxea_r1_pro] rclpy is NOT importable from this venv."
-        echo "[install][galaxea_r1_pro] On the controller / camera node (typically Orin),"
-        echo "[install][galaxea_r1_pro] install ROS 2 Humble system packages and source them"
-        echo "[install][galaxea_r1_pro] BEFORE \`ray start\`:"
+        echo "[install][galaxea_r1_pro] Install ROS2 Humble if not already done:"
+        echo "[install][galaxea_r1_pro]   bash requirements/embodied/ros2_humble_install.sh"
+        echo "[install][galaxea_r1_pro] Then re-activate the venv to pick up the sourced ROS2:"
+        echo "[install][galaxea_r1_pro]   source $VENV_DIR/bin/activate"
+        echo "[install][galaxea_r1_pro] Or before \`ray start\` use:"
+        echo "[install][galaxea_r1_pro]   source ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh"
+        echo "[install][galaxea_r1_pro] which sources /opt/ros/humble/setup.bash + galaxea workspace"
+        echo "[install][galaxea_r1_pro] and exports DDS / RLinf env vars."
         echo ""
-        echo "[install][galaxea_r1_pro]   sudo apt install ros-humble-ros-base \\"
-        echo "[install][galaxea_r1_pro]                    ros-humble-cv-bridge \\"
-        echo "[install][galaxea_r1_pro]                    ros-humble-rmw-fastrtps-cpp"
-        echo "[install][galaxea_r1_pro]   source /opt/ros/humble/setup.bash"
-        echo "[install][galaxea_r1_pro]   source \$GALAXEA_INSTALL_PATH/setup.bash"
-        echo ""
-        echo "[install][galaxea_r1_pro] Or use ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh"
-        echo "[install][galaxea_r1_pro] which sources the right scripts and exports DDS env vars."
+    else
+        echo "[install][galaxea_r1_pro] rclpy importable OK."
     fi
     echo "[install][galaxea_r1_pro] env ready."
 }
