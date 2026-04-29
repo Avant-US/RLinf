@@ -6174,12 +6174,85 @@ ping -c 5 <gpu_server_ip>               # 期望 avg < 1 ms
 
 **目标**: Orin 上 CAN 启动、HDAS/mobiman 运行、4 路相机 topic 正常发布。
 
+由于目前R1 Pro上ROS2用的DDS是`RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"`,所以要配置`CYCLONEDDS_URI="file:///path/to/cyclone_dds.xml"`. Orin 和 GPU Server 上都要配.
+  - **问题是???**: 要不要配`ROS_DOMAIN_ID="41"`     
+**还有问题是???**: cyclone_dds.xml 应该怎么写, 尝试了下面几个一直跑不通. 当然,如果能不auto不broadcast,指定特定IP端口去连接,应该是最快的,但还不知道该怎么配置.
+```xml
+<!-- 这是原来的 -->
+<CycloneDDS>
+  <Domain>
+    <General>
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <Peers>
+              <Peer address="10.239.20.41"/>
+      </Peers>
+      <ParticipantIndex>auto</ParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
+<!-- 下面这个不行 -->
+<CycloneDDS>
+  <Domain>
+    <General>
+      <AllowMulticast>default</AllowMulticast>
+    </General>
+    <Discovery>
+      <Peers>
+              <Peer address="10.239.20.41"/>
+              <Peer address="10.239.66.151"/>
+              <Peer address="10.239.66.66"/>
+      </Peers>
+      <ParticipantIndex>none</ParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
+<!--下面这个不行-->
+<CycloneDDS>
+  <Domain>
+    <General>
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <Peers>
+              <Peer address="10.239.66.151"/>
+              <Peer address="10.239.66.66"/>
+      </Peers>
+      <ParticipantIndex>1</ParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
+<!-- 下面这个不确定,但大概率不行 -->
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain Id="any">
+        <General>
+            <AllowMulticast>false</AllowMulticast>
+        </General>      
+        <Discovery>
+            <Peers>
+                <Peer Address="10.239.66.151" /> <!-- or <Peer address="fc94:a67f:2b47:756c:6e1c:7c05:7361:7378"/> -->
+                <Peer Address="10.239.66.66" /> <!-- or <Peer address="fc94:6260:26e:e057:9bc:8786:4f8a:c7a6"/> -->
+            </Peers>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <MaxAutoParticipantIndex>400</MaxAutoParticipantIndex>
+        </Discovery>
+    </Domain>
+</CycloneDDS>
+
+```
+
+**好下面才是原文**
+
 ```bash
 # ── 在 Orin 上 ──────────────────────────────────────────────────
 # 2.1 CAN 启动
 tmux new -s r1pro
 bash ~/can.sh
 ip link show can0                        # 期望: state UP
+
+# ros2 daemon stop && ros2 daemon start   # 重启ROS
 
 # 2.2 source SDK
 source ~/galaxea/install/setup.bash
@@ -6188,6 +6261,8 @@ source ~/galaxea/install/setup.bash
 cd ~/galaxea/install/startup_config/share/startup_config/script
 ./robot_startup.sh boot ../sessions.d/ATCStandard/R1PROBody.d/
 # 等待约 30 秒,确认所有 ROS2 节点起来
+
+# ros2 topic list                       # 看一下都启动了些啥 topic
 
 # 2.4 如果 startup 未自动启腕部 D405,手动启动(参见 F.8.2)
 # 多开一个 tmux 窗口:
@@ -6233,7 +6308,7 @@ source /opt/ros/humble/setup.bash
 # 3.2 设置跨主机 DDS 关键环境变量
 export ROS_DOMAIN_ID=72                  # 与 Orin 一致
 export ROS_LOCALHOST_ONLY=0              # 必须!默认 1 会阻止跨主机
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 # 3.3 可选:配置 FastDDS XML profile(参见 §10.6)
 # 如果已有 ~/fastdds_profile.xml:
@@ -7245,6 +7320,420 @@ Franka 的实际部署是"相机 USB 直连 GPU server,arm 控制 ROS1 rospy 在
 > 3. **形态 B**(Controller 在 GPU server)技术上可行,但需在 GPU server colcon build hdas_msg,且控制延迟 +5-15 ms;仅在"团队不愿在 Orin 上维护 RLinf 仓库 + 控制频率 ≤ 10 Hz + LAN 稳定"三个条件同时满足时考虑。
 
 > 工程提示:本方案 §0-16 主体、§12 配置、§13.8 Runbook、附录 A-F 全部按形态 A 编写;若某次部署确实选形态 B,只动 4 处:(1) YAML `controller_node_rank: 0`;(2) GPU server `requirements/install.sh` 加 ROS2 + colcon build hdas_msg;(3) `setup_before_ray_galaxea_r1_pro.sh` 在 GPU server 端也 source ROS2 + Galaxea install;(4) `safety_cfg.feedback_stale_threshold_ms` 适度放宽。
+
+---
+
+### 附录 H:跨主机 ROS2 + CycloneDDS 配置实操手册
+
+> **本附录定位:** §10.6 给的是 FastDDS profile 的"小抄式"清单,现实里很多团队(尤其是 R1 Pro 用 Galaxea SDK 默认装好 ROS2 Humble 的情况)更倾向用 **`rmw_cyclonedds_cpp`**——大文件 / 跨主机 / 大消息时它通常比 FastDDS 更稳,Nav2 / Autoware 也都默认 Cyclone。本附录把 "Orin(发布) ↔ GPU server(消费)" 这一条 ROS2 通道在 **三种典型链路**(GbE 直连、园区 LAN、纯 WiFi)下的 CycloneDDS 配置完全打通,并解决两个常见报错:`Failed to find a free participant index for domain` 与 "topic 列得到、`echo` 收不到"。所有结论与 XML 片段都来自 [Cyclone DDS 官方文档](https://cyclonedds.io/docs/cyclonedds/latest/config/index.html)、[`ros2/rmw_cyclonedds` 官方仓库](https://github.com/ros2/rmw_cyclonedds) 与上游维护者 [@eboasson](https://github.com/eclipse-cyclonedds/cyclonedds) 在 GitHub Issue 中的明确回复,**不是经验抄来的**。
+
+#### H.0 一句话定位
+
+> R1 Pro 的真机 RL 通信里,**Orin 等价于"发布端 A"**(发布 `/hdas/feedback_*`、`/hdas/camera_*` 等),**GPU server 等价于"消费端 B"**(订阅观测,反向把 `/motion_target/*` 发给 mobiman)。这一节给出在 RMW=`rmw_cyclonedds_cpp` 下,让"B 稳定消费 A 的 topic"且能反向控制 A 的最小可用配置 + 工程级配置 + 故障速查。
+
+#### H.1 与 §10.6 的关系
+
+| 项 | §10.6 | 附录 H |
+|---|---|---|
+| RMW | `rmw_fastrtps_cpp`(默认) | `rmw_cyclonedds_cpp` |
+| 主要场景 | 千兆直连 + FastDDS QoS profile | 千兆直连 / 园区 LAN / WiFi 三链路全覆盖 |
+| 多播 | 默认依赖 | 显式分链路决策(强制 spdp / 全单播) |
+| 故障覆盖 | profile 错误 | DDS 端口耗尽、多播被禁、网卡选错、AP 隔离 |
+| 适用阶段 | M0-M3(实验室直连) | 全部,**特别是 M4 / M5 移动场景下**(WiFi) |
+
+> **在 §13 Runbook 与 §12 YAML 中,`RMW_IMPLEMENTATION` 的最终选择由站点决定**:实验室直连可继续 FastDDS;一旦上 WiFi 或换大流量 image topic,优先切 Cyclone。两套是 *互斥* 的,不要同时设。
+
+#### H.2 通信场景全景图
+
+```mermaid
+flowchart LR
+    subgraph orin["R1 Pro Orin (A: 发布端)"]
+        hdas["HDAS drivers<br/>/hdas/feedback_arm_*, /hdas/feedback_gripper_*"]
+        cams["signal_camera_node<br/>/hdas/camera_head/*, /hdas/camera_chassis_*"]
+        mobiman["mobiman controllers<br/>订阅 /motion_target/*"]
+    end
+
+    subgraph gpu["GPU Server (B: 消费端)"]
+        envWorker["EnvWorker<br/>消费 feedback / image"]
+        controller["Controller<br/>发布 /motion_target/*"]
+    end
+
+    hdas -.->|"DDS topic"| envWorker
+    cams -.->|"DDS topic"| envWorker
+    controller -.->|"DDS topic"| mobiman
+
+    classDef orinClass fill:#fce4ec,stroke:#880e4f,color:#000
+    classDef gpuClass fill:#e3f2fd,stroke:#0d47a1,color:#000
+    class hdas,cams,mobiman orinClass
+    class envWorker,controller gpuClass
+```
+
+#### H.3 通信前置 4 件事(忽略任意一条都会导致"看似配好其实不通")
+
+| # | 项 | 检查命令 / 处理 |
+|---|---|---|
+| 1 | **A、B 同子网且互 ping 通** | `ping <对端 IP>` 双向都通;不通先解决 IP 路由,DDS 帮不了你 |
+| 2 | **`ROS_DOMAIN_ID` 一致** | 本方案固定 `72`(§10.6),写入两端 `setup_before_ray*.sh` 与 `~/.bashrc` |
+| 3 | **未启用 `ROS_LOCALHOST_ONLY=1`** | `printenv ROS_LOCALHOST_ONLY`;若为 1 会强制走环回,跨机必不通,**必须 `unset` 或显式置 0** |
+| 4 | **防火墙放通 DDS UDP 端口段** | `ROS_DOMAIN_ID=72` → DDS 端口基址 `B = 7400 + 250×72 = 25400`,放通 `25400-25700/UDP`(覆盖 PI≤120 的全部可能) |
+
+> 端口公式来自 [Cyclone DDS 官方 Port numbers 文档](https://cyclonedds.io/docs/cyclonedds/latest/config/port_numbers.html):`Port = Base(7400) + DomainGain(250)*domain + ParticipantGain(2)*PI + offset(10/11/...)`。
+
+#### H.4 三种典型链路 & 配置选型矩阵
+
+| 链路 | 典型场景 | 多播 | `AllowMulticast` | `ParticipantIndex` | `<Peers>` | 备注 |
+|---|---|---|---|---|---|---|
+| **L1 — 千兆直连** | M0-M3 实验室,Orin 与 GPU server 各一根网线接同台交换机 / 直连 | 通 | `true` | `none`(默认) | 不需要 | 最快、最简,§10.6 同款假设 |
+| **L2 — 园区 LAN** | M3+,与机房 / 实验室主网混跑 | 视 IGMP 而定 | `spdp` | `none` 或 `auto` | 不需要(`spdp`) | `spdp` 让"发现走多播,数据走单播",降多播风暴 |
+| **L3 — 纯 WiFi** | M4 / M5,Orin 上车后只能走无线 | 不可靠 / 常被禁 | `false`(全单播) | **`auto` + 拉大 Max** | **必须**显式列对端 IP | WiFi 多播一定丢;走 peer 单播是上游推荐 |
+
+> 三档来自 Cyclone DDS PR [#222 "Improve multicast defaults"](https://github.com/eclipse-cyclonedds/cyclonedds/pull/222) 与维护者在 [#1422](https://github.com/eclipse-cyclonedds/cyclonedds/issues/1422)、[#1323](https://github.com/eclipse-cyclonedds/cyclonedds/issues/1323) 中反复给出的同一套建议:"Don't try to rely on multicast (save for SPDP) on WiFi. WiFi multicast is horrible." —— @eboasson
+
+##### H.4.1 决策树
+
+```mermaid
+flowchart TD
+    start["A、B 都装好<br/>ros-humble-rmw-cyclonedds-cpp<br/>设 ROS_DOMAIN_ID=72"]
+    start --> q1{"链路类型?"}
+    q1 -->|"GbE 直连/同交换机"| L1["L1: AllowMulticast=true<br/>ParticipantIndex=none<br/>不需要 cyclonedds.xml"]
+    q1 -->|"园区 LAN"| L2["L2: AllowMulticast=spdp<br/>显式锁网卡<br/>ParticipantIndex=none"]
+    q1 -->|"WiFi"| q2{"AP 多播 OK?"}
+    q2 -->|"是"| L2
+    q2 -->|"被禁/隔离"| L3["L3: AllowMulticast=false<br/>ParticipantIndex=auto<br/>MaxAutoParticipantIndex=120<br/>显式列 Peers"]
+
+    classDef ok fill:#e8f5e9,stroke:#2e7d32,color:#000
+    classDef warn fill:#fff8e1,stroke:#f57f17,color:#000
+    classDef alarm fill:#ffebee,stroke:#b71c1c,color:#000
+    class L1 ok
+    class L2 warn
+    class L3 alarm
+```
+
+#### H.5 完整 `cyclonedds.xml` 三连发
+
+> 路径建议: `~/cyclonedds.xml`;两端各放一份,**只在 `<NetworkInterface name="..."/>` 这一项把网卡名换成自己机器的实际名**。查接口:`ip -br addr` 或 `iw dev`(无线)。
+
+##### H.5.1 L1(千兆直连) — *最简,可直接不写 XML*
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config
+                https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="enp0s31f6" />     <!-- A=eno1 / B=enp0s31f6 各填实际名 -->
+      </Interfaces>
+      <AllowMulticast>true</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <Watermarks>
+        <WhcHigh>500kB</WhcHigh>
+      </Watermarks>
+    </Internal>
+  </Domain>
+</CycloneDDS>
+```
+
+##### H.5.2 L2(园区 LAN,多播能用但不想刷流量)
+
+```xml
+<CycloneDDS xmlns="https://cdds.io/config" ...>
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="enp0s31f6" />
+      </Interfaces>
+      <!-- 仅 SPDP 走多播, 数据全单播; 维护者推荐的 WiFi/嘈杂网络默认 -->
+      <AllowMulticast>spdp</AllowMulticast>
+      <FragmentSize>1344B</FragmentSize>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <Watermarks>
+        <WhcHigh>500kB</WhcHigh>
+      </Watermarks>
+    </Internal>
+  </Domain>
+</CycloneDDS>
+```
+上面`<AllowMulticast>spdp</AllowMulticast>` 的意思是：
+
+只允许 Cyclone DDS 用 多播做参与者发现，也就是 SPDP discovery；但不把普通 topic 数据通信走多播，后续 endpoint 发现和用户数据会尽量走单播。
+
+更直观地说：
+
+spdp：用多播让 A/B 彼此“发现对方在线”
+topic 的实际数据传输：发现完成后通常走单播
+好处：不用手写 peer IP，同时减少普通数据多播带来的网络压力
+前提：网络至少要允许 DDS 的发现多播包通过
+Cyclone DDS 官方文档也建议：如果不想让正常数据用多播，仍然最好保留基于多播的 participant discovery；对应配置就是 AllowMulticast=spdp。
+
+常见取值可以这样理解：
+
+```xml
+<AllowMulticast>true</AllowMulticast>   <!-- 发现和数据都可用多播 -->
+<AllowMulticast>spdp</AllowMulticast>   <!-- 只用多播做参与者发现，推荐常用 -->
+<AllowMulticast>false</AllowMulticast>  <!-- 完全禁用多播，需要配置 Peers -->
+```
+
+所以在两台服务器同一局域网、允许多播的情况下，spdp 通常是比较稳妥的配置。
+
+##### H.5.3 L3(WiFi 或多播被禁) — *最关键的一份*
+
+```xml
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config
+                https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <!-- A 上写 WiFi 接口 (如 wlan0); B 同样 -->
+        <NetworkInterface name="wlp3s0" />
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+      <FragmentSize>1344B</FragmentSize>          <!-- WiFi MTU 1500 - 头部余量 -->
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+
+    <Discovery>
+      <!-- 单播发现必须用 auto 或固定整数, 严禁 none -->
+      <ParticipantIndex>auto</ParticipantIndex>
+      <!-- rmw_cyclonedds_cpp 内部默认仅 32, 这里拉到上限 120 -->
+      <MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>
+      <Peers>
+        <Peer Address="192.168.1.10" />            <!-- A: Orin WiFi IP -->
+        <Peer Address="192.168.1.11" />            <!-- B: GPU server WiFi IP -->
+      </Peers>
+    </Discovery>
+
+    <Internal>
+      <Watermarks>
+        <WhcHigh>500kB</WhcHigh>
+      </Watermarks>
+    </Internal>
+  </Domain>
+</CycloneDDS>
+```
+
+> ⚠️ **L3 三个易错点**(本会话踩坑总结):
+> 1. **不能用 `<ParticipantIndex>none</ParticipantIndex>`**——官方文档原文:"incompatible with unicast discovery"。设了 none 又禁多播,SPDP 直接死掉,A、B 看不到对方。
+> 2. **`<AllowMulticast>false</AllowMulticast>` 与 `<Peers>` 必须成对出现**;只有 `false` 没有 `Peers` 等于"既不广播也不知道找谁",topic 永远列不出。
+> 3. **必须显式 `<NetworkInterface name="..."/>` 锁网卡**;Linux 上 docker0 / br-* / 蓝牙网卡很常导致 Cyclone DDS 选错接口。
+
+#### H.6 与 RLinf `setup_before_ray*.sh` 的整合
+
+把附录 H 的环境变量整合进本方案 §13.8 中的 `ray_utils/realworld/setup_before_ray_galaxea_r1_pro.sh`(对照原 §10.6 第 1-2 项):
+
+```bash
+# ---------- ROS2 / DDS 公共部分 (A 与 B 都执行) ----------
+source /opt/ros/humble/setup.bash
+source /opt/galaxea_ros2_ws/install/setup.bash       # 仅 Orin 端必需; GPU server 形态A 无此 ws
+
+export ROS_DOMAIN_ID=72                              # 与 §10.6 一致
+unset  ROS_LOCALHOST_ONLY                            # 跨机必须
+
+# ---------- 切换到 CycloneDDS (本附录推荐, 与 §10.6 FastDDS 二选一) ----------
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+unset  FASTRTPS_DEFAULT_PROFILES_FILE                # 防止与 §10.6 残留冲突
+
+export CYCLONEDDS_URI=file://$HOME/cyclonedds.xml    # XML 路径
+
+# ---------- 让 ros2 daemon 用上面的 RMW (不能省) ----------
+ros2 daemon stop  >/dev/null 2>&1 || true
+ros2 daemon start >/dev/null 2>&1 || true
+```
+
+> **为什么 `ros2 daemon stop/start` 不能省**:[ROS 2 官方文档明确说](https://docs.ros.org/en/humble/How-To-Guides/Working-with-multiple-RMW-implementations.html),切换 RMW 后旧 daemon 仍跑在前一个 RMW 上,`ros2 topic list` / `ros2 node list` 会出现"看似配好其实只看到 daemon 缓存"的假象。
+
+#### H.7 启动后验证清单(写进 §13.8 PRE-FLIGHT)
+
+A、B 两台都跑一遍:
+
+```bash
+# 1. RMW 与 URI 都生效
+printenv RMW_IMPLEMENTATION CYCLONEDDS_URI ROS_DOMAIN_ID
+
+# 2. DDS 层裸测 (不依赖 ROS2 应用层)
+ddsperf sanity            # mean < 100000us 才算 OK
+
+# 3. ROS 2 多播自检 (L1/L2 才需要)
+ros2 multicast send       # A
+ros2 multicast receive    # B 应能持续打印
+
+# 4. 网卡确实被 Cyclone DDS 选到
+export CYCLONEDDS_URI="$CYCLONEDDS_URI,<Tracing><Verbosity>config</Verbosity><OutputFile>/tmp/cdds.\${CYCLONEDDS_PID}.log</OutputFile></Tracing>"
+ros2 run demo_nodes_cpp talker &
+sleep 3
+grep -E "ParticipantIndex|MaxAutoParticipant|Interface|Peer" /tmp/cdds.*.log | head
+
+# 5. R1 Pro 业务 topic
+ros2 topic list | grep -E '/hdas|/motion_target'                                # B 上必须看到 Orin 发布的全部 topic
+ros2 topic hz /hdas/feedback_arm_right                                          # 期望 ~ 100 Hz, 与 §10.3 时延预算对齐
+ros2 topic delay /hdas/camera_head/left_raw/image_raw_color/compressed          # 期望 < 50 ms
+```
+
+#### H.8 故障速查表(本附录核心交付物)
+
+| 症状 | 链路 | 根因 | 处置 |
+|---|---|---|---|
+| `Failed to find a free participant index for domain X` | L3 单播 | rmw_cyclonedds_cpp 把 `MaxAutoParticipantIndex` 强制设为 32,加上同机进程多 / 残留进程占端口,`auto` 扫不到空位 | (a) XML 显式 `<MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>`;(b) `pkill -9 -f "component_container\|ros2\|rclpy"` 清残留;(c) `ss -unlp \| grep -E '25[0-9]{3}'` 看端口是否被霸占。详见 H.8.1 |
+| 同样错,且 XML 写了 `<ParticipantIndex>none</ParticipantIndex>` | L3 单播 | `none` 不兼容单播发现 | 改成 `auto`;若一定要 `none`,只能配合 L1/L2 用多播发现 |
+| `ros2 topic list` 在 B 看不到 A 的 topic | 任意 | 见 H.3 四件事;最常见是 `ROS_LOCALHOST_ONLY=1` 或忘了 `ros2 daemon stop` | 按 H.3、H.6 复查 |
+| `ros2 multicast receive` 在 B 收不到 | L1/L2 | AP 客户端隔离 / IGMP snooping / 多播禁用 / 网卡选错 | 切到 L3;或 AP 后台关 *Client Isolation* / *无线隔离*;XML 显式 `<NetworkInterface name="..."/>` |
+| topic 列得到、`echo` 收不到 | L2/L3 | A 端只有 SPDP 通,Endpoint Discovery 走单播但 IP 反向不通(NAT / 双网卡上报错的 IP) | 显式锁单一网卡;在 A、B 之间 `nc -u` 验证单播 UDP 真的双向通 |
+| 大 image topic 偶发卡顿、丢帧 | 任意 | 写缓冲水位低 / 多个网卡争先 / WiFi 多播污染 | `<Watermarks><WhcHigh>500kB</WhcHigh></Watermarks>`;`AllowMulticast=spdp`;切走有线 |
+| Cyclone DDS 选错接口(选了 docker0 / br-*) | 任意 | 默认按 IP 排序选首个能用的 | XML 显式 `<NetworkInterface name="..."/>`;或 `sudo ip link set docker0 down` 临时排除 |
+| `safety_cfg.feedback_stale_threshold_ms` 经常打到上限 | L2/L3 | DDS 端排队过深 / 网络抖动 | 减小 `WhcHigh`;给反馈 topic 单独 `RELIABLE + KEEP_LAST(1)`;Image topic 改 `BEST_EFFORT`;考虑切回 L1 |
+
+##### H.8.1 深挖:`Failed to find a free participant index for domain` 的端口算术
+
+> 来自 Cyclone DDS Issue [`rmw_cyclonedds#458`](https://github.com/ros2/rmw_cyclonedds/issues/458) 维护者的明确解释。
+
+`ROS_DOMAIN_ID=72` 时,基址 `B = 7400 + 250 * 72 = 25400`。每个 PI 占两个 UDP 端口:
+
+| PI | 元数据端口 | 用户数据端口 | 状态 |
+|---|---|---|---|
+| 0 | 25410 | 25411 | rmw 默认从这里开始扫 |
+| 1 | 25412 | 25413 | |
+| 2 | 25414 | 25415 | |
+| ⋮ | ⋮ | ⋮ | |
+| 31 | 25472 | 25473 | rmw_cyclonedds_cpp 内部默认上限(`32` 个 PI 槽) |
+| 120 | 25650 | 25651 | Cyclone DDS 上游硬上限 ≤120 |
+
+**修复路径**(已写入 H.5.3 XML,这里再列一次顺序,方便排错时按序执行):
+
+```bash
+# Step 1: 清残留 (90% 的概率这一步就好了)
+ros2 daemon stop
+pkill -9 -f "component_container|ros2|rclpy|rclcpp"
+ss -unlp | grep -E '25[0-9]{3}' && echo "still occupied" || echo "clean"
+
+# Step 2: 把 MaxAutoParticipantIndex 拉到 120 (在 cyclonedds.xml 里)
+#   <Discovery>
+#     <ParticipantIndex>auto</ParticipantIndex>          <-- 必须 auto, 不是 none
+#     <MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>
+#   </Discovery>
+
+# Step 3: 重启 daemon
+ros2 daemon start
+```
+
+##### H.8.2 极致稳定方案:`IP:PORT` 静态绑定(非 `auto`)
+
+适合 R1 Pro 这种"两端各只有一个 RLinf 进程要跨机互通"的部署。同时减少 SPDP 单播扫端口的流量。
+
+```xml
+<!-- A: Orin (PI=0 → 监听 25410/25411) -->
+<Discovery>
+  <ParticipantIndex>0</ParticipantIndex>
+  <Peers>
+    <Peer Address="192.168.1.11:25412" />     <!-- B 的 SPDP 端口 -->
+  </Peers>
+</Discovery>
+```
+
+```xml
+<!-- B: GPU server (PI=1 → 监听 25412/25413) -->
+<Discovery>
+  <ParticipantIndex>1</ParticipantIndex>
+  <Peers>
+    <Peer Address="192.168.1.10:25410" />     <!-- A 的 SPDP 端口 -->
+  </Peers>
+</Discovery>
+```
+
+> 来自 [Cyclone DDS Discovery configuration 官方文档](https://cyclonedds.io/docs/cyclonedds/11.0.1/config/discovery-config.html) 的 IP:PORT 用法。**前置条件:同一台机器只能跑一个 DDS 进程**——形态 A(Controller 在 Orin)恰好满足,形态 B 也满足。
+
+#### H.9 端口/防火墙规划表(对应 §10.6 第 5 项)
+
+`ROS_DOMAIN_ID=72` 时一并放通(注意所有都是 **UDP**):
+
+| 用途 | 端口 / 范围 | 备注 |
+|---|---|---|
+| SPDP 多播 well-known | 25400-25401 | 仅 L1/L2 需要 |
+| Cyclone DDS 元数据 / 用户数据(`auto` 模式) | **25410-25651** | PI=0..120 全覆盖 |
+| 静态 PI(H.8.2) | 25410-25413 | 只放 A、B 用到的两组就够 |
+| 操作系统短临时端口 | 32768-65535 | `ParticipantIndex=none` 时内核随机选,跨主机一般不用放通(数据不走它) |
+
+ufw 示例:
+
+```bash
+# A 上 (Orin)
+sudo ufw allow proto udp from 192.168.1.11 to any port 25400:25700
+# B 上 (GPU server)
+sudo ufw allow proto udp from 192.168.1.10 to any port 25400:25700
+```
+
+#### H.10 与 §10.6 FastDDS profile 的对照(同义替换表)
+
+| 行为 | FastDDS(§10.6) | CycloneDDS(本附录) |
+|---|---|---|
+| 限定网卡 | `<userTransports>` + `<UDPv4>` 自带绑定 | `<Interfaces><NetworkInterface name="..."/></Interfaces>` |
+| 同机加速 | `<SHM>` 段 | 自动用 loopback,无需配置 |
+| 大消息分片 | `<sendSocketBufferSize>` 等 | `<FragmentSize>1344B</FragmentSize>` + `<MaxMessageSize>65500B</MaxMessageSize>` |
+| 单播替代多播 | `<initialPeersList>` | `<Peers><Peer Address=".."/></Peers>` |
+| 写缓冲水位 | `<historyMemoryPolicy>` | `<Internal><Watermarks><WhcHigh>500kB</WhcHigh></Watermarks></Internal>` |
+| QoS(BEST_EFFORT vs RELIABLE) | XML profile | 默认由 ROS 2 节点 QoS 决定;Cyclone 不在 RMW 层覆盖 |
+
+> **结论:** image topic 的 `BEST_EFFORT` / `KEEP_LAST(1)` 这层 QoS **由 ROS 2 应用层(`rclcpp::SensorDataQoS`)负责**,不论 FastDDS 还是 CycloneDDS,§6.5 的 `ROS2Camera` 与 `signal_camera_node` 的 QoS 都不需要改。
+
+#### H.11 故障复现 / 演练剧本(写进 §13.8 Runbook)
+
+```bash
+# 演练 1: 模拟 WiFi 多播被禁
+sudo iptables -A INPUT  -d 239.0.0.0/8 -j DROP
+sudo iptables -A OUTPUT -d 239.0.0.0/8 -j DROP
+ros2 topic list                                # 应当 (按预期) 看不到对端 topic
+# 切换到 H.5.3 L3 配置后, ros2 topic list 应恢复
+
+# 演练 2: 模拟 PI 耗尽
+for i in $(seq 1 40); do ros2 run demo_nodes_cpp talker --ros-args -r __node:=t$i & done
+# 第 33+ 个进程报 "Failed to find a free participant index" 即复现成功
+# 把 MaxAutoParticipantIndex 调到 120 后再跑, 应当全部成功
+
+# 演练 3: 模拟 ROS_LOCALHOST_ONLY=1 误开
+export ROS_LOCALHOST_ONLY=1
+ros2 topic list   # 看不到对端
+unset ROS_LOCALHOST_ONLY && ros2 daemon stop && ros2 daemon start
+ros2 topic list   # 恢复
+```
+
+> 这三组演练应作为附录 D / §13.8 Runbook 的一部分,在 M0 准备阶段(§11.2)做完,确保 operator 与 reviewer 对"DDS 故障"有手感。
+
+#### H.12 何时应该回退到 FastDDS (§10.6)
+
+| 场景 | 建议 RMW |
+|---|---|
+| 厂里默认就是 FastDDS、Galaxea SDK 已用 FastDDS profile 调好 | 维持 FastDDS,跳过本附录 |
+| Image topic 出现 hz 抖动、跨机延迟 > 50 ms | 试 Cyclone(本附录),通常更稳 |
+| WiFi 链路 / 多播被禁 | **强制 Cyclone**,FastDDS 在这类场景调起来更难 |
+| 团队不熟悉 DDS、希望"零 XML" | FastDDS 默认开箱即用度高一点;Cyclone 跨机几乎必写 XML |
+| 需要 Nav2 / Autoware 共栈 | Cyclone 是它们的官方推荐 |
+
+#### H.13 小结(三句话)
+
+> 1. **Orin = A、GPU server = B** 的跨机 ROS2 通道,在 R1 Pro 真机训练上是绕不开的;CycloneDDS 在大流量 image / WiFi / 跨机场景下比 FastDDS 更稳,本附录给出"L1 直连 / L2 LAN / L3 WiFi" 三档完整 XML。
+> 2. `Failed to find a free participant index for domain` 是 *DDS 端口算术* 问题,本质是 `rmw_cyclonedds_cpp` 内部把 `MaxAutoParticipantIndex` 限到 32 + 同机进程多 + 残留进程占端口;**XML 拉到 120 + 清残留 + `auto`(非 `none`)** 三步必修。
+> 3. 任何场景下都先做 H.3 四件事(同子网、同 `ROS_DOMAIN_ID`、`unset ROS_LOCALHOST_ONLY`、防火墙放通 25400-25700/UDP);90% 的"跨机不通"在这一步就能解决,余下的再按 H.4 决策树选 L1/L2/L3。
+
+#### H.14 参考(全部为官方 / 上游来源)
+
+- ROS 2 Humble 官方文档:[Working with Eclipse Cyclone DDS](https://docs.ros.org/en/humble/Installation/RMW-Implementations/DDS-Implementations/Working-with-Eclipse-CycloneDDS.html)、[Working with multiple RMW implementations](https://docs.ros.org/en/humble/How-To-Guides/Working-with-multiple-RMW-implementations.html)
+- Cyclone DDS 官方文档:[Configuration guide](https://cyclonedds.io/docs/cyclonedds/latest/config/index.html)、[Multicasting](https://cyclonedds.io/docs/cyclonedds/latest/config/multicasting.html)、[Port numbers](https://cyclonedds.io/docs/cyclonedds/latest/config/port_numbers.html)、[Discovery configuration](https://cyclonedds.io/docs/cyclonedds/latest/config/discovery-config.html)、[Configuration File Reference / `AllowMulticast`](https://github.com/eclipse-cyclonedds/cyclonedds/blob/master/docs/manual/options.md)
+- 上游官方 Issue / PR(均含维护者 [@eboasson](https://github.com/eclipse-cyclonedds/cyclonedds) 直接回复):
+  - [`eclipse-cyclonedds/cyclonedds#222 Improve multicast defaults`](https://github.com/eclipse-cyclonedds/cyclonedds/pull/222)(WiFi 自动 `spdp`)
+  - [`eclipse-cyclonedds/cyclonedds#1422`](https://github.com/eclipse-cyclonedds/cyclonedds/issues/1422)(多网卡 / WiFi 实战)
+  - [`eclipse-cyclonedds/cyclonedds#1323`](https://github.com/eclipse-cyclonedds/cyclonedds/issues/1323)(`MaxAutoParticipantIndex` 取值)
+  - [`eclipse-cyclonedds/cyclonedds#2110`](https://github.com/eclipse-cyclonedds/cyclonedds/issues/2110)(PI 上限 ~120)
+  - [`eclipse-cyclonedds/cyclonedds#687`](https://github.com/eclipse-cyclonedds/cyclonedds/issues/687)(单播 + IP:PORT 实战)
+  - [`ros2/rmw_cyclonedds#458`](https://github.com/ros2/rmw_cyclonedds/issues/458)(`Failed to find a free participant index` 同款问题与官方根因)
+  - [`ros2/rmw_cyclonedds#489`](https://github.com/ros2/rmw_cyclonedds/issues/489)(多播在 WiFi 上的代价)
+- Autoware 官方文档(同款问题的生产级处置):[Runtime Troubleshooting — CycloneDDS: Failed to find a free participant index](https://autowarefoundation.github.io/autoware-documentation/main/community/support/troubleshooting/runtime-troubleshooting/)、[DDS settings for ROS 2 and Autoware](https://autowarefoundation.github.io/autoware-documentation/main/installation/additional-settings-for-developers/network-configuration/dds-settings/)
 
 ---
 
