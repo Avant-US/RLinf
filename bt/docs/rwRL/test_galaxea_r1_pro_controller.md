@@ -1156,6 +1156,21 @@ ray stop
 - **系统侧**:真机额外要装的内容(`ros-humble-rclpy` 等、`hdas_msg`、CAN、mobiman、Ray 集群)我已经在 `requirements.tstr1ctrl.txt` 文件末尾的"Real-robot REPL extras"块里逐条列出,并配了一张兼容性矩阵表,新人对照执行即可。
 - **REPL 真机示例**:上面的"REPL 内 bring-up 套路"是经过 §8.3 / §8.7.6 推荐顺序设计的——先 `getstate` 验证通信,再 `home` 安全归位,然后从盒内小步 `setpose` 开始逐步放开,故意越界验证 L3a,最后用 `zero --force` 做关节标定动作并归位。这套流程能在不熟悉机器人的工程师手里也保持安全。
 
-# Prmp: 要上真机了,检查一下代码和设置
+# Instruction: 要上真机了,检查一下代码和设置
 
-你是一位机器人行业和强化学习领域的专家
+你是一位机器人行业和强化学习领域的专家, 现在是在连接 R1 Pro 机器人的 Orin 上, 你要做在 Orin 上跑 @RLinf/toolkits/realworld_check/test_galaxea_r1_pro_controller.py 以运行 "Orin-only 的真机 REPL 命令行交互模式" 前的检查. 因为 test_galaxea_r1_pro_controller.py 以及相关的代码(包括但不限于 @RLinf/rlinf/envs/realworld/galaxear/r1_pro_safety.py, @RLinf/rlinf/envs/realworld/galaxear/r1_pro_action_schema.py, @RLinf//rlinf/envs/realworld/galaxear/r1_pro_robot_state.py, @RLinf/tests/unit_tests/test_galaxea_r1_pro_safety.py, @RLinf/rlinf/envs/realworld/galaxear/r1_pro_controller.py 等) 在撰写时并没有考虑 Orin 的真实环境以及 galaxea R1 Pro SDK 的真实代码与配置(在 @galaxea/install 也就是 `/home/nvidia/galaxea/install`中). 所以在运行前, 需要结合 Orin 的真实环境以及 galaxea R1 Pro SDK  @galaxea/install 的真实代码与配置找出原来在 @RLinf 中的代码和配置写得不对和不合理的地方, 写出原因, 给出修改意见, 但不急于修改代码.
+
+**可参考的资料包含但不限于如下:**
+
++ 本地的 @RLinf/ (也就是 `/home/nvidia/lg_ws/RL/RLinf` ) 项目代码为基础, 包括但不限于 @RLinf/rlinf/envs/realworld/galaxear/r1_pro_safety.py, @RLinf/rlinf/envs/realworld/galaxear/r1_pro_action_schema.py, @RLinf//rlinf/envs/realworld/galaxear/r1_pro_robot_state.py, @RLinf/tests/unit_tests/test_galaxea_r1_pro_safety.py, @RLinf/rlinf/envs/realworld/galaxear/r1_pro_controller.py 等等.
++ galaxea R1 Pro SDK  @galaxea/install 的真实代码与配置
++ 本机 Orin 的真实配置与环境.
++ 能检测到的机器人以及各种硬件的真实配置与状态.
++ galaxea (星海图) R1 Pro 机器人及其SDK的官方文档 @https://docs.galaxea-dynamics.com/Guide/R1Pro/, @https://docs.galaxea-dynamics.com/Guide/R1Pro/quick_start/R1Pro_Getting_Started/ , @https://docs.galaxea-dynamics.com/Guide/R1Pro/software_introduction/R1Pro_Software_Guide_ROS2/ , @https://docs.galaxea-dynamics.com/zh/Guide/sdk_change_log/galaxea_changelog/#ros-2-humble , https://docs.galaxea-dynamics.com/Guide/R1Pro/hardware_introduction/R1Pro_Hardware_Introduction/ 和 ROS2 humble 的官方文档 @https://docs.ros.org/en/humble/ 等等, 也可参考搜索到的其它相关的网络文章.
++ 参考 RLinf 如何连接真机做强化学习的文章, 比如 @RLinf/docs/source-en/rst_source/ 中的各个 rst 文件, 特别是 @RLinf/docs/source-en/rst_source/publications/rlinf_user.rst, @RLinf/docs/source-en/rst_source/examples/embodied/franka.rst, @RLinf/docs/source-en/rst_source/examples/embodied/xsquare_turtle2.rst 等等. 也可参考 RLinf 的官方文档 @http://rlinf.readthedocs.io/en/latest/index.html, 包括但不限于 @https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/franka_pi0_sft_deploy.html, https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/gim_arm.html, @https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/dosw1.html 等等. 也可通过搜索得到网上与 RLinf 连接真机的主题相关的文章.
++ 参考RLinf官方github(https://github.com/RLinf/RLinf)中与连接真机相关的Issues, Commits, Pull requests 和 Disscussions 等等. 重要的是要以深入分析本地的 RLinf 代码库的相关代码.
++ 参考 @RLinf/bt/docs/ 中的各种 md 文档, 特别是 @RLinf/bt/docs/rwRL/ 中关于 RLinf 如何对接真机的文档. 包括但不限于 @RLinf/bt/docs/rwRL/glx/R1ProSDKAnalysis.md, @RLinf/bt/docs/rwRL/r1pro5op47.md, @RLinf/bt/docs/rwRL/r1pro5op47_imp1.md, @RLinf/bt/docs/rwRL/safety_2.md, @RLinf/bt/docs/rwRL/safety_2_knowledge.md, @RLinf/bt/docs/rwRL/test_galaxea_r1_pro_controller.md 等等.
+
+**请基于对上述参考资料的深入分析, 完成如下任务:**
+
+现在在与 R1 Pro 机器人相连的 Orin 上, 你要做在 Orin 上跑 @RLinf/toolkits/realworld_check/test_galaxea_r1_pro_controller.py 以运行 "Orin-only 的真机 REPL 命令行交互模式" 前的检查. 因为 test_galaxea_r1_pro_controller.py 以及相关的代码以及相关配置项在撰写时并没有考虑 Orin 的真实环境以及 galaxea R1 Pro SDK 的真实代码与配置(在 @galaxea/install 也就是 `/home/nvidia/galaxea/install`中). 所以在运行前, 你先要找出与真实机器人, 真实 Orin, 真实 SDK 相关的代码和配置项, 特别是配置项, 然后结合 Orin 的真实环境以及 galaxea R1 Pro SDK  @galaxea/install 的真实代码与配置, 结合真实机器人的状态与配置, 找出原来在 @RLinf 中的代码和配置写得不对和不合理的地方, 写出原因, 给出修改意见, 但不急于修改代码.
