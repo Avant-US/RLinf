@@ -1155,3 +1155,7 @@ ray stop
 - **pip 侧**:`toolkits/realworld_check/requirements.tstr1ctrl.txt` 一行装齐,**不需要为真机加任何 pip 包**——`rclpy` 等 ROS 2 包根本不在 PyPI 上,装也装不上。
 - **系统侧**:真机额外要装的内容(`ros-humble-rclpy` 等、`hdas_msg`、CAN、mobiman、Ray 集群)我已经在 `requirements.tstr1ctrl.txt` 文件末尾的"Real-robot REPL extras"块里逐条列出,并配了一张兼容性矩阵表,新人对照执行即可。
 - **REPL 真机示例**:上面的"REPL 内 bring-up 套路"是经过 §8.3 / §8.7.6 推荐顺序设计的——先 `getstate` 验证通信,再 `home` 安全归位,然后从盒内小步 `setpose` 开始逐步放开,故意越界验证 L3a,最后用 `zero --force` 做关节标定动作并归位。这套流程能在不熟悉机器人的工程师手里也保持安全。
+
+# Prmp: 要上真机了,检查一下代码和设置
+
+你是一位机器人行业和强化学习领域的专家
