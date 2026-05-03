@@ -386,6 +386,14 @@ safety_cfg:
 
 4. **安全盒是运行时检查**，开销极低（6 次浮点比较），不影响控制频率。
 
+### 3.5 ..spatial..Rotation的from_quat()有何用?
+scipy.spatial.transform.Rotation的from_quat()函数有什么用? 用在这里是什么意思?
+
+Rotation.from_quat() 从四元数 [x, y, z, w] 构造一个旋转对象。
+
+在这行代码中，ee[3:] 是末端执行器（end-effector）位姿的后4个分量，即姿态的四元数表示。整行的作用是：将末端执行器的四元数姿态转换为欧拉角 (roll, pitch, yaw)，顺序为 "xyz"。
+
+这是机器人控制中的常见操作——四元数无奇异性但不直观，欧拉角更适合作为策略网络的输入/输出或做增量控制计算。对应的就是文档中提到的 Quat2EulerWrapper 所做的事情。
 
 ## 4. RLinf 在 Orin 上的安装
 
@@ -698,3 +706,704 @@ RLinf 当前的安全系统（[r1_pro_safety.py](../../../rlinf/envs/realworld/g
 - [CBFkit](https://github.com/bardhh/cbfkit) — CBF 工具箱（含 ROS2 集成）
 - [CBFkit 论文 (arXiv:2404.07158)](https://arxiv.org/html/2404.07158v1) — CBF 在机器人中的应用综述
 - [Mink GitHub](https://github.com/kevinzakka/mink) — Pink 的 MuJoCo 移植版
+
+## 6. Pi0.5 & 0 都是预测action delta
+Pi0.5 预测的是 delta actions（相对动作）。
+
+代码库中的关键证据：
+
+数据配置注释（libero_dataconfig.py）明确写道："pi0 models are trained on delta actions (relative to the first state in each action chunk)"，Pi0 和 Pi0.5 都是如此。
+
+Flow Matching 架构：模型预测的是速度向量 v_t，本质就是动作的变化率（delta）：
+
+
+v_t = self.get_velocity(...)       # 预测速度
+x0_pred = x_t - v_t * t_input      # 反推起始动作
+x1_pred = x_t + v_t * (1 - t_input) # 推演目标动作
+Pi0 vs Pi0.5 的区别：两者都是 delta actions，但数据预处理不同：
+
+Pi0：extra_delta_transform=True（数据集是绝对动作，需要在线转为 delta）
+Pi0.5：extra_delta_transform=False（数据集已经是 delta 格式）
+所以在环境侧，RLinf 的 RelativeFrame wrapper 负责将模型输出的 delta 动作转换为机器人需要的绝对目标位姿。
+
+## 7. Home 和 Zero Postion
+机器人行业中,当一套动作做完后,手臂等部件回归初始状态,这个行为有个专业的叫法,叫什么?
+
+这个动作通常叫 homing（回零/归零），或者叫 reset to home position。
+
+常见的相关术语：
+
+术语	含义
+Homing	最常用，回到预定义的"home"位姿
+Home position	那个初始位姿本身
+Return to home	动作过程的描述
+Zero position	所有关节角度为零的位姿（和 home 不一定相同）
+在 RLinf 代码库中，对应的就是 reset() 方法 —— 每个 episode 结束后调用 env.reset() 将机器人回到初始位姿。配置中的 reset_joint_cycles 也是控制多久做一次关节重置（防止累积漂移）。
+
+### 7.1 Opus 4.7 给 R1 Pro 设置的 Home Position
+
+`_DEFAULT_HOME_QPOS = (0.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.0)` 不是凭空写的,但也不是来自 Galaxea 官方某份"必须遵守"的标定文档。它的依据可以分成 4 个层次。
+
+#### 7.1.1. 直接来源:同生产环境 `joint_reset_qpos_right`
+
+CLI 里这个常量是**镜像**于 RLinf 生产环境配置的:
+
+```100:103:rlinf/envs/realworld/galaxear/r1_pro_env.py
+    joint_reset_qpos_right: list = field(default_factory=lambda: [
+        0.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.0,
+    ])
+    joint_reset_qpos_left: Optional[list] = None
+```
+
+设计文档里也是这个值:
+
+```2845:2846:bt/docs/rwRL/r1pro5op47.md
+    joint_reset_qpos_right: list[float] = field(default_factory=lambda: [
+        0.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.0])
+```
+
+`env.reset()` 内部的 `_safe_go_to_rest("right", cfg.joint_reset_qpos_right)`(`r1_pro_env.py:540-541`)走的就是同一组关节。
+
+> **设计意图**:CLI `home` 命令应当让臂回到训练 reset 时的同一姿态。如果 CLI 用一组,env 用另一组,operator 在 bring-up / 故障恢复时会看到不一致的"安全位",非常容易混淆。所以这是**单一事实源**(single source of truth),不是另起炉灶的常量。
+
+#### 7.1.2. 历史血统:Franka "Ready Pose" 风格,适配到 A2
+
+对比 RLinf 已有 Franka 实现:
+
+```71:73:rlinf/envs/realworld/franka/franka_env.py
+    joint_reset_qpos: list[float] = field(
+        default_factory=lambda: [0, 0, 0, -1.9, -0, 2, 0]
+    )
+```
+
+| 机器人 | reset qpos (rad) | 风格 |
+|---|---|---|
+| Franka(本仓库) | `[0, 0, 0, -1.9, 0, 2.0, 0]` | "简化版" Panda ready,J2/J3/J5/J7 全 0 |
+| R1 Pro / Galaxea A2 | `[0, 0.3, 0, -1.8, 0, 2.1, 0]` | 同上,但 J2 抬高 ~17° |
+| Franka 官方 ready(libfranka 例程) | `[0, -π/4, 0, -3π/4, 0, π/2, π/4]` ≈ `[0, -0.79, 0, -2.36, 0, 1.57, 0.79]` | 经典对称肘弯 |
+
+R1 Pro 的版本本质上是**沿用 Franka 风格** —— 让所有"轴向" DOF(J1 / J3 / J5 / J7)归零,只让"弯曲" DOF(J2 / J4 / J6)定型 —— 这种 4-DOF 归零 + 3-DOF 定型的做法在 7-DoF 协作臂工程实践里非常常见,因为它:
+
+- 把臂保持在矢状面内,左右无偏置
+- 各轴向关节有最大往两侧旋转的余量
+- 易记、易验证(只有 3 个非零数)
+
+#### 7.1.3. 物理 / 几何含义(逐关节)
+
+R1 Pro 右臂用的是 Galaxea A2(7-DoF),关节布局与 Panda 同构:
+
+| 关节 | 角色 | 默认值 | 物理含义 |
+|---|---|---|---|
+| J1 | 肩 yaw | 0.0 | 肩部水平居中,正前方 |
+| J2 | 肩 pitch | +0.3 (≈+17°) | 肩部略抬,把臂从下垂位"提起来" |
+| J3 | 上臂 roll | 0.0 | 上臂不扭转 |
+| **J4** | **肘 pitch** | **-1.8 (≈-103°)** | **肘部内屈成稍大于直角**,这是核心姿态决定项 |
+| J5 | 前臂 roll | 0.0 | 前臂不扭转 |
+| **J6** | **腕 pitch** | **+2.1 (≈+120°)** | **腕部前俯**,让 EE 工具轴朝前下方,正对桌面工作区 |
+| J7 | 工具 roll | 0.0 | 工具不扭转 |
+
+整体效果:**EE 落在躯干前下方约 30-40 cm 处的工作区上方**,朝向桌面,既不贴胸也不外展。这正好对应 `r1_pro_env.py` 默认 `reset_ee_pose_right = [0.35, -0.10, 0.45, -3.14, 0.0, 0.0]`(在 `torso_link4` frame 中,即 EE 在前 35 cm、左右居中、高 45 cm)。
+
+#### 7.1.4. 安全性:相对 SafetyConfig 的关节限位余量
+
+参照本文档 §4.2 / [`r1_pro_safety.py:62-65`](rlinf/envs/realworld/galaxear/r1_pro_safety.py#L62-L65) 中:
+
+```
+arm_q_min = [-2.7, -1.8, -2.7, -3.0, -2.7, -0.1, -2.7]
+arm_q_max = [ 2.7,  1.8,  2.7,  0.0,  2.7,  3.7,  2.7]
+```
+
+| Joint | qpos | q_min | q_max | 距 q_min | 距 q_max | 评价 |
+|---|---|---|---|---|---|---|
+| J1 | 0.0 | -2.7 | +2.7 | 2.7 | 2.7 | 正中 |
+| J2 | +0.3 | -1.8 | +1.8 | 2.1 | 1.5 | 余量充足 |
+| J3 | 0.0 | -2.7 | +2.7 | 2.7 | 2.7 | 正中 |
+| J4 | -1.8 | -3.0 | 0.0 | 1.2 | 1.8 | **关键关节,J4_max=0,所以必须为负;-1.8 取在中段** |
+| J5 | 0.0 | -2.7 | +2.7 | 2.7 | 2.7 | 正中 |
+| J6 | +2.1 | -0.1 | +3.7 | 2.2 | 1.6 | 余量充足 |
+| J7 | 0.0 | -2.7 | +2.7 | 2.7 | 2.7 | 正中 |
+
+每个关节最近限位的距离都 ≥ **1.2 rad ≈ 69°**,因此该姿态:
+
+- 通过本文档 §8.7.5 的 L2 严格内区间检查(`q_min < q < q_max`),**不会被 CLI 拒绝**;
+- 对 PID 控制器跟踪误差/过冲有充分容忍度;
+- 远离 J4=0 的肘部"完全伸直"奇异点(J4 = 0 在 Panda 类机臂里是奇异/碰撞危险点)。
+
+#### 7.1.5. 它"好"在哪里?为什么把它当作 Home
+
+把上面综合起来,这个 qpos 同时满足以下 6 条工程标准:
+
+1. **可达且远离限位** —— 关节余量 ≥ 1.2 rad(§4 表格)
+2. **远离运动学奇异点** —— J4 ≈ -103° 离 J4=0(肘伸直奇异)足够远
+3. **EE 落在工作区上方** —— 与 `reset_ee_pose_right = [0.35, -0.10, 0.45, ...]` 对得上,既不撞桌也不贴胸
+4. **各轴向关节正中** —— 之后向左/右/任意方向继续运动都有最大余量
+5. **左右对称基础** —— `joint_reset_qpos_left` 默认 `None` 时复用同一组数值,在 `r1_pro_env.py` 里 `_safe_go_to_rest` 会把它当作 left 的回零目标(实际部署需要根据双臂安装位/碰撞球做调整)
+6. **训练-bring-up 一致性** —— CLI `home` 与 `env.reset()` 落到同一姿态,operator 看到的"home 后状态"就是策略训练时的 reset 状态
+
+#### 7.1.6. 这值不是"绝对真理"——已知局限
+
+也要老实说明,这个默认值不是 Galaxea 官方公布的"R1 Pro 标准 home pose",而是 RLinf 工程上选定的**默认值**。它有以下局限:
+
+| 局限 | 说明 | 应对 |
+|---|---|---|
+| 与 Galaxea SDK 真实机械限位未对照 | `SafetyConfig.arm_q_min/q_max` 是 RLinf 设的软限位,真机 SDK / 关节编码器零点可能略有偏移 | bring-up 时按 §2.2 校验 A2 实际限位,必要时在 `--home-qpos` 中覆盖 |
+| 不考虑 gripper / payload / 工具长度 | EE 实际位置会被 gripper(0-100mm)、夹持物体的几何尺寸所拉长 | 加装长工具时减小 J6 的前俯角 |
+| 任务特化场景未优化 | pick-and-place、cap-tighten、移动操作等不同任务的最佳 Home 不同 | 在任务 YAML 中通过 `joint_reset_qpos_right` 覆盖,或在 CLI 中用 `--home-qpos` |
+| 双臂场景下左右用同值可能互相干扰 | `joint_reset_qpos_left` 默认 `None`(=右臂同值),双臂同时摆到这个姿态在 `torso_link4` 系下可能出现 EE 重合 | 双臂任务必须显式给 `joint_reset_qpos_left`,或在 CLI 中扩展支持(本期单臂 CLI 不涉及) |
+| 没有 CAD 自碰撞验证 | 当前数值只验证关节限位,没在 URDF / collision mesh 上做自碰撞判断 | 真机 dry-run 时人眼/慢速测试 |
+
+#### 7.1.7. 一句话总结
+
+> `(0.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.0)` = **"Franka Panda 风格 4-轴归零 + 3-轴定型"的 ready pose,被 RLinf 工程团队选作 R1 Pro 训练 reset 的默认目标关节,CLI Home 镜像了这一选择。** 它在所有 7 个关节都距 `SafetyConfig` 软限位 ≥ 1.2 rad,EE 落在躯干前下方工作区上方,远离肘奇异点,因此既适合 bring-up 回零,也适合训练 episode 之间的 reset。它不是 Galaxea 官方钦定的姿态,因此 CLI 提供 `--home-qpos` 与 `set-home` 来允许任务/操作员现场覆盖。
+
+
+## 8. 三种位姿输入模式详解：pose-euler、pose-quat、pose-delta
+
+> 对应 [safety_2.md §8.7 R1 Pro 右臂位姿 + 安全盒 CLI 工具](safety_2.md)
+>
+> 代码文件：[`toolkits/realworld_check/test_galaxea_r1_pro_controller.py`](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py)
+
+### 8.1 前置知识：描述"机械臂手到哪里、怎么摆"需要什么？
+
+控制机械臂的末端执行器（夹爪/手）运动，本质上需要回答两个问题：
+
+```
+1. 去哪儿？ → 位置：三维空间坐标 (x, y, z)
+2. 手怎么摆？ → 姿态：夹爪朝哪个方向
+```
+
+**位置** 容易理解——三维空间中的一个点，单位是米 (m)，在 `torso_link4` 坐标系中度量（关于 `torso_link4` 的含义参见本文档 §1.1）：
+
+```
+          z ↑ (上)
+          │
+          │     x → (前)
+          │    ╱
+          │   ╱
+          │  ╱
+          ├──────→ y (左)
+       torso_link4
+       (机器人肩部基座)
+```
+
+**姿态** 稍复杂——描述一个物体在三维空间中"朝哪个方向"有多种数学表达。这三种位姿模式的核心区别就在于：**用什么方式描述姿态**，以及**目标是绝对的还是相对的**。
+
+### 8.2 三种模式一览
+
+| 模式 | 输入维度 | 位置表达 | 姿态表达 | 目标类型 |
+|------|---------|---------|---------|---------|
+| `pose-euler` | 6D | 绝对坐标 `(x, y, z)` | 欧拉角 `(roll, pitch, yaw)` | 绝对目标 |
+| `pose-quat` | 7D | 绝对坐标 `(x, y, z)` | 四元数 `(qx, qy, qz, qw)` | 绝对目标 |
+| `pose-delta` | 7D | 相对偏移 `(dx, dy, dz)` | 相对旋转 `(drx, dry, drz)` + 夹爪 | 相对偏移 |
+
+用一个比喻来理解这三种模式：
+
+```
+pose-euler:  "去北京市朝阳区XX路YY号，面朝南。"     → 精确的绝对地址 + 朝向
+pose-quat:   "去 GPS 116.4074°E, 39.9042°N，面朝南。" → 同一地点，换一种坐标表达
+pose-delta:  "从现在的位置往前走 3 步，右转 15°。"    → 相对当前位置的指令
+```
+
+### 8.3 模式一：pose-euler — 最直觉的绝对位姿
+
+#### 8.3.1 输入格式
+
+```
+命令行:  --pose-euler  X    Y     Z    Roll  Pitch  Yaw
+REPL:    setpose       0.40 -0.10 0.30 -3.14 0.0   0.0
+```
+
+6 个浮点数 = 3 个位置分量 + 3 个姿态分量，全部在 `torso_link4` 坐标系中。
+
+#### 8.3.2 欧拉角 (Roll, Pitch, Yaw) 是什么
+
+欧拉角把任意一个三维旋转分解为"依次绕三个轴旋转"的三个角度（单位：弧度）。在 RLinf 中采用 `xyz` 顺序（也叫 Tait-Bryan 角），三个分量各自对应一种直觉运动：
+
+```
+  ┌───────────────────────────────────────────────────────────────┐
+  │                                                               │
+  │   Roll (绕 x 轴)        Pitch (绕 y 轴)       Yaw (绕 z 轴)  │
+  │                                                               │
+  │      ╭──╮                   │                    │            │
+  │     ╱    ╲                  │                    │            │
+  │    ╱  ↻   ╲                 │↙                   │            │
+  │   x───→ y             x───→╱y              x───→ y           │
+  │  ╱                    ╱   ╱                ╱  ╲              │
+  │ z                    z                    z    ↻             │
+  │                                                               │
+  │  想象：                想象：               想象：              │
+  │  转门把手              点头                 摇头                │
+  │  手腕绕自身             手腕前后俯仰         手腕左右偏转       │
+  │  长轴旋转              (上下看)             (左右看)           │
+  └───────────────────────────────────────────────────────────────┘
+```
+
+常见姿态数值举例：
+
+| 姿态 | (Roll, Pitch, Yaw) | 含义 |
+|------|---------------------|------|
+| `(-3.14, 0.0, 0.0)` | Roll ≈ -π | 夹爪绕 x 轴旋转 180°，即**朝下**（最常见的桌面抓取姿态） |
+| `(0.0, 0.0, 0.0)` | 全 0 | 夹爪与 `torso_link4` 坐标系同向（通常朝前，不朝下） |
+| `(-3.14, 0.0, 0.785)` | Yaw ≈ π/4 | 朝下且顺时针旋转 45°（侧抓） |
+
+#### 8.3.3 处理管线
+
+`pose-euler` 的处理管线是三种模式中最简单的——用户输入的就是最终目标，只需检查安全盒并发送：
+
+```mermaid
+flowchart TB
+    Input["用户输入 6 个浮点数<br/>x y z roll pitch yaw"] --> Finite["① 有限性检查<br/>NaN / Inf → 拒绝"]
+    Finite --> Clip["② clip_pose_to_box()<br/>逐轴裁剪到安全盒"]
+    Clip --> Warn["③ 如有裁剪 → 打印 L3a 警告"]
+    Warn --> Convert["④ euler_to_quat(rpy)<br/>欧拉角 → 四元数"]
+    Convert --> Send["⑤ 发送 pose7<br/>[x,y,z,qx,qy,qz,qw]"]
+```
+
+对应代码路径：[`test_galaxea_r1_pro_controller.py`](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 的 `ArmSafetyCLI.send_pose_euler()` → `_send_clipped_xyzrpy()` → `clip_pose_to_box()` → `euler_to_quat()` → `backend.send_pose(pose7)`。
+
+#### 8.3.4 数值示例
+
+假设安全盒默认配置为：
+
+```
+box_min = [0.20, -0.35, 0.05, -3.20, -0.30, -0.30]
+box_max = [0.65,  0.35, 0.65,  3.20,  0.30,  0.30]
+```
+
+**示例 A — 盒内目标（不裁剪）**：
+
+```bash
+setpose 0.40 -0.10 0.30 -3.14 0.0 0.0
+```
+
+```
+输入: target = [0.40, -0.10, 0.30, -3.14, 0.0, 0.0]
+裁剪: clip([0.40, -0.10, 0.30, -3.14, 0.0, 0.0],
+           [0.20, -0.35, 0.05, -3.20, -0.30, -0.30],
+           [0.65,  0.35, 0.65,  3.20,  0.30,  0.30])
+     = [0.40, -0.10, 0.30, -3.14, 0.0, 0.0]  ← 全部在盒内，不变
+
+输出: [INFO]  Sent pose7 = [+0.4000, -0.1000, +0.3000, +0.0000, +0.0000, -0.0008, +1.0000]
+                                                         ↑ qx      qy       qz      qw
+                                                         (roll=-π 对应的四元数)
+```
+
+**示例 B — 盒外目标（触发裁剪）**：
+
+```bash
+setpose 0.80 0.0 0.30 -3.14 0.0 0.0
+```
+
+```
+输入: target = [0.80, 0.0, 0.30, -3.14, 0.0, 0.0]
+裁剪: x=0.80 > box_max[0]=0.65 → 裁剪到 0.65
+
+输出:
+[WARN]  L3a:right_ee_box x=+0.8000 -> +0.6500 (clipped to max face)
+[INFO]  Sent pose7 = [+0.6500, +0.0000, +0.3000, ...]
+```
+
+实际发送的是 `x=0.65`（安全盒边缘），不是用户输入的 `0.80`。机械臂不会超出安全盒。
+
+#### 8.3.5 什么时候用
+
+- 人工 bring-up 时，手动输入一个明确的目标点
+- 从 TF2 / MoveIt / SLAM 获取了目标位姿的欧拉角表示
+- 想逐步试探"机器人能不能安全到达这个点"
+- 最简单、最直觉，适合刚接触 CLI 的操作员
+
+### 8.4 模式二：pose-quat — 四元数姿态的绝对位姿
+
+#### 8.4.1 输入格式
+
+```
+命令行:  --pose-quat  X    Y     Z    QX   QY   QZ   QW
+REPL:    setposq      0.40 -0.10 0.30 0.0  0.0  0.0  1.0
+```
+
+7 个浮点数 = 3 个位置分量 + 4 个姿态分量（四元数）。
+
+#### 8.4.2 为什么需要四元数
+
+欧拉角虽然直觉，但有一个数学缺陷叫 **万向节锁 (Gimbal Lock)**——当 Pitch 角接近 ±90° 时，Roll 和 Yaw 的旋转轴重合，三个自由度退化为两个，姿态表示不再唯一。
+
+四元数用 4 个数字 `(qx, qy, qz, qw)` 描述同一个旋转，没有万向节锁，而且旋转插值更平滑。代价是不太直觉：
+
+| 姿态 | 欧拉角 (人类友好) | 四元数 (数学友好) |
+|------|-----------------|-----------------|
+| 不旋转 (identity) | `(0, 0, 0)` | `(0, 0, 0, 1)` |
+| 夹爪朝下 (绕 x 翻 180°) | `(-3.14, 0, 0)` | `(1, 0, 0, 0)` 或 `(-1, 0, 0, 0)` |
+| 绕 z 轴转 90° | `(0, 0, 1.57)` | `(0, 0, 0.707, 0.707)` |
+
+四元数必须满足 `qx² + qy² + qz² + qw² = 1`（单位四元数）。CLI 会自动归一化用户输入，容忍轻微的非单位输入。
+
+> **何时用四元数、何时用欧拉角？** 一个实用的判断标准：
+> - 需要**人类阅读或手写**的场景 → 用欧拉角（直觉）
+> - 需要**程序间传递或数学运算**的场景 → 用四元数（精确、无奇异）
+>
+> ROS2 的 `PoseStamped` 消息使用四元数，所以从 `ros2 topic echo` 看到的姿态就是四元数格式。
+
+#### 8.4.3 处理管线
+
+比 `pose-euler` 多了四元数归一化和双向转换步骤：
+
+```mermaid
+flowchart TB
+    Input["用户输入 7 个浮点数<br/>x y z qx qy qz qw"] --> Finite["① 有限性检查"]
+    Finite --> Norm["② 四元数归一化<br/>q = q / ||q||"]
+    Norm --> ZeroCheck["③ 零范数检查<br/>||q|| ≈ 0 → 拒绝"]
+    ZeroCheck --> Q2E["④ quat_to_euler(q)<br/>四元数 → 欧拉角"]
+    Q2E --> Clip["⑤ clip_pose_to_box()<br/>在欧拉角空间裁剪"]
+    Clip --> E2Q["⑥ euler_to_quat(rpy)<br/>欧拉角 → 四元数"]
+    E2Q --> Send["⑦ 发送 pose7"]
+```
+
+**为什么中间要转一次欧拉角？** 因为安全盒的姿态边界定义在欧拉角空间：
+
+```python
+# SafetyConfig 默认值
+right_ee_min = [x_min, y_min, z_min, roll_min, pitch_min, yaw_min]
+right_ee_max = [x_max, y_max, z_max, roll_max, pitch_max, yaw_max]
+```
+
+`np.clip()` 逐元素裁剪只在欧拉角的三个独立分量上有物理意义。四元数的 4 个分量相互耦合（满足单位约束 `||q||=1`），无法逐元素独立裁剪。所以管线是：
+
+```
+用户的四元数 → 转为欧拉角 → 安全盒裁剪 → 转回四元数 → 发送
+```
+
+对应代码：`ArmSafetyCLI.send_pose_quat()` 先归一化四元数、转欧拉角，然后调用同一个 `_send_clipped_xyzrpy()`。
+
+#### 8.4.4 数值示例
+
+从 ROS2 话题复制一个 EE 位姿：
+
+```bash
+# 先看当前位姿
+ros2 topic echo /motion_control/pose_ee_arm_right --once
+# 输出: position: {x: 0.35, y: -0.12, z: 0.28}
+#        orientation: {x: 0.999, y: 0.001, z: -0.003, w: 0.012}
+
+# 直接粘贴到 CLI
+setposq 0.35 -0.12 0.28 0.999 0.001 -0.003 0.012
+```
+
+CLI 内部处理：
+
+```
+1. 归一化: ||q|| = √(0.999² + 0.001² + 0.003² + 0.012²) ≈ 0.9991
+   q_norm = [0.999, 0.001, -0.003, 0.012] / 0.9991
+          ≈ [0.9999, 0.001, -0.003, 0.012]
+
+2. 四元数 → 欧拉角: rpy ≈ [-3.117, -0.006, 0.002]
+   (接近 roll=-π，即夹爪朝下)
+
+3. 安全盒裁剪: 全部在盒内，不裁剪
+
+4. 欧拉角 → 四元数: 转回四元数
+
+5. 发送 pose7
+```
+
+#### 8.4.5 什么时候用
+
+- 从 `ros2 topic echo` 复制了一个四元数位姿，想直接粘贴到 CLI
+- 从 MoveIt、TF2、SLAM 等系统获取了四元数格式的目标
+- 想避免手动把四元数转换为欧拉角（容易出错）
+- 适合有 ROS2 经验的工程师
+
+### 8.5 模式三：pose-delta — 模拟策略输出的相对偏移
+
+#### 8.5.1 输入格式
+
+```
+命令行:  --pose-delta  DX   DY   DZ   DRX  DRY  DRZ  DGRIP
+REPL:    setdelta      0.1  0.0  0.0  0.0  0.0  0.0  0.5
+```
+
+7 个归一化浮点数，值域 `[-1, 1]`：6 个运动分量 + 1 个夹爪分量。
+
+#### 8.5.2 核心区别：不说"去哪"，而说"怎么动"
+
+前两种模式告诉机器人一个**绝对目标位置**——"把手放到 (0.40, -0.10, 0.30)"。不管手现在在哪，目标都是那个点。
+
+`pose-delta` 完全不同。它告诉机器人一个**相对偏移**——"从现在的位置往前移一点、夹爪合拢一点"。最终手到达哪里，取决于手**现在在哪**。
+
+```
+pose-euler/quat:                     pose-delta:
+"去 (0.40, -0.10, 0.30)"            "从这里往前 +0.1"
+
+        目标固定                           目标随当前位置变化
+    ┌──────────┐                      现在在 A → 去 A'
+    │          │                      现在在 B → 去 B'
+    │    ★     │  ← 同一个目标
+    │          │                      ★ A →→→ ★ A'
+    └──────────┘                        ★ B →→→ ★ B'
+```
+
+#### 8.5.3 归一化 delta 是什么
+
+RL 策略网络（VLA、Pi0 等）不直接输出"往前移动 3 厘米"这样的物理量。它输出的是**归一化的 [-1, 1] 范围**的数值，然后乘以一个 `action_scale` 才变成实际的物理偏移：
+
+```
+实际位移 = action × action_scale
+
+其中:
+  action ∈ [-1, 1]           ← 策略网络输出
+  action_scale[0] = 0.05 m   ← 位移缩放因子（每步最多 5cm）
+  action_scale[1] = 0.10 rad ← 旋转缩放因子（每步最多 ~5.7°）
+```
+
+所以 `setdelta 1.0 0.0 0.0 0.0 0.0 0.0 0.0` 的含义是："沿 x 轴正方向移动 `1.0 × 0.05 = 5cm`"。
+
+7 个分量的含义：
+
+| 分量 | 含义 | 值域 | × scale 后的物理量 |
+|------|------|------|-------------------|
+| DX | x 方向位移 | [-1, 1] | ±5cm（默认 scale=0.05） |
+| DY | y 方向位移 | [-1, 1] | ±5cm |
+| DZ | z 方向位移 | [-1, 1] | ±5cm |
+| DRX | 绕 x 轴旋转 (roll) | [-1, 1] | ±0.1rad ≈ ±5.7° |
+| DRY | 绕 y 轴旋转 (pitch) | [-1, 1] | ±0.1rad |
+| DRZ | 绕 z 轴旋转 (yaw) | [-1, 1] | ±0.1rad |
+| DGRIP | 夹爪开合 | [-1, 1] | -1=全开, +1=全合 |
+
+#### 8.5.4 为什么需要这个模式
+
+这是三种模式中唯一与 **RL 训练路径一致**的模式。在训练中，策略网络输出 delta action，经过安全系统处理后变成机器人的控制指令。这个 CLI 模式让操作员能在 REPL 中**手动模拟策略的输出**，观察安全系统的完整反应。
+
+典型用途：
+
+```
+调试场景：训练日志显示某个 action 被 L3a 裁剪了，想手动重现
+
+  1. 从日志中找到那个 action: [0.8, -0.3, 0.1, 0.0, 0.2, -0.1, 0.5]
+  2. 在 CLI 中输入:
+     setdelta 0.8 -0.3 0.1 0.0 0.2 -0.1 0.5
+  3. 观察输出：哪些安全层触发了、被裁剪到了多少
+```
+
+#### 8.5.5 处理管线（完整 L1-L5 安全管线）
+
+这是三种模式中**最复杂**的路径，因为它走的是生产级安全管线，与 `GalaxeaR1ProEnv.step()` 内部的 action 处理流程相同：
+
+```mermaid
+flowchart TB
+    Input["用户输入 7 个归一化浮点数<br/>dx dy dz drx dry drz dgrip"] --> GetState["① 从后端获取当前机器人状态<br/>backend.get_state()"]
+    GetState --> NoState{"有状态？"}
+    NoState -->|"否 (rclpy/dummy)"| ZeroState["使用零状态<br/>打印 origin-anchored 提示"]
+    NoState -->|"是 (ray)"| Validate[""]
+    ZeroState --> Validate["② SafetySupervisor.validate()<br/>完整 L1-L5 安全管线"]
+
+    subgraph L1to5 ["安全管线内部"]
+        direction TB
+        L1["L1: NaN/Inf 检查"]
+        L3a["L3a: 预测 EE 目标 → 安全盒裁剪 → 改写 action"]
+        L4["L4: 单步步长上限 → 截断过大动作"]
+        L5["L5: BMS/SWD/心跳 → 系统级安全"]
+        L1 --> L3a --> L4 --> L5
+    end
+
+    Validate --> L1to5
+
+    L1to5 --> Check{"安全结果"}
+    Check -->|"emergency_stop"| Brake1["apply_brake(True)<br/>拒绝下发<br/>[EMERG]"]
+    Check -->|"safe_stop"| Brake2["apply_brake(True)<br/>拒绝下发<br/>[SAFE]"]
+    Check -->|"soft_hold"| Hold["拒绝下发 (不刹车)<br/>[HOLD]"]
+    Check -->|"通过"| Predict["③ ActionSchema.predict_arm_ee_pose()<br/>safe_action + 当前 EE → 目标 EE"]
+    Predict --> Convert["④ euler_to_quat()"]
+    Convert --> Send["⑤ 发送 pose7"]
+```
+
+对应代码：`ArmSafetyCLI.send_pose_delta()` 调用 `self._supervisor.validate(a, state, self._schema)` 获取 `SafetyInfo`，根据标志位决定是否下发。
+
+#### 8.5.6 数值示例
+
+假设当前 EE 位置为 `[0.35, -0.12, 0.28]`（在 `torso_link4` 前方 35cm），`action_scale = [0.05, 0.10, 1.0]`：
+
+**示例 A — 安全的小步移动**：
+
+```bash
+setdelta 0.1 0.0 0.0 0.0 0.0 0.0 0.0
+```
+
+```
+action     = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+当前 EE    = [0.35, -0.12, 0.28, ...]
+scale      = [0.05, 0.10, 1.0]
+
+预测目标 x = 0.35 + 0.1 × 0.05 = 0.355  ← 前进 5mm
+预测目标 y = -0.12 + 0.0 × 0.05 = -0.12  ← 不变
+预测目标 z = 0.28 + 0.0 × 0.05 = 0.28    ← 不变
+
+L3a 检查: [0.355, -0.12, 0.28] 全部在 [0.20..0.65, -0.35..0.35, 0.05..0.65] 内
+→ 不裁剪，正常下发
+
+输出:
+[INFO]  Sent pose7 = [+0.3550, -0.1200, +0.2800, ...]
+```
+
+**示例 B — 触发 L3a 裁剪的大步移动**：
+
+```bash
+setdelta 1.0 0.0 0.0 0.0 0.0 0.0 0.0
+```
+
+```
+action     = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+预测目标 x = 0.35 + 1.0 × 0.05 = 0.40    ← 前进 5cm
+
+如果当前 EE 更靠前, 比如 x=0.62:
+预测目标 x = 0.62 + 1.0 × 0.05 = 0.67 > box_max=0.65
+→ L3a 裁剪到 0.65, 改写 safe_action
+
+输出:
+[INFO]  L3a:right_ee_box x 裁剪
+[INFO]  Sent pose7 = [+0.6500, ...]
+```
+
+**示例 C — 触发 emergency_stop 的非法输入**：
+
+```bash
+setdelta nan 0.0 0.0 0.0 0.0 0.0 0.0
+```
+
+```
+L1 检查: 发现 NaN → emergency_stop = True
+
+输出:
+[ERROR] L1:non_finite_action
+[EMERG] apply_brake(True); refusing to publish target.
+```
+
+机械臂刹车锁死，不下发任何目标。
+
+#### 8.5.7 "origin-anchored" 模式说明
+
+当使用 `--backend rclpy` 或 `--dummy` 时，后端没有真实的 `get_state()` 能力——rclpy 后端只发布目标但不订阅反馈，dummy 后端根本不连接机器人。此时 CLI 会使用一个默认的 `GalaxeaR1ProRobotState()`（EE 位姿全零）作为 state：
+
+```
+[NOTE]  Backend does not expose state; using a zero EE snapshot.
+        Predicted EE = action * scale (origin-anchored).
+```
+
+这意味着预测的 EE 目标是从**原点**出发的偏移，不是从真实 EE 位置出发。适合离线验证安全逻辑，**不适合**作为真机精确 delta 控制。真机 delta 控制应使用 `--backend ray`。
+
+#### 8.5.8 什么时候用
+
+- 调试训练中某个 action 被安全系统裁剪的原因
+- 模拟策略行为，验证 L1/L3a/L4/L5 各层反应
+- 验证 `action_scale` 配置是否合理
+- 适合有 RL 训练经验的工程师
+
+### 8.6 三种模式的处理管线对比
+
+```mermaid
+flowchart LR
+    subgraph euler ["pose-euler (最简单)"]
+        direction TB
+        E1["6D 输入<br/>x y z r p y"] --> E2["finite check"]
+        E2 --> E3["clip_to_box<br/>(轻量 L3a)"]
+        E3 --> E4["euler→quat"]
+        E4 --> E5["send_pose"]
+    end
+
+    subgraph quat ["pose-quat (多转换步骤)"]
+        direction TB
+        Q1["7D 输入<br/>x y z qx qy qz qw"] --> Q2["finite check"]
+        Q2 --> Q3["normalize quat"]
+        Q3 --> Q4["quat→euler"]
+        Q4 --> Q5["clip_to_box<br/>(轻量 L3a)"]
+        Q5 --> Q6["euler→quat"]
+        Q6 --> Q7["send_pose"]
+    end
+
+    subgraph delta ["pose-delta (完整安全管线)"]
+        direction TB
+        D1["7D 归一化 delta<br/>dx dy dz drx dry drz dgrip"] --> D2["get_state()"]
+        D2 --> D3["SafetySupervisor<br/>validate()<br/>L1→L3a→L4→L5"]
+        D3 --> D4["predict_ee_pose<br/>cur + safe_action × scale"]
+        D4 --> D5["euler→quat"]
+        D5 --> D6["send_pose"]
+    end
+```
+
+关键差异汇总：
+
+| 维度 | pose-euler | pose-quat | pose-delta |
+|------|-----------|-----------|------------|
+| **输入维度** | 6 | 7 | 7 |
+| **位姿类型** | 绝对目标 | 绝对目标 | 相对偏移 |
+| **姿态表达** | 欧拉角 (直觉) | 四元数 (精确) | 归一化 delta |
+| **需要当前 EE 状态** | 不需要 | 不需要 | 需要 |
+| **安全检查层级** | 仅 L3a 盒裁剪 | 仅 L3a 盒裁剪 | 完整 L1-L5 |
+| **可触发 emergency_stop** | 仅 NaN/Inf | 仅 NaN/Inf + 零范数四元数 | L1/L5 均可触发 |
+| **可触发 brake** | 否 | 否 | 是 (L1/L5) |
+| **与训练路径一致** | 否 | 否 | 是 (`env.step()` 同路径) |
+| **代码入口** | `send_pose_euler()` | `send_pose_quat()` | `send_pose_delta()` |
+| **公共路径** | `_send_clipped_xyzrpy()` | `_send_clipped_xyzrpy()` | `_supervisor.validate()` |
+| **对后端的要求** | 任意 (含 dummy) | 任意 (含 dummy) | 推荐 ray (需 get_state) |
+| **典型使用者** | 现场操作员 | ROS2 工程师 | RL 训练调试工程师 |
+
+### 8.7 安全盒裁剪的数学语义对比
+
+三种模式虽然都涉及 L3a 安全盒，但裁剪的数学对象不同：
+
+```
+pose-euler / pose-quat:
+  裁剪对象 = 用户输入的绝对目标位姿
+  公式:     safe_target = clip(user_target, box_min, box_max)
+  裁剪后:   直接发送 safe_target
+
+pose-delta:
+  裁剪对象 = 预测的下一步 EE 位姿
+  公式:     predicted_target = cur_ee + action × scale
+            safe_target = clip(predicted_target, box_min, box_max)
+            safe_action = (safe_target - cur_ee) / scale   ← 反向改写 action
+  裁剪后:   用 safe_action 重新预测并发送
+```
+
+`pose-delta` 多了"反向改写 action"这一步（即 `_rewrite_arm_action()`），因为下游需要的是 safe_action 而不是 safe_target——action 还要经过 L4 步长上限等后续检查。
+
+### 8.8 使用场景选择指南
+
+```
+需要控制机器人到某个明确位置？
+├── 位姿数据来自 ROS2 topic (四元数格式)
+│   └── → 用 pose-quat
+├── 自己指定目标 (更直觉)
+│   └── → 用 pose-euler
+└── 不是指定绝对位置，而是模拟策略 action
+    └── → 用 pose-delta
+
+是否需要验证完整安全管线 (L1-L5)？
+├── 是 → 只有 pose-delta 走完整管线
+└── 否 → 三种都可以，euler 最简单
+
+是否有真实机器人状态反馈？
+├── 有 (--backend ray) → 三种都可以
+└── 没有 (--backend rclpy / --dummy)
+    ├── euler / quat → 正常工作（不依赖状态）
+    └── delta → 可工作但为 origin-anchored（不精确）
+```
+
+### 8.9 欧拉角、四元数与安全盒的局限性
+
+三种模式都有一个共同的已知局限：安全盒裁剪在**欧拉角空间**进行，而欧拉角存在万向节锁 (Gimbal Lock)——当 Pitch 接近 ±90° (±π/2 rad) 时，Roll 和 Yaw 退化为同一个旋转轴，此时的裁剪行为可能不符合物理预期。
+
+当前系统中 Pitch 被默认限制在 ±0.30 rad (≈±17°)，远离 ±90°，因此实际风险很低。但如果任务需要大幅俯仰（如侧抓、翻转物体），需要注意这一局限。详见 [safety_2.md §9.8](safety_2.md) 的 P3 已知风险。
+
+### 8.10 相关代码索引
+
+| 功能 | 文件 | 关键行/函数 |
+|------|------|------------|
+| 绝对 pose 安全盒裁剪 | [`test_galaxea_r1_pro_controller.py`](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) | `clip_pose_to_box()` (L105-143) |
+| 欧拉角 → 四元数 | 同上 | `euler_to_quat()` (L146-150) |
+| 四元数 → 欧拉角 | 同上 | `quat_to_euler()` (L153-157) |
+| 绝对 pose 公共发送路径 | 同上 | `_send_clipped_xyzrpy()` (L511-533) |
+| 欧拉角输入 | 同上 | `send_pose_euler()` (L535-537) |
+| 四元数输入 | 同上 | `send_pose_quat()` (L539-560) |
+| Delta 输入 | 同上 | `send_pose_delta()` (L562-617) |
+| 安全盒默认值 | [`r1_pro_safety.py`](../../../rlinf/envs/realworld/galaxear/r1_pro_safety.py) | `SafetyConfig.right_ee_min/max` (L69-76) |
+| Delta → EE 预测公式 | [`r1_pro_action_schema.py`](../../../rlinf/envs/realworld/galaxear/r1_pro_action_schema.py) | `predict_arm_ee_pose()` (L130-145) |
+| 完整 L1-L5 监督器 | [`r1_pro_safety.py`](../../../rlinf/envs/realworld/galaxear/r1_pro_safety.py) | `GalaxeaR1ProSafetySupervisor.validate()` |
