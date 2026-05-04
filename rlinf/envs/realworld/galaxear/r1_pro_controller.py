@@ -65,7 +65,7 @@ class GalaxeaR1ProController(Worker):
         env_idx: int = 0,
         node_rank: int = 1,
         worker_rank: int = 0,
-        ros_domain_id: int = 72,
+        ros_domain_id: int = 41,
         ros_localhost_only: bool = False,
         galaxea_install_path: str = "~/galaxea/install",
         use_left_arm: bool = False,
@@ -352,8 +352,8 @@ class GalaxeaR1ProController(Worker):
         try:
             from hdas_msg.msg import (  # type: ignore[import]
                 bms as BmsMsg,
-                controller_signal_stamped as ControllerSignalMsg,
-                feedback_status as StatusMsg,
+                ControllerSignalStamped as ControllerSignalMsg,
+                FeedbackStatus as StatusMsg,
             )
             self._subs.append(self._node.create_subscription(
                 BmsMsg, "/hdas/bms",
@@ -402,9 +402,9 @@ class GalaxeaR1ProController(Worker):
         with self._state_lock:
             for src, t0 in self._feedback_first_seen.items():
                 self._state.feedback_age_ms[src] = (now - t0) * 1000.0
-            # Aliveness: at least one arm feedback fresh in last 500 ms.
+            # Aliveness: at least one arm feedback fresh in last 1500 ms. @# from 500ms change to 1500ms to avoid false negative because of the network delay.
             any_alive = any(
-                age < 500.0
+                age < 1500.0
                 for age in self._state.feedback_age_ms.values()
             )
             self._state.is_alive = any_alive

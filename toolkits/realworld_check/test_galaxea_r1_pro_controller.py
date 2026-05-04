@@ -74,7 +74,7 @@ out-of-box pose::
 """
 
 from __future__ import annotations
-
+import os
 import argparse
 import logging
 import shlex
@@ -304,7 +304,7 @@ class RclpyBackend(ControllerBackend):
     name = "rclpy"
 
     def __init__(self, *, ros_domain_id: int, is_dummy: bool) -> None:
-        import os
+        assert ros_domain_id is not None and ros_domain_id > 0, "ROS_DOMAIN_ID must be set and greater than 0"
         os.environ["ROS_DOMAIN_ID"] = str(ros_domain_id)
         self._is_dummy = bool(is_dummy)
         if is_dummy:
@@ -1105,7 +1105,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ros-domain-id",
         type=int,
-        default=72,
+        default=None,
         help="ROS_DOMAIN_ID for the controller / publishers.",
     )
     p.add_argument(
@@ -1227,6 +1227,8 @@ def _build_backend(args: argparse.Namespace) -> ControllerBackend:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_argparser().parse_args(argv)
+    if args.ros_domain_id is None:
+        args.ros_domain_id = int(os.environ.get("ROS_DOMAIN_ID", 41))
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",

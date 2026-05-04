@@ -103,7 +103,7 @@ class GalaxeaR1ProJoystickIntervention(gym.ActionWrapper):
             return
         try:
             from hdas_msg.msg import (  # type: ignore[import]
-                controller_signal_stamped as ControllerSignalMsg,
+                ControllerSignalStamped as ControllerSignalMsg,
             )
         except ImportError:
             _logger.warning(
