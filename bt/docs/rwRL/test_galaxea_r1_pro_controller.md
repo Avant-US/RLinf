@@ -1174,3 +1174,817 @@ ray stop
 **请基于对上述参考资料的深入分析, 完成如下任务:**
 
 现在在与 R1 Pro 机器人相连的 Orin 上, 你要做在 Orin 上跑 @RLinf/toolkits/realworld_check/test_galaxea_r1_pro_controller.py 以运行 "Orin-only 的真机 REPL 命令行交互模式" 前的检查. 因为 test_galaxea_r1_pro_controller.py 以及相关的代码以及相关配置项在撰写时并没有考虑 Orin 的真实环境以及 galaxea R1 Pro SDK 的真实代码与配置(在 @galaxea/install 也就是 `/home/nvidia/galaxea/install`中). 所以在运行前, 你先要找出与真实机器人, 真实 Orin, 真实 SDK 相关的代码和配置项, 特别是配置项, 然后结合 Orin 的真实环境以及 galaxea R1 Pro SDK  @galaxea/install 的真实代码与配置, 结合真实机器人的状态与配置, 找出原来在 @RLinf 中的代码和配置写得不对和不合理的地方, 写出原因, 给出修改意见, 但不急于修改代码.
+
+---
+
+# 8.7.10 在真机 Orin REPL 中支持关节空间 positions 与夹爪开合标志位输入:新功能设计
+
+> **定位**:本节是 §8.7 的功能扩展设计稿。它把"在真机 Orin 跑 REPL 时,可以一行输入任意关节角 + 一行 `gripper open/close` 直接驱动右臂"做成一个**完全向后兼容**的增量,不破坏现有 `setpose` / `setdelta` / `home` / `zero` 任何语义,但补齐三块缺口:任意 qpos 直发、夹爪符号化标志位、关节空间安全盒可在 REPL 中收紧。
+>
+> 本节只**设计**,不改源代码;所有"应该长这样"的代码以 markdown 代码块嵌入,所有"现在长这样"的代码以 CODE REFERENCES 引用。等评审通过再单独提交一个 PR 落地。
+
+### 8.7.10.A 现状审查:为什么必须补这一块
+
+把 [`toolkits/realworld_check/test_galaxea_r1_pro_controller.py`](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 的 REPL 现状对照"用户实际 bring-up 需求"做了一遍体检,结论是**部分支持、不能直接用**。具体短板列表:
+
+| 缺口 | 现状证据 | 后果 |
+|---|---|---|
+| 没有任意 `setqpos Q1..Q7` 命令 | REPL 调度只识别 `home` / `zero` / `set-home` / `set-zero` 四个固定槽位命令(见 [`test_galaxea_r1_pro_controller.py` L1017-L1024](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py));`set-home` / `set-zero` 是**改预存槽**,要执行还得再敲一次 `home` / `zero` | 标定动作要 2 步,中间只要操作员忘改回去就会污染下一次 `home`;无法快速试探"下一帧关节角"这种 RL 调试需求 |
+| 没有 `gripper open` / `gripper close` 标志位 | 只有 `gripper PCT` 一种连续值入口(L1029-L1030 的 dispatch + [`_cmd_gripper` L935-L944](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py)) | 操作员需要记 0=关、100=开,凌晨调试容易写错;脚本里也无法通过自然语义表达 |
+| 没有非阻塞的 `send_arm_joints` 透出 | [`RayBackend.go_to_rest` L274-L281](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 是阻塞等关节收敛的;[底层 `GalaxeaR1ProController.send_arm_joints` L588-L600](../../../rlinf/envs/realworld/galaxear/r1_pro_controller.py) 已实现但 CLI 端没透出 | 想做轨迹连发(每 100ms 一帧 qpos)走不通,只能走 `setpose` 间接 |
+| `RclpyBackend` 完全没有 joint publisher | 只创建了 `target_pose_arm_right` / `target_position_gripper_right` / `brake_mode` 三条 publisher(L347-L357) | Orin-only 最小路径下根本无法验证 `/motion_target/target_joint_state_arm_right` 链路 |
+| 关节空间安全盒"硬编码 + 不可调" | [`_check_qpos_within_limits` L686-L710](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 直接吃 `SafetyConfig.arm_q_min/q_max`,没有 REPL 入口收紧;也没有相对当前 qpos 的步长上限,违反 [`safety_2_joinlimit.md` §6.2](safety_2_joinlimit.md) 强调的"RL 安全工作区应比硬件极限更紧"原则 | 一旦发了大跳变 qpos,直接撞上 mobiman 的"big angle jump → motors' protection"急停,bring-up 流程被中断 |
+
+底层接口其实是齐的(SDK 在 `/motion_target/target_joint_state_arm_right` 上接 `JointState.position`,见 [`r1pro_sample_code.py:24-33` 与 `publish_right_arm_target`](/home/nvidia/galaxea/install/mobiman/share/mobiman/scripts/robotOpenbox/R1Pro/r1pro_sample_code.py)),问题完全在 CLI 工具层,改动可以局部化在 `test_galaxea_r1_pro_controller.py` 一个文件 + 控制器 1 行可选 `velocity` 形参。
+
+### 8.7.10.B 设计目标与四点取舍
+
+围绕"既要有 RL 调试需要的灵活、又要在真机上不出事故"列四条原则:
+
+1. **完全向后兼容**:`setpose` / `setposq` / `setdelta` / `home` / `zero` / `set-home` / `set-zero` / `gethomes` / `setbox-min` / `setbox-max` / `getbox` / `getstate` / `getpos` / `brake` / `gripper PCT` / `help` / `q` 共 17 条既有命令的字面量、参数、错误码、退出码全部不变。`zero --force` 的现有语义(只跳 `_check_qpos_within_limits`)也保持。
+2. **吻合 SDK 真实接口**:关节话题用 `/motion_target/target_joint_state_arm_right`,消息为 `sensor_msgs/JointState`,`position` 为 7 元 float(rad,与 J1..J7 一一对应),**不**填 `name`(与 `r1pro_sample_code.py` 的 `# This function does not fill msg.name` 一致);`velocity` 字段可选,作为**per-joint 速度上限**透传给 mobiman(对照 `r1pro_first_motion.py` 中 `send_vel_limit` 的写法)。夹爪话题 `/motion_target/target_position_gripper_right` 沿用 `JointState.position[0]`,`0=close`、`100=open`,与现有 `send_gripper(pct)` 一致。
+3. **多层关节安全(防御纵深)**:不依赖单一闸门,采用三层结构,语义和 [`r1_pro_safety.py` L308-L320](../../../rlinf/envs/realworld/galaxear/r1_pro_safety.py) 的 `_clip_to_box`/L3a 风格统一(见 §8.7.10.D)。
+4. **Orin 单进程可运行**:`--backend rclpy` 路径必须能在不依赖 Ray 的情况下完成 qpos 直发与 gripper open/close,这样 §8.7.6/§A.3 "最小资源 bring-up"路径不被破坏。
+
+四条原则之间有冲突时,优先级 `1 > 3 > 2 > 4`:**先保兼容,再保安全**,然后再追求 SDK 一致性,最后才是单进程便利。
+
+### 8.7.10.C 新增 / 修改的代码组件清单
+
+只有一个 Python 文件需要"主改"——[`test_galaxea_r1_pro_controller.py`](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py);控制器侧只有一个**可选**小改(给 `send_arm_joints` 加 `velocity=None`)。下表按文件 + 按类整理:
+
+| 文件 | 类 / 函数 | 变动类型 | 说明 |
+|---|---|---|---|
+| `test_galaxea_r1_pro_controller.py` | `ControllerBackend` | 新增抽象 `send_arm_joints(qpos, vel_limit=None, blocking=False, timeout_s=5.0) -> bool` | 默认实现 `return False`,所有不实现该方法的后端都"安全降级" |
+| `test_galaxea_r1_pro_controller.py` | `RayBackend.send_arm_joints` | 新增 | `blocking=False` 走 `_handle.send_arm_joints("right", q).wait()`(fire-and-forget);`blocking=True` 走 `_handle.go_to_rest("right", q, timeout_s).wait()[0]`(复用现有阻塞收敛路径) |
+| `test_galaxea_r1_pro_controller.py` | `RclpyBackend.__init__` | 新增 publisher `_pub_joints_right` | topic `/motion_target/target_joint_state_arm_right`;QoS 与 SDK 示例对齐为 `RELIABLE / KEEP_LAST(10) / TRANSIENT_LOCAL`(对照 `r1pro_sample_code.py:9-14`) |
+| `test_galaxea_r1_pro_controller.py` | `RclpyBackend.send_arm_joints` | 新增 | 直接发布 `JointState`(可选 `velocity` 字段);`blocking=True` 时打印 `[NOTE]` 并降级为 fire-and-forget(与现有 `go_to_rest` 在 rclpy 后端的降级策略一致) |
+| `test_galaxea_r1_pro_controller.py` | `ArmSafetyCLI.__init__` | 新增 5 个字段 | `_q_box_min` / `_q_box_max` / `_q_hard_lo` / `_q_hard_hi` / `_max_qpos_step_per_call_rad`,默认值见 §8.7.10.D |
+| `test_galaxea_r1_pro_controller.py` | `ArmSafetyCLI.send_qpos` | 新增 | 主入口,跑 L1 → L2-hard → L2-soft → L4-step → backend dispatch |
+| `test_galaxea_r1_pro_controller.py` | `_clip_qpos_to_box` / `_check_qpos_step` / `_check_qpos_against_hard_limits` | 新增 3 个私有工具 | 见 §8.7.10.F-2 |
+| `test_galaxea_r1_pro_controller.py` | `gripper_open` / `gripper_close` / `gripper_toggle` | 新增 | 见 §8.7.10.F-3,公开方法,`_cmd_gripper` 调用 |
+| `test_galaxea_r1_pro_controller.py` | `update_q_box_min` / `update_q_box_max` / `print_q_box` | 新增 | 与现有 `update_box_min` / `update_box_max` / `print_box` 对偶 |
+| `test_galaxea_r1_pro_controller.py` | REPL 命令 | 新增 7 条 | `setqpos` / `setqpos-block` / `getqbox` / `setqbox-min` / `setqbox-max` / `set-qstep`,以及扩展 `gripper open\|close\|toggle\|PCT` 多分支 |
+| `test_galaxea_r1_pro_controller.py` | `_HELP` | 扩展 | help 文本追加新命令一节 |
+| `test_galaxea_r1_pro_controller.py` | argparse | 新增 9 个参数 | `--qpos` / `--qpos-block` / `--qpos-vel-limit` / `--gripper-action` / `--q-box-min` / `--q-box-max` / `--max-qpos-step-rad` / `--qpos-skip-joint-check` / `--qpos-force` |
+| `r1_pro_controller.py`(可选) | `GalaxeaR1ProController.send_arm_joints` | 加 `velocity=None` 形参 | 仅当上层传 `vel_limit` 时透传到 `JointState.velocity`;不传则原状不变。这是 `TODO(controller)`,本设计**不强依赖**它(见 §8.7.10.I) |
+
+整体改动量:`test_galaxea_r1_pro_controller.py` 大约 +200 行(主要是新代码,不动既有方法签名);可选 `r1_pro_controller.py` 大约 +5 行。
+
+### 8.7.10.D 关节空间安全盒:三层模型
+
+把"关节空间不安全"细分成 3 类风险,每类配一道闸门:
+
+| 闸门 | 用途 | 数据源 | 默认值 | 违例标签(reason) | 是否可被 `--force` 跳过 |
+|---|---|---|---|---|---|
+| **L2-soft** | RL 安全工作区,REPL 中可收紧 | `_q_box_min` / `_q_box_max` | 启动时拷贝自 `SafetyConfig.arm_q_min/q_max` | `L2:right_arm_q J{i}=±{x:.4f} not strictly inside (lo,hi)` | ✅ `--qpos-force` / `setqpos --force` 可跳过(打印 `[WARN]` 后继续) |
+| **L2-hard** | 硬件极限 95% 的"绝对不能碰"红线 | `_q_hard_lo` / `_q_hard_hi` = `0.95 × SafetyConfig.arm_q_min/q_max` | 自动从 `SafetyConfig` 派生(对负数取 95%,即靠近 0;对正数取 95%,即靠近 0) | `L2-hard:right_arm_q J{i}=±{x:.4f} >= 0.95 × hard_limit` | ❌ **任何 force 都不能跳过**,直接拒发 |
+| **L4-step** | 防 SDK 大跳变保护(`big angle jump triggers motors' protection`) | `state.right_arm_qpos` + `_max_qpos_step_per_call_rad` | 默认 `0.5 rad/joint`,bring-up 建议 `0.2 rad/joint` | `L4:qpos_step_too_large J{i} dq=±{x:.4f} > {step:.4f}` | ❌ 默认拒发(可加 `--qpos-force` 但**强烈不推荐**;打印 `[WARN]` 后继续) |
+
+#### D.1 reason 标签命名约定
+
+新方案的 reason 字符串遵守 [`r1_pro_safety.py` 的命名约定](../../../rlinf/envs/realworld/galaxear/r1_pro_safety.py)(`L{level}{sub}:{slot}`),让 CLI 输出能直接和 `MetricLogger` 训练日志中的 `safety/reasons` 比对:
+
+| 标签 | 等价于生产侧 |
+|---|---|
+| `L1:non_finite_qpos` | `L1:non_finite_action`(`r1_pro_safety.py:189`) |
+| `L2:right_arm_q ...` | 与现有 `_check_qpos_within_limits` 输出一致(L686-L710) |
+| `L2-hard:right_arm_q ...` | 新增,无生产侧对应(因为 supervisor 的 L2 当前是占位的,见 [`safety_2_joinlimit.md` §3.1 末段](safety_2_joinlimit.md)) |
+| `L3a:right_ee_box ...` | 不变,只在 `setpose`/`setdelta` 路径里出现(`r1_pro_safety.py:_clip_to_box`) |
+| `L4:qpos_step_too_large ...` | 与现有 `L4:per_step_cap`(`r1_pro_safety.py:397`)同级,但作用于关节空间而非 EE |
+
+#### D.2 与 `_check_qpos_within_limits` 的关系
+
+现有的 [`_check_qpos_within_limits` L686-L710](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 是 `home` / `zero` 路径的事后校验,直接读 `_joint_q_min` / `_joint_q_max`(=`SafetyConfig`)。新方案**保留它**(`zero --force` 行为完全不变),并在它**之上**新增一层"参数化的运行时安全盒":
+
+```text
+home / zero       →  _check_qpos_within_limits   (旧,读 SafetyConfig.arm_q_min/q_max)
+setqpos           →  _check_qpos_against_hard_limits(L2-hard, 0.95×SafetyConfig)
+                  →  _clip_qpos_to_box(L2-soft, _q_box_min/max, 默认= SafetyConfig.arm_q_min/q_max)
+                  →  _check_qpos_step(L4-step, vs state.right_arm_qpos)
+```
+
+之所以"L2-soft 默认值正好 = `_check_qpos_within_limits` 的源值",是为了保证"未通过 `setqbox-*` 收紧时,`setqpos` 与 `home` 的拒发判据等价",不引入额外惊喜。`setqbox-min` / `setqbox-max` 让操作员**只能更紧**,后端层进一步用 L2-hard 兜住"被错误放宽"的情况。
+
+#### D.3 `state` 不可用时的退化策略
+
+`get_state()` 返回 `None`(rclpy 后端 / Ray 后端 RPC 失败 / EE 反馈话题没起来)时,L4-step 无法计算 `dq = q_target - q_current`。退化语义如下:
+
+- L1 / L2-hard / L2-soft 仍然执行(它们不依赖 state)
+- L4-step 跳过,打印 `[NOTE] state unavailable; skipping L4 qpos-step check`
+- 这与现有 [`send_pose_delta` L573-L579](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 的"零 EE snapshot"退化策略类型相同(都是"打印 NOTE 后继续"),保持一致
+
+### 8.7.10.E UML
+
+#### E.1 类图(在 §8.7.3 类图基础上扩展)
+
+```mermaid
+classDiagram
+    class ArmSafetyCLI {
+        +send_pose_euler(xyzrpy)
+        +send_pose_quat(xyz_quat)
+        +send_pose_delta(delta7)
+        +send_qpos(qpos, blocking, vel_limit, force, timeout_s)
+        +gripper_open()
+        +gripper_close()
+        +gripper_toggle()
+        +home()
+        +zero(force)
+        +update_q_box_min(q_min)
+        +update_q_box_max(q_max)
+        +print_q_box()
+        -_clip_qpos_to_box(q)
+        -_check_qpos_step(q_tgt, q_cur)
+        -_check_qpos_against_hard_limits(q)
+        -_q_box_min
+        -_q_box_max
+        -_q_hard_lo
+        -_q_hard_hi
+        -_max_qpos_step_per_call_rad
+    }
+    class ControllerBackend {
+        <<abstract>>
+        +send_pose(pose7)
+        +send_arm_joints(qpos, vel_limit, blocking, timeout_s)
+        +send_gripper(pct)
+        +apply_brake(on)
+        +go_to_rest(qpos, timeout_s)
+        +get_state()
+    }
+    class RayBackend {
+        +send_arm_joints(qpos, vel_limit, blocking, timeout_s)
+    }
+    class RclpyBackend {
+        +send_arm_joints(qpos, vel_limit, blocking, timeout_s)
+        -_pub_joints_right
+    }
+    class SafetyConfig {
+        +arm_q_min
+        +arm_q_max
+        +arm_qvel_max
+    }
+    ControllerBackend <|-- RayBackend
+    ControllerBackend <|-- RclpyBackend
+    ArmSafetyCLI --> ControllerBackend
+    ArmSafetyCLI ..> SafetyConfig : default q_box
+```
+
+实线 `-->` 表示组合(CLI 持有一个 backend),虚线 `..>` 表示"启动时拷贝默认值"(L2-soft 边界从 `SafetyConfig` 拷贝一份后就独立演化,不再回写)。
+
+#### E.2 序列图:`setqpos` 命令端到端
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant REPL as ArmSafetyCLI.repl
+    participant CLI as ArmSafetyCLI.send_qpos
+    participant SC as SafetyConfig
+    participant BE as ControllerBackend
+    participant Ctl as GalaxeaR1ProController
+    participant Mob as mobiman
+
+    Op->>REPL: setqpos 0.1 0.3 0.0 -1.7 0.0 2.0 0.0
+    REPL->>CLI: send_qpos(q, blocking=False)
+    CLI->>CLI: L1 finite + shape check
+    CLI->>SC: q_hard_lo / q_hard_hi (0.95 x arm_q_min/max)
+    CLI->>CLI: L2-hard check
+    alt L2-hard violated
+        CLI-->>REPL: refuse, no force override
+    end
+    CLI->>CLI: L2-soft check vs _q_box_min/max
+    alt L2-soft violated and not force
+        CLI-->>REPL: refuse
+    end
+    CLI->>BE: get_state()
+    BE-->>CLI: state.right_arm_qpos (or None)
+    CLI->>CLI: L4-step check ("|dq| <= max_step")
+    alt L4-step violated
+        CLI-->>REPL: refuse
+    end
+    CLI->>BE: send_arm_joints(q, vel_limit, blocking=False)
+    BE->>Ctl: send_arm_joints("right", q).wait()
+    Ctl->>Mob: "/motion_target/target_joint_state_arm_right (JointState)"
+    Mob-->>Ctl: "/hdas/feedback_arm_right (JointState)"
+    Ctl-->>BE: state updated (next get_state will see q_current move)
+```
+
+#### E.3 三层校验 flowchart
+
+```mermaid
+flowchart TB
+    UserInput["setqpos Q1..Q7"] --> ParseQ["parse 7 floats"]
+    ParseQ --> L1["L1 finite + shape"]
+    L1 -->|violate| RefuseL1["refuse, L1 non_finite_qpos"]
+    L1 -->|ok| L2hard["L2-hard 0.95 x SafetyConfig.arm_q_min/max"]
+    L2hard -->|violate| RefuseHard["refuse, no force override"]
+    L2hard -->|ok| L2soft["L2-soft _q_box_min/max"]
+    L2soft -->|"violate, no --force"| RefuseSoft["refuse"]
+    L2soft -->|"violate, --force"| Warn1["WARN print, continue"]
+    L2soft -->|inside| L4step["L4-step |q-q_cur| <= max_step"]
+    Warn1 --> L4step
+    L4step -->|"violate, no --force"| RefuseStep["refuse"]
+    L4step -->|state unavailable| Note1["NOTE skip L4, continue"]
+    L4step -->|ok| Send["backend.send_arm_joints"]
+    Note1 --> Send
+    Send --> Pub["/motion_target/target_joint_state_arm_right"]
+```
+
+### 8.7.10.F 关键代码详解
+
+下面 7 段是落地 PR 的代码草案。**所有片段都是新增**,不修改任何现有方法签名;现有片段用 CODE REFERENCES 形式标出"复用点"。
+
+#### F.1 `ArmSafetyCLI.send_qpos`:三层闸门 + 后端分派
+
+```python
+def send_qpos(
+    self,
+    qpos,
+    *,
+    blocking: bool = False,
+    vel_limit=None,
+    force: bool = False,
+    timeout_s: float = 5.0,
+) -> bool:
+    """Send an arbitrary joint-space target through the L2-hard / L2-soft
+    / L4-step pipeline.
+
+    Mirrors the predict-clip-rewrite philosophy of L3a (EE box) but in
+    joint space.  See §8.7.10.D for the three-tier model.
+    """
+    q = np.asarray(qpos, dtype=np.float32).reshape(-1)
+
+    if q.size != 7:
+        print(f"[ERROR] setqpos needs 7 floats; got {q.size}")
+        return False
+    if not is_finite_vec(q):
+        print("[ERROR] L1:non_finite_qpos -- refusing to send.")
+        return False
+
+    hard_violations = self._check_qpos_against_hard_limits(q)
+    for v in hard_violations:
+        print(f"[ERROR] {v}")
+    if hard_violations:
+        print(
+            "[ERROR] L2-hard violated; refusing to send.  "
+            "This guard cannot be bypassed by --force."
+        )
+        return False
+
+    soft_violations = self._clip_qpos_to_box(q)[1]
+    for v in soft_violations:
+        print(f"[WARN]  {v}")
+    if soft_violations and not force:
+        print(
+            "[ERROR] L2-soft (RL safety box) violated; refusing to send. "
+            "Pass --qpos-force / 'setqpos --force' after verifying clearance."
+        )
+        return False
+
+    state = self._backend.get_state()
+    if state is None:
+        print(
+            "[NOTE]  state unavailable; skipping L4 qpos-step check.  "
+            "rclpy backend / EE feedback not subscribed."
+        )
+    else:
+        step_violations = self._check_qpos_step(q, state.right_arm_qpos)
+        for v in step_violations:
+            print(f"[WARN]  {v}")
+        if step_violations and not force:
+            print(
+                "[ERROR] L4 qpos-step exceeded; refusing to send.  "
+                "Lower the step or --force ONLY if you understand the "
+                "motors' protection risk."
+            )
+            return False
+
+    formatted = "[" + ", ".join(f"{float(x):+.4f}" for x in q) + "]"
+    print(f"[INFO]  Sending qpos = {formatted}"
+          f"{' (blocking)' if blocking else ' (fire-and-forget)'}")
+
+    ok = self._backend.send_arm_joints(
+        list(q.tolist()),
+        vel_limit=(list(vel_limit) if vel_limit is not None else None),
+        blocking=bool(blocking),
+        timeout_s=float(timeout_s),
+    )
+    if blocking:
+        print(f"  send_arm_joints(blocking) -> "
+              f"{'OK' if ok else 'TIMEOUT/UNSUPPORTED'}")
+    return bool(ok)
+```
+
+**解读**
+
+- 流程顺序固定为 L1 → L2-hard → L2-soft → L4-step → dispatch,与 §8.7.10.D 表格逐行对应。
+- `force=True` **只能跳过 L2-soft 与 L4-step**,不能跳过 L1 与 L2-hard。这与现有 `zero --force` "只跳过 `_check_qpos_within_limits`" 的语义对偶。
+- `vel_limit` 是可选的 7 元 list,完全透传给后端;后端决定塞进 `JointState.velocity`(rclpy)还是先打印 `[NOTE]`(ray)。
+- `blocking` 默认 `False`(fire-and-forget),`True` 时复用 `go_to_rest` 的"等关节收敛"路径——避免维护两套等待逻辑。
+
+#### F.2 三个安全工具函数
+
+```python
+def _check_qpos_against_hard_limits(self, q: np.ndarray) -> list:
+    """Return reasons when *q* violates the 0.95 × SafetyConfig hard band.
+
+    Asymmetric clamp: take 95% of the magnitude on each side so that the
+    band always contracts toward 0, never widens past the config.
+    """
+    lo_hard = self._q_hard_lo
+    hi_hard = self._q_hard_hi
+    reasons = []
+    for i in range(7):
+        qi = float(q[i])
+        if qi < float(lo_hard[i]):
+            reasons.append(
+                f"L2-hard:right_arm_q J{i + 1}={qi:+.4f} < "
+                f"{float(lo_hard[i]):+.4f} (95% of arm_q_min)"
+            )
+        if qi > float(hi_hard[i]):
+            reasons.append(
+                f"L2-hard:right_arm_q J{i + 1}={qi:+.4f} > "
+                f"{float(hi_hard[i]):+.4f} (95% of arm_q_max)"
+            )
+    return reasons
+
+
+def _clip_qpos_to_box(self, q: np.ndarray):
+    """Mirrors `clip_pose_to_box` but for joints; uses _q_box_min/max."""
+    lo = self._q_box_min
+    hi = self._q_box_max
+    clipped = np.clip(q, lo, hi)
+    reasons = []
+    for i in range(7):
+        if abs(float(q[i]) - float(clipped[i])) > 1e-6:
+            face = "max" if q[i] > clipped[i] else "min"
+            reasons.append(
+                f"L2:right_arm_q J{i + 1}={float(q[i]):+.4f} -> "
+                f"{float(clipped[i]):+.4f} (clipped to {face} face)"
+            )
+    return clipped, reasons
+
+
+def _check_qpos_step(self, q_target: np.ndarray, q_current: np.ndarray) -> list:
+    """Return reasons when any |dq_i| > _max_qpos_step_per_call_rad.
+
+    Empty list when q_current is the zero placeholder (state never seen).
+    """
+    if q_current is None or float(np.linalg.norm(q_current)) < 1e-9:
+        return []
+    step = float(self._max_qpos_step_per_call_rad)
+    dq = np.asarray(q_target, dtype=np.float32) - np.asarray(
+        q_current, dtype=np.float32
+    )
+    reasons = []
+    for i in range(7):
+        if abs(float(dq[i])) > step:
+            reasons.append(
+                f"L4:qpos_step_too_large J{i + 1} dq={float(dq[i]):+.4f} "
+                f"> {step:.4f}"
+            )
+    return reasons
+```
+
+**解读**
+
+- `_check_qpos_against_hard_limits` **不**复用 `_clip_qpos_to_box`,因为它的语义是"严格拒发,不裁剪"——L2-hard 一旦违例,任何"裁到边缘再发"的行为都不安全。
+- `_clip_qpos_to_box` 与 `clip_pose_to_box`(已有,L105-L143)结构完全平行,reason 字符串前缀 `L2:right_arm_q` 也匹配 [`_check_qpos_within_limits` L706-L709](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py),让 grep 训练日志能找到同源。
+- `_check_qpos_step` 在 `q_current` 全 0(典型的"state 没起来"占位)时直接返回空 list,与 §8.7.10.D-3 的退化策略一致。
+
+#### F.3 `gripper_open` / `gripper_close` / `gripper_toggle`
+
+```python
+GRIPPER_OPEN_PCT = 100.0
+GRIPPER_CLOSE_PCT = 0.0
+GRIPPER_TOGGLE_THRESHOLD_PCT = 50.0
+
+
+def gripper_open(self) -> None:
+    self._backend.send_gripper(GRIPPER_OPEN_PCT)
+    self._last_gripper_pct = GRIPPER_OPEN_PCT
+    print(f"  gripper open  -> send_gripper({GRIPPER_OPEN_PCT:.1f})")
+
+
+def gripper_close(self) -> None:
+    self._backend.send_gripper(GRIPPER_CLOSE_PCT)
+    self._last_gripper_pct = GRIPPER_CLOSE_PCT
+    print(f"  gripper close -> send_gripper({GRIPPER_CLOSE_PCT:.1f})")
+
+
+def gripper_toggle(self) -> None:
+    """Toggle relative to feedback when available, else relative to last
+    commanded percentage; if neither, default to open (safer in a free
+    workspace).
+    """
+    state = self._backend.get_state()
+    if state is not None and float(np.linalg.norm(state.right_ee_pose[:3])) > 1e-9:
+        cur = float(state.right_gripper_pos)
+        src = "feedback"
+    elif self._last_gripper_pct is not None:
+        cur = float(self._last_gripper_pct)
+        src = "last-cmd"
+    else:
+        print("[NOTE]  no gripper feedback and no prior command; "
+              "defaulting toggle -> open.")
+        self.gripper_open()
+        return
+    if cur > GRIPPER_TOGGLE_THRESHOLD_PCT:
+        print(f"[INFO]  toggle: cur={cur:.1f} ({src}) > "
+              f"{GRIPPER_TOGGLE_THRESHOLD_PCT:.1f} -> close")
+        self.gripper_close()
+    else:
+        print(f"[INFO]  toggle: cur={cur:.1f} ({src}) <= "
+              f"{GRIPPER_TOGGLE_THRESHOLD_PCT:.1f} -> open")
+        self.gripper_open()
+```
+
+**解读**
+
+- 三个常量集中在类外或类的顶部,方便后续做 YAML 化(`SafetyConfig.gripper_*` 留给生产侧补)。
+- `gripper_toggle` 的反馈选择优先级 `feedback > last-cmd > 默认开`,这是 §8.7.10.I 提到的"无反馈降级"问题的实现。`_last_gripper_pct` 是 `__init__` 里新增的字段,初始值 `None`。
+- 三个方法都是"公开"的,是为了让单元测试可以直接 patch backend 后调用,而不必走 REPL parser。
+
+#### F.4 `RclpyBackend.send_arm_joints`:补齐 joint publisher
+
+```python
+def __init__(self, *, ros_domain_id: int, is_dummy: bool) -> None:
+    # ... existing init body unchanged ...
+
+    if not is_dummy:
+        from rclpy.qos import (
+            DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy,
+        )
+        from sensor_msgs.msg import JointState
+
+        joint_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._pub_joints_right = self._node.create_publisher(
+            JointState,
+            "/motion_target/target_joint_state_arm_right",
+            joint_qos,
+        )
+    else:
+        self._pub_joints_right = None
+
+
+def send_arm_joints(
+    self,
+    qpos: list,
+    vel_limit=None,
+    blocking: bool = False,
+    timeout_s: float = 5.0,
+) -> bool:
+    if self._is_dummy or self._node is None or self._pub_joints_right is None:
+        return True
+    if blocking:
+        print("[NOTE]  rclpy backend: blocking=True is not supported "
+              "(no joint feedback subscription).  Falling back to "
+              "fire-and-forget; use --backend ray for convergence wait.")
+    msg = self._JointState()
+    msg.header.stamp = self._node.get_clock().now().to_msg()
+    msg.position = [float(x) for x in list(qpos)[:7]]
+    if vel_limit is not None:
+        msg.velocity = [float(x) for x in list(vel_limit)[:7]]
+    self._pub_joints_right.publish(msg)
+    return True
+```
+
+**解读**
+
+- QoS 用 `RELIABLE / KEEP_LAST(10) / TRANSIENT_LOCAL`,与 [`r1pro_sample_code.py:9-14`](/home/nvidia/galaxea/install/mobiman/share/mobiman/scripts/robotOpenbox/R1Pro/r1pro_sample_code.py) 完全一致;**故意**不动 `_pub_pose` / `_pub_grip` / `_pub_brake` 现有的 `RELIABLE / KEEP_LAST(1)`(避免影响既有 `setpose` / `gripper PCT` / `brake` 行为,留作单独迁移 PR)。
+- `name` 字段不填,与 SDK 文档 "publisher and subscriber must have an agreed joint order" 保持一致。
+- `blocking=True` 在 rclpy 后端只打印 `[NOTE]` 后降级为 fire-and-forget,与 [`RclpyBackend.go_to_rest` L392-L404](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 的现有 `[WARN] go_to_rest is not supported by the rclpy backend` 风格保持一致。
+
+#### F.5 `RayBackend.send_arm_joints`:复用底层 RPC
+
+```python
+def send_arm_joints(
+    self,
+    qpos: list,
+    vel_limit=None,
+    blocking: bool = False,
+    timeout_s: float = 5.0,
+) -> bool:
+    if vel_limit is not None:
+        print("[NOTE]  ray backend: vel_limit pass-through requires "
+              "GalaxeaR1ProController.send_arm_joints(velocity=...) "
+              "(TODO(controller)); ignoring vel_limit for now.")
+    if blocking:
+        return bool(
+            self._handle.go_to_rest(
+                "right", list(qpos), float(timeout_s),
+            ).wait()[0]
+        )
+    self._handle.send_arm_joints("right", list(qpos)).wait()
+    return True
+```
+
+**解读**
+
+- 非阻塞路径复用现有 [`GalaxeaR1ProController.send_arm_joints` L588-L600](../../../rlinf/envs/realworld/galaxear/r1_pro_controller.py),通过 Ray RPC `.wait()` 同步语义,与 `send_pose` / `send_gripper` 风格一致(L266-L269)。
+- 阻塞路径复用 [`go_to_rest` L648-L667](../../../rlinf/envs/realworld/galaxear/r1_pro_controller.py),不重新写 0.03 rad 收敛阈值——避免双源真相。
+- `vel_limit` 透传依赖控制器侧加 `velocity=None` 形参(`TODO(controller)`),本设计**不强依赖**;落地 PR 可以分两步走。
+
+#### F.6 REPL 命令分派扩展
+
+```python
+def _cmd_setqpos(self, args, *, blocking: bool = False) -> None:
+    force = False
+    vel_limit = None
+    if args and args[-1] in ("--force", "-f"):
+        force = True
+        args = args[:-1]
+    if "--vel-limit" in args:
+        vidx = args.index("--vel-limit")
+        try:
+            vel_limit = [float(x) for x in args[vidx + 1: vidx + 8]]
+            if len(vel_limit) != 7:
+                raise ValueError(f"--vel-limit needs 7 floats")
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            return
+        args = args[:vidx]
+    if len(args) != 7:
+        print(f"Usage: setqpos{'-block' if blocking else ''} "
+              "Q1 Q2 Q3 Q4 Q5 Q6 Q7 [--vel-limit V1 V2 V3 V4 V5 V6 V7] [--force]")
+        return
+    try:
+        q = [float(x) for x in args]
+    except ValueError as e:
+        print(f"[ERROR] could not parse 7 floats: {e}")
+        return
+    self.send_qpos(q, blocking=blocking, vel_limit=vel_limit, force=force)
+
+
+def _cmd_gripper(self, args) -> None:
+    """Extended dispatcher: accepts open|close|toggle|<float>."""
+    if len(args) == 1 and args[0].lower() in ("open", "o"):
+        self.gripper_open()
+        return
+    if len(args) == 1 and args[0].lower() in ("close", "c"):
+        self.gripper_close()
+        return
+    if len(args) == 1 and args[0].lower() in ("toggle", "t"):
+        self.gripper_toggle()
+        return
+    if len(args) == 1:
+        try:
+            pct = float(args[0])
+        except ValueError as e:
+            print(f"[ERROR] could not parse float / open / close / toggle: {e}")
+            return
+        self.gripper(pct)
+        return
+    print("Usage: gripper open|close|toggle|<PCT 0-100>")
+```
+
+REPL `repl()` 中的 dispatch 表(对应现有 [L1001-L1030](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py))追加 4 个分支:
+
+```python
+elif cmd in ("setqpos",):
+    self._cmd_setqpos(args, blocking=False)
+elif cmd in ("setqpos-block", "setqposb"):
+    self._cmd_setqpos(args, blocking=True)
+elif cmd == "getqbox":
+    self.print_q_box()
+elif cmd == "setqbox-min":
+    self._cmd_setqbox("min", args)
+elif cmd == "setqbox-max":
+    self._cmd_setqbox("max", args)
+elif cmd == "set-qstep":
+    self._cmd_set_qstep(args)
+```
+
+`_cmd_setqbox` / `_cmd_set_qstep` 的实现镜像现有 [`_cmd_setbox` L905-L927](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py)(只改边界数据源到 `_q_box_min/max`)与 [`_cmd_set_zero` L968-L977](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py)(只改字段),故省略。
+
+`_HELP` 文本在原 [L845-L870](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 末尾追加:
+
+```text
+  setqpos  Q1 .. Q7 [--vel-limit V1..V7] [--force]
+                                 fire-and-forget joint-space target;
+                                 runs L2-hard / L2-soft / L4-step
+  setqpos-block Q1 .. Q7 [--vel-limit V1..V7] [--force]
+                                 same as setqpos but waits for
+                                 convergence (ray backend only)
+  gripper open|close|toggle|PCT  symbolic or 0-100% gripper command
+  getqbox                        print joint-space safety box
+  setqbox-min Q1 .. Q7           tighten lower joint-box corner
+  setqbox-max Q1 .. Q7           tighten upper joint-box corner
+  set-qstep RAD                  per-call max |dq_i| (default 0.5)
+```
+
+#### F.7 argparse 单发参数
+
+```python
+p.add_argument(
+    "--qpos",
+    nargs=7,
+    type=float,
+    metavar=("Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"),
+    default=None,
+    help="Single-shot: send arbitrary right-arm joint target (rad).",
+)
+p.add_argument(
+    "--qpos-block",
+    action="store_true",
+    help="Make --qpos blocking (waits for joint convergence; ray only).",
+)
+p.add_argument(
+    "--qpos-vel-limit",
+    nargs=7,
+    type=float,
+    metavar=("V1", "V2", "V3", "V4", "V5", "V6", "V7"),
+    default=None,
+    help="Optional per-joint velocity cap passed via JointState.velocity.",
+)
+p.add_argument(
+    "--gripper-action",
+    choices=("open", "close", "toggle"),
+    default=None,
+    help="Single-shot: open/close/toggle gripper then exit.",
+)
+p.add_argument(
+    "--q-box-min", nargs=7, type=float, default=None,
+    help="Tighter lower joint-box corner (rad).",
+)
+p.add_argument(
+    "--q-box-max", nargs=7, type=float, default=None,
+    help="Tighter upper joint-box corner (rad).",
+)
+p.add_argument(
+    "--max-qpos-step-rad", type=float, default=0.5,
+    help="Per-call max |dq_i| in rad (L4 step cap).",
+)
+p.add_argument(
+    "--qpos-skip-joint-check", action="store_true",
+    help="Alias of --qpos-force; skip L2-soft + L4-step (NOT L2-hard).",
+)
+p.add_argument(
+    "--qpos-force", action="store_true",
+    help="Skip L2-soft + L4-step (NOT L2-hard).  Use after physical "
+         "verification.",
+)
+```
+
+`--qpos` 与 `--pose-euler` / `--pose-quat` / `--pose-delta` / `--home` / `--zero` 共享同一个 `mutually_exclusive_group` g,确保单发模式只跑一种。`main()` 里跟现有 [L1280-L1304](../../../toolkits/realworld_check/test_galaxea_r1_pro_controller.py) 风格一致追加两段:
+
+```python
+if args.qpos is not None:
+    if isinstance(cli._backend, RayBackend):
+        cli._backend._wait_until_ready(timeout_s=30.0)
+    ok = cli.send_qpos(
+        np.asarray(args.qpos, dtype=np.float32),
+        blocking=bool(args.qpos_block),
+        vel_limit=(args.qpos_vel_limit
+                   if args.qpos_vel_limit is not None else None),
+        force=bool(args.qpos_force or args.qpos_skip_joint_check),
+    )
+    return 0 if ok else 1
+if args.gripper_action is not None:
+    if args.gripper_action == "open":
+        cli.gripper_open()
+    elif args.gripper_action == "close":
+        cli.gripper_close()
+    else:
+        cli.gripper_toggle()
+    return 0
+```
+
+### 8.7.10.G 与既有功能的兼容矩阵
+
+下表把"现有 17 条 REPL 命令 + 6 条 single-shot + 2 个后端 + 3 个安全字段"逐一过一遍,标注新设计是否影响:
+
+| 既有功能 | 类型 | 是否被影响 | 说明 |
+|---|---|---|---|
+| `setpose` | REPL cmd | 否 | 不变 |
+| `setposq` | REPL cmd | 否 | 不变 |
+| `setdelta` | REPL cmd | 否 | 不变 |
+| `getbox` / `setbox-min` / `setbox-max` | REPL cmd | 否 | EE 安全盒,与关节盒互不影响 |
+| `getpos` / `getstate` | REPL cmd | 否 | 不变 |
+| `home` | REPL cmd | 否 | 仍走 `_check_qpos_within_limits` |
+| `zero` / `zero --force` | REPL cmd | 否 | `--force` 仍只跳过 `_check_qpos_within_limits`,与新 `setqpos --force` 在不同代码路径 |
+| `set-home` / `set-zero` | REPL cmd | 否 | 仍只改预存槽位 |
+| `gethomes` | REPL cmd | 否 | 不变 |
+| `brake` | REPL cmd | 否 | 不变 |
+| `gripper PCT`(数字入参) | REPL cmd | **行为不变,但调用入口改为 `_cmd_gripper` 多分支** | 数字分支保留;增加了 `open/close/toggle` 分支;数值越界等错误信息升级为统一格式 |
+| `help` / `?` | REPL cmd | **help 文本扩展** | 追加 `setqpos*` / `gripper open|close|toggle` / `getqbox` / `setqbox-*` / `set-qstep` |
+| `q` / `quit` / `exit` | REPL cmd | 否 | 不变 |
+| `--pose-euler` / `--pose-quat` / `--pose-delta` | single-shot | 否 | mutually_exclusive_group 中加入 `--qpos` 后,行为仍互斥 |
+| `--home` / `--zero` | single-shot | 否 | 不变 |
+| `--zero-skip-joint-check` | single-shot | 否 | 仍只跳过 `_check_qpos_within_limits`,不与 `--qpos-skip-joint-check` 互通 |
+| `--home-qpos` / `--zero-qpos` / `--joint-reset-qpos` | single-shot | 否 | 不变 |
+| `--box-min` / `--box-max` / `--action-scale` | single-shot | 否 | 不变 |
+| `RayBackend` | backend | **新增 `send_arm_joints` 方法** | 所有现有方法签名不变 |
+| `RclpyBackend` | backend | **新增 publisher + 新增 `send_arm_joints` 方法** | 现有 pose / gripper / brake publisher 与发送行为不变;QoS 不动 |
+| `_joint_q_min` / `_joint_q_max` 字段(L444-L446) | safety field | 否 | 仍由 `home` / `zero` / `_check_qpos_within_limits` 用 |
+| `_box_min` / `_box_max` 字段(L436-L438) | safety field | 否 | EE 盒不动 |
+| `_supervisor` / `_schema` 字段(L457-L458) | safety field | 否 | 只服务 `setdelta` 路径 |
+
+结论:**100% 向后兼容**,任何只用旧命令的 bring-up 脚本都不需要改。
+
+### 8.7.10.H Orin 真机操作 SOP(7 步)
+
+把"装好新功能后第一次跑"的最小路径写成 7 步,每一步都带预期输出,保证操作员看到任何意外都能立刻定位。
+
+**Step 1**:dummy 烟雾测试(不连机器人):
+
+```bash
+python toolkits/realworld_check/test_galaxea_r1_pro_controller.py \
+    --backend ray --dummy \
+    --qpos 0.0 0.3 0.0 -1.8 0.0 2.1 0.0
+```
+
+预期输出:
+
+```text
+[INFO]  Backend: ray (dummy)
+Safety box ...
+[INFO]  Sending qpos = [+0.0000, +0.3000, +0.0000, -1.8000, +0.0000, +2.1000, +0.0000] (fire-and-forget)
+```
+
+**Step 2**:rclpy 后端连真机,先 `getstate` 验证反馈链路:
+
+```bash
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=72
+python toolkits/realworld_check/test_galaxea_r1_pro_controller.py \
+    --backend rclpy
+r1pro> getqbox
+r1pro> setqpos 0.0 0.3 0.0 -1.8 0.0 2.1 0.0      # = HOME pose
+```
+
+预期:
+
+```text
+[NOTE]  state unavailable; skipping L4 qpos-step check.  rclpy backend ...
+[INFO]  Sending qpos = [+0.0000, +0.3000, ..., +0.0000] (fire-and-forget)
+```
+
+**Step 3**:Ray 后端连真机,看反馈 + 连发轨迹:
+
+```bash
+ray start --head --port=6379
+python toolkits/realworld_check/test_galaxea_r1_pro_controller.py \
+    --backend ray --node-rank 0
+r1pro> getstate
+r1pro> setqpos 0.0 0.3 0.0 -1.8 0.0 2.1 0.0      # 第一帧
+r1pro> setqpos 0.0 0.4 0.0 -1.7 0.0 2.0 0.0      # 第二帧, 每关节 < 0.1 rad
+```
+
+预期:第一帧 fire-and-forget,第二帧 L4-step 通过(因为 dq < 0.5 rad)。
+
+**Step 4**:夹爪开合标志位:
+
+```text
+r1pro> gripper open
+  gripper open  -> send_gripper(100.0)
+r1pro> gripper close
+  gripper close -> send_gripper(0.0)
+r1pro> gripper toggle
+[INFO]  toggle: cur=0.0 (last-cmd) <= 50.0 -> open
+```
+
+**Step 5**:运行时收紧关节安全盒:
+
+```text
+r1pro> setqbox-min -1.0 -1.0 -1.0 -2.5 -1.0 -0.05 -1.0
+r1pro> setqbox-max  1.0  1.0  1.0 -0.5  1.0  3.5  1.0
+r1pro> setqpos 0.0 0.0 0.0 -2.7 0.0 2.0 0.0      # J4 越过新 L2-soft 下界 -2.5
+[WARN]  L2:right_arm_q J4=-2.7000 -> -2.5000 (clipped to min face)
+[ERROR] L2-soft (RL safety box) violated; refusing to send.  Pass --qpos-force ...
+```
+
+**Step 6**:大跳变拦截:
+
+```text
+r1pro> set-qstep 0.2
+r1pro> setqpos 0.0 1.5 0.0 -1.8 0.0 2.1 0.0      # J2 = 1.5, 距当前 0.3 差 1.2 rad
+[WARN]  L4:qpos_step_too_large J2 dq=+1.2000 > 0.2000
+[ERROR] L4 qpos-step exceeded; refusing to send.  Lower the step or --force ONLY ...
+```
+
+**Step 7**:阻塞模式 + 退出:
+
+```text
+r1pro> setqpos-block 0.0 0.3 0.0 -1.8 0.0 2.1 0.0
+[INFO]  Sending qpos = [...] (blocking)
+  send_arm_joints(blocking) -> OK
+r1pro> q
+```
+
+退出时记得 `ray stop`。整套流程目标是"在 5 分钟内验证完关节空间所有新通路 + 安全盒 3 层闸门 + 夹爪 3 个标志位",出问题立刻能从 reason 标签反查到具体代码行。
+
+### 8.7.10.I 风险、限制与 TODO
+
+落地前需要意识到的 5 个开放问题:
+
+1. **`RayBackend.vel_limit` 透传依赖控制器侧小改**:目前 [`GalaxeaR1ProController.send_arm_joints` L588-L600](../../../rlinf/envs/realworld/galaxear/r1_pro_controller.py) 不接受 `velocity` 形参。本设计 §8.7.10.F-5 用 `[NOTE]` 提示"暂忽略",rclpy 后端走得通。`TODO(controller)`:加一行 `if velocity is not None: msg.velocity = [float(v) for v in velocity[:7]]`,5 行 diff,不破坏既有调用。
+2. **`_max_qpos_step_per_call_rad` 默认 0.5 rad 是经验值**:对一个 100ms 的 RL 控制周期、`SafetyConfig.arm_qvel_max=[3,3,3,3,5,5,5]` 的速度上限,理论最大 step ≈ 0.3-0.5 rad。bring-up 阶段建议先用 `set-qstep 0.2`。`TODO(safety)`:后续应改为从 `arm_qvel_max × dt` 自动派生,放进 `SafetyConfig` 而非 CLI 字段。
+3. **`gripper_toggle` 在 rclpy 后端无反馈降级**:rclpy 后端 `get_state()` 永远返回 `None`,所以 toggle 退化为"看 `_last_gripper_pct`";如果连 `_last_gripper_pct` 都还是 `None`(进程刚启动就敲 toggle),设计中默认 `gripper_open()`(在自由空间安全)。如果操作员的工位是夹爪闭合更安全的环境,需要在 SOP 里强制"先 `gripper close` 再 `gripper toggle`",或加 `--toggle-default close` 参数(本期不做)。
+4. **与 [`safety_2.md`](safety_2.md) §9.4 心跳 / §9.11 EE 反馈缺失的关系**:`setqpos` 路径**不**走 `SafetySupervisor.validate`(与 `setpose` / `setposq` 一致),所以 `operator_heartbeat_timeout_ms` 的 1.5 s 限制不影响——这是有意的,REPL 中操作员就是心跳源。EE 反馈缺失只影响 `setdelta` 与 `setpose` 路径中的 L3a 预测,**不影响 `setqpos`**(关节路径走 `state.right_arm_qpos`,反馈链路是 `/hdas/feedback_arm_right`,不依赖 `/motion_control/pose_ee_arm_right`)。
+5. **与 [`safety_2_joinlimit.md`](safety_2_joinlimit.md) §7.2 方案 A 的关系**:本设计是它在**CLI 工具层**的"对齐版"实现——把 §7.2 提到的"事后校验 `state.arm_qpos`"思想搬到 `setqpos` 路径,让 operator 在 bring-up 期间就能用上。它**不替代**生产 `SafetySupervisor.validate` 内部应该补齐的 L2 事前校验(那需要 IK 或 Jacobian,见 `safety_2_joinlimit.md` §7.1 方案 B/C)。两者关系:本设计 = 短期"跑得了"(REPL 工具,IK-free);`safety_2_joinlimit.md` §7.2 = 长期"跑得好"(生产 supervisor,带 IK)。
+
+落地建议:作为单独的 PR,合并顺序 `r1_pro_controller.py 加 velocity 形参` → `test_galaxea_r1_pro_controller.py 主体` → 单元测试 `tests/unit_tests/test_galaxea_r1_pro_qpos_cli.py`(覆盖 L1/L2-hard/L2-soft/L4-step + gripper toggle 4 类场景的 mock backend 测试),所有改动控制在 ~250 行可审。

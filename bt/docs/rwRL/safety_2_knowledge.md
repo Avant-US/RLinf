@@ -1059,7 +1059,7 @@ REPL:    setposq      0.40 -0.10 0.30 0.0  0.0  0.0  1.0
 |qz	|  nz · sin(θ/2)|	"绕哪个轴转" — Z 分量   
 
 约束条件：qx² + qy² + qz² + qw² = 1（单位四元数，在 4D 超球面上）。   
-![quaternion_concept](.\assets\quaternion_concept.png)
+![quaternion_concept](./assets/quaternion_concept.png)
 
 **为什么用 θ/2 而不是 θ?**    
 这是四元数数学性质决定的。用半角使得两个旋转的组合可以直接用四元数乘法表示：
@@ -1075,7 +1075,7 @@ REPL:    setposq      0.40 -0.10 0.30 0.0  0.0  0.0  1.0
 绕 X 轴转 180°	  1	  0	         0	      0         	n=(1,0,0), θ=180°, sin(90°)=1, cos(90°)=0
 绕 Y 轴转 90°	    0	  0.707	     0	      0.707      	n=(0,1,0), θ=90°
 绕 Z 轴转 -90°	  0	  0	         -0.707	  0.707	      反方向，sin 变负
-![Image](.\assets\quaternion_examples.png)
+![Image](./assets/quaternion_examples.png)
 
 速记技巧：    
 + qw = 1 → 没旋转
@@ -1095,7 +1095,7 @@ REPL:    setposq      0.40 -0.10 0.30 0.0  0.0  0.0  1.0
 + 路径插值突然跳变（两个"看起来接近"的欧拉角，中间路径可能绕远路）
 + 安全检查误判（姿态解算不唯一）
 四元数完全没有这个问题。
-![Image](.\assets\quaternion_gimbal_lock.png)
+![Image](./assets/quaternion_gimbal_lock.png)
 
  **在 R1 Pro 安全系统中的应用**   
 文档第 8.4 节的 pose-quat 模式，输入格式是：    

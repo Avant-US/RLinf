@@ -208,6 +208,53 @@ SUBSCRIBED BY HDAS / mobiman:
   ```
   这是右臂的限位;左臂 URDF 没看,但 R1 Pro 镜像设计大概率是 `J1` 镜像(`[-1.31, 4.45]` ?需要单独读 `r1_pro_floating_left.urdf` 确认──预检应该在脚本里加一条"启动前 read 两个 URDF 校验自身常量"的 sanity check)。
 
+#### C.1.1 上面"URDF lower / upper"的值是怎么来的?还有其它要改的吗?
+
+**来源**:`/home/nvidia/galaxea/install/mobiman/lib/mobiman/configs/urdfs/r1_pro_floating_right.urdf` 中 7 个 `<joint type="revolute">` 的 `<limit lower=... upper=...>` 字段。 用 grep 命中行号:`151, 209, 267, 325, 383, 441, 499`,逐行展开后得到:
+
+```
+right_arm_joint1   axis=(0,1,0)   lower=-4.4506    upper=1.3090     effort=55  velocity=7.1209
+right_arm_joint2   axis=(1,0,0)   lower=-3.1416    upper=0.1745     effort=55  velocity=7.1209
+right_arm_joint3   axis=(0,0,1)   lower=-2.356196  upper=2.356196   effort=25  velocity=8.3776
+right_arm_joint4   axis=(0,1,0)   lower=-2.0944    upper=0.3491     effort=25  velocity=8.3776
+right_arm_joint5   axis=(0,0,1)   lower=-2.356196  upper=2.356196   effort=18  velocity=10.4720
+right_arm_joint6   axis=(0,1,0)   lower=-1.047198  upper=1.047198   effort=18  velocity=10.4720
+right_arm_joint7   axis=(1,0,0)   lower=-1.5708    upper=1.5708     effort=18  velocity=10.4720
+```
+
+数字与表里**完全一致**。我又交叉验证了**整机 URDF**`/home/nvidia/galaxea/install/mobiman/share/mobiman/urdf/R1_PRO/urdf/r1_pro.urdf` 的右臂部分(行 1981-2333),7 行 limit 也是同一组数字(URDF 是从同一份原始 SolidWorks export 生成的,见文件头注释)。**所以这 7 行值是从真 SDK 的 URDF 取出的,可信。**   
+
+SDK 里**没有任何独立的 `joint_limits.yaml` / `joint_pos_limit` 配置文件**(我用 `grep -rn "joint_pos|joint_limits|q_min|q_max"` 搜 `install/`,只命中 `mobiman/scripts/A1X_Teleop/gello_teleop.py` 的一段 A1X teleop 用代码,不是 R1Pro)。**HDAS / ACU 固件在 C++ 二进制里另写了一份限位**(从 `Embedded_Software_Firmware/`、`HDAS/` 二进制可看出),用户态读不到。所以严格地说:
+- **URDF 限位**:`relaxed_ik` 求解时会使用,IK 报"unreachable"就拒绝。
+- **HDAS/ACU 固件限位**:运动到位时硬件级拒绝,可能 = URDF,也可能略宽或略窄,SDK 不公开。
+- **真机急停硬限位**:机械止挡或 thermistor 切断,在 SolidWorks 模型里有,数字应该 ≥ URDF。
+
+工程上,**URDF 限位是 SDK 暴露给用户的"软限位"**,作为 L2 的"绝对外侧不可逾越的红线"是合理的. **但有以下问题:**   
+1. **0.05 rad 的安全裕度对高速轴太小。**
+   URDF J6 / J7 的 `velocity=10.472 rad/s`,`q_vel_max` 在 RLinf 又设了 5 rad/s。若用 0.05 rad 的余量,等同于:控制环在最高速时约 **5–10 ms 的反应窗口**。`ros2 launch mobiman r1_right_arm_relaxed_ik_launch.py` 配的 IK 周期是 0.2 s(`_watchdog_timer_cb` 5 Hz);ACU 50–100 Hz;HDAS 链路 50–100 ms 抖动。**0.05 rad 留给 overshoot+drift 是不够的**,工程上应至少 0.1–0.15 rad。
+2. **没有验证左臂。** 我刚刚查证整机 URDF(r1_pro.urdf 1300-1648):
+   - **左臂 J1 不是镜像**,与右臂**相同**`[-4.4506, 1.3090]`。
+   - **左臂 J2 才是镜像**:`[-0.1745, 3.1416]`(右臂是 `[-3.1416, 0.1745]`)。
+   - 其余 J3-J7 与右臂相同。
+3. **要区分"L2 用 URDF 真值"和"L2 留比 URDF 收 5%~10% 余量"。** 即使要对齐 URDF,对于人臂类机械臂,L2 应是 URDF × (90%–95%)而不是 URDF − 0.05 rad。
+
+**左臂(竞争对手没给)**:用整机 URDF 实测的 J2 镜像值:   
+```python
+left_arm_q_min  = [-2.70, -0.16, -2.19, -1.95, -2.19, -0.10, -1.46]
+left_arm_q_max  = [ 1.22,  1.80,  2.19,  0.00,  2.19,  0.97,  1.46]
+```
+(只 J2 翻了一翻;其它与右臂一致)。这就要求 [`r1_pro_safety.py:62-67`](rlinf/envs/realworld/galaxear/r1_pro_safety.py) 的字段从单一 `arm_q_min/max` 拆成 `right_arm_q_min/max` + `left_arm_q_min/max`,**这是 RLinf 当前代码没考虑、也是竞争对手忽略的 bug**。
+
+
+**对下面的 `_DEFAULT_HOME_QPOS` 的修法(他给的 `(0,0,0,-0.3,0,0.5,0)` 是否可行)**:可行,但建议改成更接近实拍 R1 Pro 工厂出厂姿态的:
+```python
+_DEFAULT_HOME_QPOS = (0.0, -0.3, 0.0, -1.0, 0.0, 0.5, 0.0)
+```
+原因:
+- J2=-0.3(肩前张 ~17°)而不是 0.0,避免肩膀前伸贴胸甲;
+- J4=-1.0(肘弯 ~57°)而不是 -0.3,把手腕拉离基座;
+- J6=0.5 与他提的一致,维持腕部上仰。
+
 ### C.2 默认 `_DEFAULT_HOME_QPOS = (0.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.0)` 几乎肯定会被自身 L2 拒绝
 
 - **来源对比**:`test_galaxea_r1_pro_controller.py:1051`。
@@ -219,6 +266,132 @@ SUBSCRIBED BY HDAS / mobiman:
   _DEFAULT_HOME_QPOS = (0.0, 0.0, 0.0, -0.3, 0.0, 0.5, 0.0)
   ```
   注:`relaxed_ik.py:86 starting_config=[0,0,0,0,0,0,0]`,即 R1 Pro 厂家约定的 IK 起算点也是全 0;现行 home 这组 `(-1.8, 2.1)` 是从 Franka 那一脉抄过来的(Franka A1 的 home 是这个量级),并非 R1 Pro 工程值。
+
+#### C.2.1 Home Position 的 SDK 真值反查与方案重排
+
+> 上面 §C.2 的"建议值" `(0.0, 0.0, 0.0, -0.3, 0.0, 0.5, 0.0)` 与"`relaxed_ik.py:86 starting_config=[0,0,0,0,0,0,0]`" 这两处都需要校正。下面按 §C.1.1 的反查风格,把"R1 Pro 真机 home 到底应该是什么"这个问题彻底过一遍。
+
+##### 1. `(0,0,0,-0.3,0,0.5,0)` 这个建议值的真实出处
+
+我把它放回 SDK 里反查,**结论是这个数值不来自 Galaxea 任何配置/示例,是凭"工程感"拼出来的折中**:
+
+- §C.2 末尾说"`relaxed_ik.py:86 starting_config=[0,0,0,0,0,0,0]`",**变量名写错了**。`/home/nvidia/galaxea/install/mobiman/lib/mobiman/relaxed_ik.py:86` 这一行实际是:
+  ```86:86:install/mobiman/lib/mobiman/relaxed_ik.py
+              self.last_pos = [0.0, 0.0, 0.0 ,0.0, 0.0, 0.0, 0.0]
+  ```
+  字段名是 `self.last_pos`(IK 内部"上次解的关节"软件态,watchdog 超时回退用的种子),**不是 `starting_config`**。
+- 真正的 `starting_config` 在 [`/home/nvidia/galaxea/install/mobiman/lib/mobiman/configs/R1PRO/settings_right.yaml:7`](file:///home/nvidia/galaxea/install/mobiman/lib/mobiman/configs/R1PRO/settings_right.yaml):
+  ```7:7:install/mobiman/lib/mobiman/configs/R1PRO/settings_right.yaml
+  starting_config: [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
+  ```
+  恰好也是 `[0]*7`,所以"R1 Pro 厂家约定的 IK 起算点是全 0"这个**结论巧合正确**,但引用 sloppy。
+- 数值 `(0,0,0,-0.3,0,0.5,0)` 中的 `-0.3` 与 `+0.5` 在整个 `/home/nvidia/galaxea/install/` 中**没有任何配置/示例使用过**(我用 `rg` 全量搜过)。是建议者自己加的"让肘略弯一点、腕略翘一点"折中,从全 0 这个 SDK 锚点跳到 `(-0.3, +0.5)` 这一步**没有任何 SDK 依据**。
+
+##### 2. R1 Pro 的 home == zero == `[0]*7` —— SDK 一致性证据链
+
+R1 Pro 与 Franka/Panda 的工程哲学根本不同:**Galaxea 在 R1 Pro 上故意把 "home" 与 "zero" 合并成同一个 `[0]*7` 姿态,作为 single source of truth。** 证据链来自 SDK 三个独立位置:
+
+```mermaid
+flowchart LR
+    SDK["Galaxea R1 Pro SDK<br/>home = zero = [0]*7<br/>(single source of truth)"]
+
+    subgraph mobiman ["mobiman 配置 (启动时载入)"]
+        S1["configs/R1PRO/settings_right.yaml:7<br/>starting_config = [0]*7"]
+        S2["configs/R1PRO/settings_left.yaml:7<br/>starting_config = [0]*7"]
+        IK1["lib/mobiman/relaxed_ik.py:86<br/>R1PRO -> last_pos = [0]*7"]
+        IK2["lib/mobiman/relaxed_ik.py:186-187<br/>_default_seed_for_robot()<br/>R1PRO -> [0]*7"]
+    end
+
+    subgraph examples ["官方开箱测试脚本"]
+        E1["r1pro_test_open_box.py:155<br/>hand_up_test 收尾 = [0]*7"]
+        E2["r1pro_test_open_box.py:193<br/>hand_dance 收尾 = [0]*7"]
+        E3["r1pro_test_open_box.py:100<br/>start_fake_feedback_blocking<br/>position = [0]*7"]
+        E4["r1pro_first_motion.py<br/>torso_test1 = [0,0,0,-0.7,0,0,0]<br/>(轻屈肘 ready,可选)"]
+    end
+
+    subgraph tutorial ["官方 ROS2 控制 R1Pro 教程"]
+        T1["第 13 节:0.0 = 关节初始零位"]
+        T2["第 15.2 节-方法三:<br/>程序启动时永远先回零 = [0]*7"]
+        T3["第 14.3 节-紧急回零模板:<br/>position = [0,0,0,0,0,0,0]"]
+    end
+
+    subgraph contrast ["反例:R1 (非 Pro,6-DoF)"]
+        N1["configs/R1/settings_right.yaml:7<br/>= [-1.57, 2.75, -2.3, 0, 0, 0]<br/>明显非零的 Franka 风格 ready"]
+    end
+
+    SDK --> mobiman
+    SDK --> examples
+    SDK --> tutorial
+    SDK -. 故意区别 .-> contrast
+```
+
+- mobiman 的 IK 起算点、关节追踪器初值、伪反馈位、教程示例,**所有用到"基准位"的地方都是 `[0]*7`**。
+- 唯一一个非零的官方姿态是 `r1pro_first_motion.py` 的 `torso_test1` = `[0,0,0,-0.7,0,0,0]`(J4 = -40°,见 [`r1pro_first_motion.py`](file:///home/nvidia/galaxea/install/mobiman/share/mobiman/scripts/robotOpenbox/R1Pro/r1pro_first_motion.py),也对应 [`教程_ROS2控制R1Pro机器人.md` 第 4.4 节](file:///home/nvidia/galaxea/install/mobiman/share/mobiman/scripts/robotOpenbox/R1Pro/教程_ROS2控制R1Pro机器人.md));但它是"测试动作 1",不是 home。
+- 而 R1(非 Pro,6-DoF)的 mobiman 配置就是带肩膀外展、肘弯曲的 Franka 风格 ready —— **这种对比说明 Galaxea 在 R1 Pro 上是有意识地选择了"home == kinematic neutral"**,而不是因为忘了配置。
+
+##### 3. `(0,0,0,-0.3,0,0.5,0)` 的 4 个工程问题
+
+| # | 问题 | 详情 |
+|---|---|---|
+| 1 | 无 SDK 依据 | 不在任何 mobiman/HDAS/示例/教程中出现,违反 single source of truth |
+| 2 | J4 = -0.3 距奇异点仅 17° | Panda 同构 7-DoF 臂,J4 ≈ 0(肘伸直)是雅可比退化的奇异/碰撞危险点;-0.3 离 0 只有 0.3 rad,IK 在该区域容易"跳解" |
+| 3 | EE 落在自定义安全盒边缘 | 右臂基座 `(-0.0005, -0.097, +0.303)` (`torso_link4` 系),J4=-0.3 的近平举 FK 给出 EE x≈+0.55, z≈+0.40,顶到 §C.3 推荐保守盒 `x_max=0.55` 边缘 |
+| 4 | 与训练 reset 路径不一致 | [`rlinf/envs/realworld/galaxear/r1_pro_env.py:540-541`](rlinf/envs/realworld/galaxear/r1_pro_env.py) `_safe_go_to_rest("right", cfg.joint_reset_qpos_right)` 训练时用的是另一组,operator bring-up 看到的"home 后状态"会与训练 reset 后状态不一致 |
+
+##### 4. 三套有 SDK 依据的替代方案
+
+- **方案 A (强烈推荐):HOME = ZERO = `[0]*7`** —— 完全对齐 Galaxea SDK
+  ```python
+  _DEFAULT_HOME_QPOS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  _DEFAULT_ZERO_QPOS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  ```
+  SDK 出处:`mobiman/configs/R1PRO/settings_*.yaml: starting_config` + `relaxed_ik.py` R1PRO 默认种子 + 官方教程"回零"约定 + `r1pro_test_open_box.py` 每个动作收尾。
+
+- **方案 B:`[0,0,0,-0.7,0,0,0]`** —— 直接来自 Galaxea 自家示例的"轻屈肘 ready"
+  ```python
+  _DEFAULT_HOME_QPOS = (0.0, 0.0, 0.0, -0.7, 0.0, 0.0, 0.0)  # J4 = -40°
+  ```
+  SDK 出处:[`r1pro_first_motion.py`](file:///home/nvidia/galaxea/install/mobiman/share/mobiman/scripts/robotOpenbox/R1Pro/r1pro_first_motion.py) `torso_test1` 双臂关节目标(也对应教程 §4.4)。Galaxea 工程团队亲手选的"轻屈肘准备位"。
+
+- **方案 C:`[0,0,0,-1.0,0,0.5,0]`** —— Franka 风格做 R1 Pro URDF 适配
+  ```python
+  _DEFAULT_HOME_QPOS = (0.0, 0.0, 0.0, -1.0, 0.0, 0.5, 0.0)  # J4 = -57°,J6 = +28°
+  ```
+  无直接 SDK 出处,是 §C.2 思路的"安全版" —— J4 = -1.0 远奇异点,J6 = +0.5 严格在 URDF J6 ∈ [-1.05, 1.05] 内部。**特别注意**:不要像 §C.1.1 末尾那样写 J2 = -0.3——R1 Pro 右臂 J2 axis = (1,0,0),URDF lower=-3.14、upper=+0.17,**J2 负方向是肩膀向后/向上抬,不是 Franka 的"shoulder pitch down"**;在没有真机 dry-run 的情况下不应擅改 J2。
+
+##### 5. 五种候选的并排对比
+
+| 候选 | qpos | SDK 依据 | URDF 限位 | 距 J4=0 奇异 | EE 大致位置 (torso_link4 系) | 推荐度 |
+|---|---|---|---|---|---|---|
+| RLinf 现行 | `(0, 0.3, 0, -1.8, 0, 2.1, 0)` | 无 (Franka 移植) | **越界** (J6=2.1 > URDF 1.05) | 1.8 rad ✓ | x≈0.35, z≈0.45 | 越界,弃用 |
+| §C.2 建议 | `(0, 0, 0, -0.3, 0, 0.5, 0)` | 无 | 全部内 | **0.3 rad ✗ 危险** | x≈0.55, z≈0.40 (盒边) | ★ |
+| §C.1.1 修正 | `(0, -0.3, 0, -1.0, 0, 0.5, 0)` | 无 + J2 方向未验 | 全部内 | 1.0 rad ✓ | 未 FK 验证 | ★★ |
+| **方案 A** | `(0, 0, 0, 0, 0, 0, 0)` | **mobiman + relaxed_ik + 教程 + 开箱测试** | 全部内 (修正后) | 0 (在奇异点) | 臂下垂 | ★★★★★ |
+| **方案 B** | `(0, 0, 0, -0.7, 0, 0, 0)` | **r1pro_first_motion.py** | 全部内 | 0.7 rad ✓ | x≈0.40, z≈0.50 (工作区) | ★★★★ |
+| **方案 C** | `(0, 0, 0, -1.0, 0, 0.5, 0)` | URDF 适配 (无直接) | 全部内 | 1.0 rad ✓ | x≈0.35, z≈0.55 (工作区) | ★★★ |
+
+> 关于方案 A 的"在 J4=0 奇异点上":这本来是 Panda/Franka 类机臂的痛点;但 R1 Pro 的工厂出厂校准、零位编码器对位、relaxed_ik 起算种子都用 `[0]*7`,说明 Galaxea 工程上接受"零位即 IK 锚点"这一选择。代价是 IK 在零位附近的雅可比 condition number 较大,所以**真正的训练任务应当从一个"task-ready"位起步,而不是从 home 起步**——见下面的最终推荐。
+
+##### 6. 最终推荐:方案 A + 引入独立 `task_ready_qpos` 字段
+
+把"机器人原点 home/zero"和"任务起始位 task-ready"这两件本来不同的事**在配置上彻底分开**,两者都有 SDK 依据:
+
+| 概念 | 字段 | 默认值 | 用途 | 来源 |
+|---|---|---|---|---|
+| Home | `_DEFAULT_HOME_QPOS` | `[0]*7` | bring-up 回零、紧急复位、CLI `home` 命令 | mobiman starting_config + 官方教程"回零" |
+| Zero | `_DEFAULT_ZERO_QPOS` | `[0]*7` | 关节空间原点、校准、坐标系/运动学验证 | 编码器零点定义 |
+| Task-Ready (新增) | `task_ready_qpos_right` | `[0,0,0,-0.7,0,0,0]` | 训练 episode 之间 reset、远奇异/无碰撞的任务起步位 | r1pro_first_motion.py torso_test1 |
+
+代码层面对应改动(留待后续 PR,本 doc PR 不动代码):
+
+1. [`toolkits/realworld_check/test_galaxea_r1_pro_controller.py:1051`](toolkits/realworld_check/test_galaxea_r1_pro_controller.py): `_DEFAULT_HOME_QPOS = (0.0,)*7`
+2. [`rlinf/envs/realworld/galaxear/r1_pro_env.py:100-102`](rlinf/envs/realworld/galaxear/r1_pro_env.py): `joint_reset_qpos_right` 改为 `[0]*7`(语义对齐 home),并新增独立字段 `task_ready_qpos_right` 默认 `[0,0,0,-0.7,0,0,0]`,`reset()` 内先 home 再 task-ready
+3. REPL 帮助文本明确说明:**R1 Pro 上 `home` 与 `zero` 行为相同(对齐 Galaxea 官方 SDK 约定);若任务需要从轻屈肘 ready 位起步,在 YAML 或 CLI `set-home` 中显式覆盖**
+4. 同步更新 `bt/docs/rwRL/safety_2_knowledge.md §7.1`(原 Opus 4.7 推导段),把"7.1.2 历史血统:Franka Ready Pose"段标注为**deprecated**,补一段 "7.1.5(修订版):R1 Pro 的工程惯例是 home == zero,Franka-style 4-轴归零+3-轴定型 在 R1 Pro 上是反模式"
+
+##### 7. 反思:为什么 §C.2 与 RLinf 现行默认值都"凭工程感"乱写
+
+LLM 在缺乏真机 dry-run / SDK 交互的情况下,倾向于"参考已有 Franka/Panda 经验微调"——`(0, 0.3, 0, -1.8, 0, 2.1, 0)` 与 `(0, 0, 0, -0.3, 0, 0.5, 0)` 都属于这种"安全的猜测"。但 R1 Pro 的工程哲学与 Franka 不同(home == kinematic neutral),这个区别只有读 mobiman 配置 + 官方开箱测试脚本 + ROS2 控制教程 这三样的交集才能看出来。**教训:对于真机相关的"魔法常量",必须以 SDK 真实代码为准,不能凭直觉调。**
 
 ### C.3 `right_ee_min/max` 安全盒数值合不合理 — 需要标定
 
@@ -407,7 +580,7 @@ SUBSCRIBED BY HDAS / mobiman:
 | 7 | P0 代码 | 修 `_on_controller_signal`(`r1_pro_controller.py:534-543`)、`r1_pro_robot_state.controller_signal` 默认 dict、`r1_pro_safety.py L5 SWD` 检查,使其与 R1 Pro `ControllerSignal.msg`(`left_x_axis/right_x_axis/.../mode`)对齐 | 代码 |
 | 8 | P0 代码 | 修 [`r1_pro_controller.py:545-548`](rlinf/envs/realworld/galaxear/r1_pro_controller.py) `_on_status` 的 `int(e)` 错误 | 代码 |
 | 9 | P1 代码 | 修 `SafetyConfig.arm_q_min/q_max` 默认值与 URDF 对齐(§C.1) | 代码 |
-| 10 | P1 代码 | 改 `_DEFAULT_HOME_QPOS` 为 R1 Pro 可达姿态,改 `right_ee_min/max` 默认为保守盒(§C.2/C.3) | 代码 |
+| 10 | P1 代码 | 改 `_DEFAULT_HOME_QPOS = [0]*7`(对齐 Galaxea SDK,见 §C.2.1 方案 A;**不要**用 §C.2 原建议的 `(0,0,0,-0.3,0,0.5,0)` —— 距 J4=0 奇异点仅 17°);同步改 `r1_pro_env.py:100-102` 的 `joint_reset_qpos_right` 并新增 `task_ready_qpos_right=[0,0,0,-0.7,0,0,0]`;改 `right_ee_min/max` 默认为保守盒(§C.3) | 代码 |
 | 11 | P1 现场 | 启动命令推荐:`python toolkits/realworld_check/test_galaxea_r1_pro_controller.py --backend rclpy --ros-domain-id 41 --box-min 0.25 -0.25 0.10 --box-max 0.55 0.25 0.55` | 现场 |
 | 12 | P2 代码 | 增加 `/motion_control/pose_ee_arm_right` 订阅,填 `state.right_ee_pose`(§E.1) | 代码 |
 | 13 | P2 代码 | 修文档 `test_galaxea_r1_pro_controller.md` §A.3.3 的启动序列(§F.3) | 文档 |
