@@ -162,6 +162,17 @@ class GalaxeaR1ProRobotState:
             self.right_gripper_vel if side == "right" else self.left_gripper_vel
         )
 
+    def get_gripper_pos_norm(
+        self,
+        side: str,
+        *,
+        closed_stroke_mm: float = 0.0,
+        open_stroke_mm: float = 100.0,
+    ) -> float:
+        span = max(open_stroke_mm - closed_stroke_mm, 1e-9)
+        pos_mm = self.get_gripper_pos(side)
+        return float(np.clip((pos_mm - closed_stroke_mm) / span, 0.0, 1.0))
+
     def get_torso_qpos(self) -> np.ndarray:
         return np.asarray(self.torso_qpos, dtype=np.float32).reshape(-1)[:4]
 

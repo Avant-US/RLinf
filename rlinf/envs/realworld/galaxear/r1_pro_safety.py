@@ -108,10 +108,16 @@ class SafetyConfig:
     chassis_dead_zone: np.ndarray = field(default_factory=lambda: np.array(
         [0.01, 0.01, 0.05], dtype=np.float32))
 
-    # ── L2: gripper (0-100% stroke) ────────────────────────────
-    gripper_pct_min: float = 0.0
-    gripper_pct_max: float = 100.0
-    max_gripper_step_pct: float = 30.0  # per-step delta cap
+    # ── L2: gripper (normalised [0, 1] — 0=fully closed, 1=fully open) ──
+    # v3: replaces v2's `gripper_pct_*` (which mixed mm/percentage units).
+    gripper_pos_min: float = 0.0
+    gripper_pos_max: float = 1.0
+    max_gripper_step: float = 0.30  # per-step delta in [0, 1] space
+    # Hardware stroke envelope (mm); used to convert ROS topic `mm` <-> norm.
+    # Defaults match RLinf `_dispatch_action.clip(0, 100)` current behaviour;
+    # set to BRS-style 10/90 mm for an extra 10 mm bumper margin.
+    gripper_closed_stroke_mm: float = 0.0
+    gripper_open_stroke_mm: float = 100.0
 
     # ── L2: thresholds & gains ─────────────────────────────────
     l2_warning_margin_rad: float = 0.15      # start scaling action
@@ -828,12 +834,14 @@ class GalaxeaR1ProSafetySupervisor:
         state: "GalaxeaR1ProRobotState",
         schema: "ActionSchema",
     ) -> None:
-        """Two L2 checks for each enabled gripper:
+        """Two L2 checks for each enabled gripper, expressed in the
+        RLinf normalised [0, 1] working space (0 = fully closed,
+        1 = fully open):
 
-        1. Per-step delta cap (``max_gripper_step_pct``):
-           |Δ pct| ≤ max_gripper_step_pct.
-        2. Position bound: predicted next pct ∈
-           [gripper_pct_min, gripper_pct_max].
+        1. Per-step delta cap (``max_gripper_step``):
+           |Δ pos_norm| ≤ max_gripper_step.
+        2. Position bound: predicted next pos_norm ∈
+           [gripper_pos_min, gripper_pos_max].
 
         Both are implemented in the predict-clip-rewrite style used
         by L3a so that the rest of the pipeline sees a clean
@@ -841,10 +849,18 @@ class GalaxeaR1ProSafetySupervisor:
         """
         if schema.no_gripper:
             return
-        scale_g = max(float(schema.action_scale[2]), 1e-9)
-        max_step = float(self._cfg.max_gripper_step_pct)
-        lo = float(self._cfg.gripper_pct_min)
-        hi = float(self._cfg.gripper_pct_max)
+
+        open_mm = float(self._cfg.gripper_open_stroke_mm)
+        closed_mm = float(self._cfg.gripper_closed_stroke_mm)
+        stroke_span = max(open_mm - closed_mm, 1e-9)
+
+        raw_scale = max(float(schema.action_scale[2]), 1e-9)
+        scale_norm = raw_scale / stroke_span if raw_scale > 5.0 else raw_scale
+
+        max_step = float(self._cfg.max_gripper_step)
+        lo = float(self._cfg.gripper_pos_min)
+        hi = float(self._cfg.gripper_pos_max)
+
         for side in ("right", "left"):
             if side == "right" and not schema.has_right_arm:
                 continue
@@ -854,23 +870,27 @@ class GalaxeaR1ProSafetySupervisor:
             key = f"{side}_gripper"
             if key not in d:
                 continue
+
             a_g = float(d[key])           # already in [-1, 1] post L1
-            cur_pct = float(state.get_gripper_pos(side))
-            delta_pct = a_g * scale_g
+            cur_mm = state.get_gripper_pos(side)
+            # cur_pos = (cur_mm - closed_mm) / stroke_span
+            # cur_pos = float(np.clip(cur_pos, 0.0, 1.0))
+            cur_pos = state.get_gripper_pos_norm(side=side, closed_stroke_mm=closed_mm, open_stroke_mm=open_mm)
+            delta_pos = a_g * scale_norm  # signed delta in [0,1] space
 
             # 1) rate cap
             new_a = a_g
             rate_capped = False
-            if abs(delta_pct) > max_step:
-                new_a = float(np.sign(a_g) * max_step / scale_g)
+            if abs(delta_pos) > max_step:
+                new_a = float(np.sign(a_g) * max_step / scale_norm)
                 rate_capped = True
 
-            # 2) position bound
-            next_pct = cur_pct + new_a * scale_g
+            # 2) position bound — runs after the rate cap
+            next_pos = cur_pos + new_a * scale_norm
             pos_capped = False
-            if next_pct < lo or next_pct > hi:
-                target = float(np.clip(next_pct, lo, hi))
-                new_a = float((target - cur_pct) / scale_g)
+            if next_pos < lo or next_pos > hi:
+                target = float(np.clip(next_pos, lo, hi))
+                new_a = float((target - cur_pos) / scale_norm)
                 pos_capped = True
 
             if rate_capped or pos_capped:
@@ -881,11 +901,12 @@ class GalaxeaR1ProSafetySupervisor:
                 tag_parts = []
                 if rate_capped:
                     tag_parts.append(
-                        f"rate_cap |Δ|={abs(delta_pct):.1f}>{max_step:.1f}%/step"
+                        f"rate_cap |Δ|={abs(delta_pos):.3f}>"
+                        f"{max_step:.3f}/step"
                     )
                 if pos_capped:
                     tag_parts.append(
-                        f"pos_cap pred={next_pct:.1f}->[{lo:.1f},{hi:.1f}]"
+                        f"pos_cap pred={next_pos:.3f}->[{lo:.2f},{hi:.2f}]"
                     )
                 info.reason.append(
                     f"L2:{side}_gripper " + " ".join(tag_parts)
@@ -898,6 +919,8 @@ class GalaxeaR1ProSafetySupervisor:
                         "pos_cap": pos_capped,
                         "raw_a": a_g,
                         "new_a": new_a,
+                        "cur_pos_norm": cur_pos,
+                        "cur_pos_mm": cur_mm,
                     },
                 )
 

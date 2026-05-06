@@ -447,15 +447,16 @@ def test_l2d_chassis_cap_clips_to_qvel_max():
 # 11. Gripper position clamp ----------------------------------------
 
 def test_l2_gripper_position_clamp_caps_to_max():
-    """Use an action_scale[2]=50 so that a normalised gripper action
-    of 1.0 translates to +50 %/step delta -- enough to overshoot the
-    100% upper bound from a starting 95% pct.  L1 will not clip
-    a=1.0, so the L2 gripper layer can see the full request and
-    rewrite it back via predict-clip-rewrite."""
+    """Use an action_scale[2]=50 so that the mm-flavoured heuristic
+    triggers (50 > 5 -> scale_norm = 50/100 = 0.5).  A normalised
+    gripper action of 1.0 translates to +0.5 in [0,1] space --
+    enough to overshoot the 1.0 upper bound from a starting 0.95
+    position.  L1 will not clip a=1.0, so the L2 gripper layer can
+    see the full request and rewrite it back via predict-clip-rewrite."""
     cfg = _strict_l2_only_cfg()
-    cfg.gripper_pct_min = 0.0
-    cfg.gripper_pct_max = 100.0
-    cfg.max_gripper_step_pct = 1e6  # disable rate cap for this test
+    cfg.gripper_pos_min = 0.0
+    cfg.gripper_pos_max = 1.0
+    cfg.max_gripper_step = 1e6  # disable rate cap for this test
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     # Use a realistic gripper scale (RLinf default uses 1.0 with a
     # different mapping; here we choose 50 so a in [-1,1] -> ±50%/step,
@@ -470,9 +471,10 @@ def test_l2_gripper_position_clamp_caps_to_max():
 
     cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
                      dtype=np.float32)
-    # Gripper currently at 95.0%; a=1.0 with scale 50 -> delta=+50.
-    # Predicted next pct = 145 -> cap to 100 -> new_delta = 5
-    # -> new_a = 5/50 = 0.1.
+    # Gripper at 95.0 mm -> cur_pos_norm = 0.95.  Heuristic: scale=50
+    # > 5 -> scale_norm = 50/100 = 0.5.  a=1.0 -> delta_pos = 0.5.
+    # Predicted next = 0.95+0.5 = 1.45 -> cap to 1.0 -> new_delta = 0.05
+    # -> new_a = 0.05/0.5 = 0.1.
     state = _state_with_qpos(right_qpos=cur_q, right_gripper_pos=95.0)
     a = np.zeros(7, dtype=np.float32)
     a[6] = 1.0
@@ -487,9 +489,9 @@ def test_l2_gripper_position_clamp_caps_to_max():
 
 def test_l2_gripper_rate_limit_caps_step():
     cfg = _strict_l2_only_cfg()
-    cfg.gripper_pct_min = 0.0
-    cfg.gripper_pct_max = 100.0
-    cfg.max_gripper_step_pct = 10.0
+    cfg.gripper_pos_min = 0.0
+    cfg.gripper_pos_max = 1.0
+    cfg.max_gripper_step = 0.10
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     schema = ActionSchema(
         has_left_arm=False, has_right_arm=True,
@@ -501,14 +503,14 @@ def test_l2_gripper_rate_limit_caps_step():
     cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
                      dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q, right_gripper_pos=20.0)
-    # a[6]=1.0 with scale=50 -> demanded delta=+50%/step (above cap=10).
+    # a[6]=1.0, scale_norm=0.5 -> delta_pos=0.5 (above cap=0.10).
     a = np.zeros(7, dtype=np.float32)
     a[6] = 1.0
     info = sup.validate(a.copy(), state, schema)
     assert info.clipped is True
     assert any("L2:right_gripper" in r and "rate_cap" in r
                for r in info.reason)
-    # Capped to +10%/step -> new_a = 10 / 50 = 0.2.
+    # Capped to max_step=0.10 -> new_a = 0.10 / 0.50 = 0.2.
     assert info.safe_action[6] == pytest.approx(0.2, abs=1e-5)
 
 
