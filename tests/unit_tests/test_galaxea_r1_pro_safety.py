@@ -149,7 +149,8 @@ def test_l5_status_errors_soft_hold():
     cfg = SafetyConfig()
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     state = _state_with_ee()
-    state.status_errors = {"right": [42]}
+    state.status_errors = {"right": {"name":"TEST_ERR", "code": int(42),
+                "desc": list(["Just For Test"])}}
     info = sup.validate(np.zeros(7, dtype=np.float32), state,
                         _schema_single_arm())
     assert info.soft_hold is True

@@ -70,7 +70,7 @@ class GalaxeaR1ProRobotState:
     * BMS: dict with ``voltage``, ``current``, ``capital_pct``, ``temperature``
     * Controller signal: dict with ``swa``/``swb``/``swc``/``swd`` switches
       (typically int 0/1/2 for 3-position toggle) and ``mode`` int
-    * Per-arm ``status_errors``: dict ``side -> list[int]`` populated
+    * Per-arm ``status_errors``: dict ``side -> list[Any]`` populated
       from ``/hdas/feedback_status_arm_*``
     * ``feedback_age_ms``: dict ``source_name -> ms`` populated by
       controller; used by SafetySupervisor as L5 watchdog
@@ -136,7 +136,7 @@ class GalaxeaR1ProRobotState:
             "swa": 0, "swb": 0, "swc": 0, "swd": 0, "mode": 0,
         }
     )
-    status_errors: Dict[str, List[int]] = field(default_factory=dict)
+    status_errors: Dict[str, List] = field(default_factory=dict)
 
     feedback_age_ms: Dict[str, float] = field(default_factory=dict)
     is_alive: bool = False

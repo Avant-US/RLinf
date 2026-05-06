@@ -66,7 +66,7 @@ class SafetyConfig:
     arms differ on J2** (mirrored mechanical design), so we keep
     two separate position vectors instead of a single ``arm_q_min/max``.
 
-    See ``bt/docs/rwRL/safety_2_joinlimit_2.md`` §3 for the full
+    See ``bt/docs/rwRL/safety_2_joinlimit_3.md`` §3 for the full
     derivation and rationale.
 
     Tune via ``override_cfg.safety_cfg`` in the env YAML.
@@ -124,6 +124,7 @@ class SafetyConfig:
     l2_critical_margin_rad: float = 0.05     # freeze that joint
     l2_qvel_overspeed_factor: float = 1.20   # > 1.2x limit -> soft_hold
     l2_qvel_warning_factor: float = 0.90     # > 0.9x limit -> scale 0.5
+    l2_per_joint_freeze_action: float = 0.0  # value written on freeze
 
     # ── L2 sub-layer toggles (let YAML disable individual checks) ──
     enable_l2a_predict_q_clip: bool = True
@@ -204,7 +205,7 @@ class SafetyConfig:
                     "right_arm_q_min and left_arm_q_min from it.  Migrate "
                     "your YAML to use right_arm_q_min / left_arm_q_min "
                     "(R1 Pro arms are mirrored on J2 -- see "
-                    "bt/docs/rwRL/safety_2_joinlimit_2.md §3.3).",
+                    "bt/docs/rwRL/safety_2_joinlimit_3.md §3.3).",
                 )
         if self.arm_q_max is not None:
             arr = np.asarray(self.arm_q_max, dtype=np.float32).reshape(-1)[:7]
@@ -314,7 +315,7 @@ class GalaxeaR1ProSafetySupervisor:
         # -> feedback velocity watchdog (L2c) -> commanded velocity
         # cap (L2d) -> gripper position/rate cap.  Each sub-layer is
         # individually toggleable via SafetyConfig.enable_l2*.
-        # See bt/docs/rwRL/safety_2_joinlimit_2.md §4 for rationale.
+        # See bt/docs/rwRL/safety_2_joinlimit_3.md §4 for rationale.
         if self._cfg.enable_l2a_predict_q_clip:
             self._check_l2a_predict_q_clip(info, state, action_schema)
         if self._cfg.enable_l2b_qpos_freeze:
@@ -469,7 +470,7 @@ class GalaxeaR1ProSafetySupervisor:
         no-op predictor, so this layer is essentially a placeholder
         until an IK callback is plugged in.  The protection is then
         delegated to L2b (post-hoc qpos freeze) and L2c (qvel
-        watchdog) — see safety_2_joinlimit_2.md §7.2.
+        watchdog) — see safety_2_joinlimit_3.md §7.2.
         """
         for side in ("right", "left"):
             if side == "right" and not schema.has_right_arm:
@@ -568,7 +569,8 @@ class GalaxeaR1ProSafetySupervisor:
             bad_idx = np.where(margin < self._cfg.l2_critical_margin_rad)[0]
             if bad_idx.size > 0:
                 info.safe_action = schema.rewrite_action_arm(
-                    info.safe_action, side, 0.0,
+                    info.safe_action, side,
+                    self._cfg.l2_per_joint_freeze_action,
                 )
                 info.soft_hold = True
                 joint_labels = ",".join(f"J{int(i) + 1}" for i in bad_idx)
@@ -595,7 +597,8 @@ class GalaxeaR1ProSafetySupervisor:
                 bad_t = np.where(margin_t < self._cfg.l2_critical_margin_rad)[0]
                 if bad_t.size > 0:
                     info.safe_action = schema.rewrite_action_torso(
-                        info.safe_action, 0.0,
+                        info.safe_action,
+                        self._cfg.l2_per_joint_freeze_action,
                     )
                     info.soft_hold = True
                     tlst = ",".join(f"T{int(i) + 1}" for i in bad_t)
@@ -642,7 +645,8 @@ class GalaxeaR1ProSafetySupervisor:
             max_idx = int(np.argmax(ratio))
             if max_ratio > over:
                 info.safe_action = schema.rewrite_action_arm(
-                    info.safe_action, side, 0.0,
+                    info.safe_action, side,
+                    self._cfg.l2_per_joint_freeze_action,
                 )
                 info.soft_hold = True
                 info.reason.append(
@@ -682,7 +686,8 @@ class GalaxeaR1ProSafetySupervisor:
                 )
                 if np.any(ratio_t > over):
                     info.safe_action = schema.rewrite_action_torso(
-                        info.safe_action, 0.0,
+                        info.safe_action,
+                        self._cfg.l2_per_joint_freeze_action,
                     )
                     info.soft_hold = True
                     info.reason.append(
@@ -711,7 +716,8 @@ class GalaxeaR1ProSafetySupervisor:
                 )
                 if np.any(ratio_c > over):
                     info.safe_action = schema.rewrite_action_chassis(
-                        info.safe_action, 0.0,
+                        info.safe_action,
+                        self._cfg.l2_per_joint_freeze_action,
                     )
                     info.soft_hold = True
                     info.reason.append(

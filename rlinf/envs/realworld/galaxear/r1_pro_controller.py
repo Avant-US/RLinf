@@ -545,7 +545,11 @@ class GalaxeaR1ProController(Worker):
     def _on_status(self, msg, side: str) -> None:
         with self._state_lock:
             errs = getattr(msg, "errors", []) or []
-            self._state.status_errors[side] = [int(e) for e in errs]
+            self._state.status_errors[side] = [
+                {"name": str(e.name), "code": int(e.error_code),
+                "desc": list(e.error_description)}
+                for e in errs
+            ]
 
     # ── Public API (RPC-callable) ───────────────────────────────
 

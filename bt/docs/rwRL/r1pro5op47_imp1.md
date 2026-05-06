@@ -1202,3 +1202,124 @@ Orin 出厂系统为 Ubuntu 22.04 + Python 3.10。在 Orin 上创建 venv 时:
 - [ ] `python -c "import torch; print(torch.cuda.is_available())"` 输出 `True`
 - [ ] 38 个 Galaxea 单元测试全部通过
 - [ ] dummy SAC 训练循环 100 步无异常退出
+
+
+# 实现细节解释
+
+
+## ActionSchema类的`action_scale` 是什么
+
+@RLinf/rlinf/envs/realworld/galaxear/r1_pro_action_schema.py 中的 ActionSchema 类的注释如下:
+"""Stage-dependent action layout + execution.
+
+    Attributes:
+        has_left_arm / has_right_arm: Stage flags.
+        has_torso / has_chassis: Stage flags.
+        no_gripper: When True, the gripper dim is dropped (per arm).
+        action_scale: ``[pos_scale, ori_scale, gripper_scale]`` the
+            policy output is multiplied by before being applied as a
+            delta on top of the current EE pose.
+        use_joint_mode: Reserved; ``True`` switches arm publishing
+            from mobiman pose mode to joint tracker.  Not yet exposed
+            beyond the controller skeleton.
+    """
+请问 ActionSchema 类的 action_scale 属性有什么用? 怎么用?
+
+它是一个长度为 3 的数组，约定为：
+
+`[pos_scale, ori_scale, gripper_scale]`
+
+在 `build_action_schema` 里从 `GalaxeaR1ProRobotConfig.action_scale` 读入，缺省为 **`[0.05, 0.10, 1.0]`**（单位见下）。
+
+```358:371:/home/nvidia/lg_ws/RL/RLinf/rlinf/envs/realworld/galaxear/r1_pro_action_schema.py
+def build_action_schema(cfg) -> ActionSchema:
+    """Construct the schema from a :class:`GalaxeaR1ProRobotConfig`."""
+    action_scale = np.asarray(getattr(cfg, "action_scale", [0.05, 0.10, 1.0]),
+                              dtype=np.float32).reshape(-1)
+    if action_scale.size < 3:
+        action_scale = np.array([0.05, 0.10, 1.0], dtype=np.float32)
+    return ActionSchema(
+        ...
+        action_scale=action_scale,
+```
+
+环境配置里对应字段在 `GalaxeaR1ProRobotConfig`：
+
+```85:88:/home/nvidia/lg_ws/RL/RLinf/rlinf/envs/realworld/galaxear/r1_pro_env.py
+    # ── Control ─────────────────────────────────────────────────
+    step_frequency: float = 10.0
+    action_scale: list = field(default_factory=lambda: [0.05, 0.10, 1.0])
+```
+
+YAML 里可写，例如 `examples/embodiment/config/realworld_galaxea_r1_pro_right_arm_rlpd_cnn_async.yaml` 中的 `action_scale: [0.05, 0.10, 1.0]`。
+
+---
+
+### 各分量分别干什么
+
+#### `action_scale[0]`（位置）
+
+策略输出的 `right_xyz` / `left_xyz` 被当作 **[-1, 1] 上的归一化增量**，乘 `action_scale[0]` 后加到当前末端 **位置（米）** 上，用于预测下一步 EE 位姿（安全层 L3、以及真机下发前的目标位姿都用这条逻辑）：
+
+```136:141:/home/nvidia/lg_ws/RL/RLinf/rlinf/envs/realworld/galaxear/r1_pro_action_schema.py
+        ee = state.get_ee_pose(side)
+        cur_xyz = ee[:3].astype(np.float32)
+        cur_eul = R.from_quat(np.asarray(ee[3:], dtype=np.float64)).as_euler("xyz")
+        nxt_xyz = cur_xyz + d[key_xyz] * float(self.action_scale[0])
+        nxt_eul = cur_eul + d[key_rpy] * float(self.action_scale[1])
+```
+
+含义：**满量程 `±1` 时，单步最大平移约为 `±action_scale[0]` 米**（默认约 ±5 cm/步）。
+
+在 `use_joint_mode` 且走“关节增量”分支时，前 6 个关节的增量也乘 **`action_scale[0]`**（第 7 关节不动）：
+
+```211:223:/home/nvidia/lg_ws/RL/RLinf/rlinf/envs/realworld/galaxear/r1_pro_action_schema.py
+        if self.use_joint_mode:
+            ...
+            scale = float(self.action_scale[0])
+            new_q = cur_q.copy()
+            new_q[:6] = cur_q[:6] + joint_delta6 * scale
+            return new_q.astype(np.float32)
+```
+
+#### `action_scale[1]`（姿态）
+
+`right_rpy` / `left_rpy` 同样为归一化增量，乘 **`action_scale[1]`** 后加到当前 **欧拉角（弧度）** 上（与上面同一段 `predict_arm_ee_pose`）。
+
+含义：**满量程 `±1` 时，单步各轴角增量约为 `±action_scale[1]` rad**（默认约 ±0.1 rad/步）。
+
+#### `action_scale[2]`（夹爪）
+
+类注释里写的是“与位置/姿态一样先乘 scale 再当增量”。在 **`GalaxeaR1ProSafetySupervisor` 的 L2 夹爪逻辑**里确实用到了：把归一化夹爪指令换算成 **归一化开度 [0,1] 空间里的步长** `delta_pos = a_g * scale_norm`，再和 `max_gripper_step`、行程上下限一起做 rate/position 裁剪；若 `action_scale[2] > 5`，会按 **毫米风格** 启发式除以 `stroke_span`（与 BRS/旧测试兼容）：
+
+```857:879:/home/nvidia/lg_ws/RL/RLinf/rlinf/envs/realworld/galaxear/r1_pro_safety.py
+        raw_scale = max(float(schema.action_scale[2]), 1e-9)
+        scale_norm = raw_scale / stroke_span if raw_scale > 5.0 else raw_scale
+        ...
+            a_g = float(d[key])           # already in [-1, 1] post L1
+            cur_mm = state.get_gripper_pos(side)
+            cur_pos = state.get_gripper_pos_norm(side=side, closed_stroke_mm=closed_mm, open_stroke_mm=open_mm)
+            delta_pos = a_g * scale_norm  # signed delta in [0,1] space
+```
+
+**注意与真机下发的差异**：`r1_pro_env._dispatch_action` 里夹爪是 **`(d["right_gripper"] + 1.0) * 50` 映射到 0–100%**，这里没有再乘 `action_scale[2]`。因此 **`action_scale[2]` 主要影响安全层如何理解/改写夹爪归一化动作**；若 L2 未改写，最终百分比映射与 `[2]` 无关。这是阅读注释时需要留心的实现细节。
+
+---
+
+### “怎么用”（调参建议）
+
+1. **在 YAML / `GalaxeaR1ProRobotConfig` 里设 `action_scale: [x, y, z]`**，由 `build_action_schema` 注入 `ActionSchema`。
+2. **`[0]`、`[1]`**：与 `max_linear_step_m`、`max_angular_step_rad`、L3 工作空间裁剪等一起决定“**1 个归一化单位 = 多少物理增量**”。二者应语义一致（文档里也有“`max_linear_step_m` 与 `action_scale[0]` 对齐”一类建议）。
+3. **`[2]`**：优先配合 **`max_gripper_step`**、夹爪行程配置调 L2；默认 `1.0` 表示“归一化指令直接当 [0,1] 开度空间里的步长系数”。若需要与旧 BRS 风格或单测里 `50` 这类大数兼容，安全层会用 `> 5` 的启发式当毫米再归一化。
+
+---
+
+### 小结
+
+| 索引 | 典型含义 | 主要使用位置 |
+|------|----------|--------------|
+| `[0]` | 每步 EE 位置增量标度（米 / 单位归一化动作） | `predict_arm_ee_pose`、IK 分支、`joint_mode` 关节增量、L3/L4 与安全反写 |
+| `[1]` | 每步 EE 姿态增量标度（rad / 单位归一化动作） | 同上 |
+| `[2]` | 夹爪在 **L2 安全** 中与归一化开度步长的换算系数；`>5` 时按 mm 风格处理 | `r1_pro_safety.py`；**当前 `_dispatch_action` 发夹爪未直接乘 `[2]`** |
+
+因此：**对机械臂末端，`action_scale` 就是“归一化动作 → 物理增量”的线性比例；对夹爪，注释与类设计偏向“也是 scale”，但执行路径上 `[2]` 主要体现在安全监督的步长语义上，与发 `send_gripper` 的 `(a+1)*50` 是两条逻辑。** 若你希望夹爪物理步长也显式由配置统一控制，需要在 `_dispatch_action` 或控制器侧再对齐设计（当前代码未做）。
