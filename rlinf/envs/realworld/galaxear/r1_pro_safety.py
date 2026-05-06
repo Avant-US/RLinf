@@ -36,15 +36,18 @@ See design doc §6.4 and §9 for the full rationale.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 
 if TYPE_CHECKING:
     from .r1_pro_action_schema import ActionSchema
     from .r1_pro_robot_state import GalaxeaR1ProRobotState
+
+_logger = logging.getLogger(__name__)
 
 
 # ───────────────────────── Config dataclass ─────────────────────
@@ -54,17 +57,85 @@ if TYPE_CHECKING:
 class SafetyConfig:
     """Hard safety limits + watchdog thresholds.
 
-    Defaults are tuned for the M1 single-arm bring-up.  Tune via
-    ``override_cfg.safety_cfg`` in the env YAML.
+    Position and velocity defaults are derived from the R1 Pro URDF
+    (``mobiman/lib/mobiman/configs/urdfs/r1_pro_floating_*.urdf`` and
+    ``mobiman/share/mobiman/urdf/R1_PRO/urdf/r1_pro.urdf``) minus a
+    0.1 rad (5.7°) safety margin per joint, with the velocity bound
+    additionally cross-checked against the BRS-ctrl production
+    constants in ``R1ProInterface``.  Notably the **left and right
+    arms differ on J2** (mirrored mechanical design), so we keep
+    two separate position vectors instead of a single ``arm_q_min/max``.
+
+    See ``bt/docs/rwRL/safety_2_joinlimit_2.md`` §3 for the full
+    derivation and rationale.
+
+    Tune via ``override_cfg.safety_cfg`` in the env YAML.
     """
 
-    # ── L2: per-joint limits (right arm; left arm uses same) ────
-    arm_q_min: np.ndarray = field(default_factory=lambda: np.array(
-        [-2.7, -1.8, -2.7, -3.0, -2.7, -0.1, -2.7], dtype=np.float32))
-    arm_q_max: np.ndarray = field(default_factory=lambda: np.array(
-        [2.7, 1.8, 2.7, 0.0, 2.7, 3.7, 2.7], dtype=np.float32))
+    # ── L2: 7-DoF per-arm position limits (rad) ────────────────
+    # URDF - 0.1 rad margin.  J2 is mirrored between arms.
+    right_arm_q_min: np.ndarray = field(default_factory=lambda: np.array(
+        [-4.35, -3.04, -2.26, -1.99, -2.26, -0.95, -1.47],
+        dtype=np.float32))
+    right_arm_q_max: np.ndarray = field(default_factory=lambda: np.array(
+        [1.21, 0.07, 2.26, 0.25, 2.26, 0.95, 1.47],
+        dtype=np.float32))
+    left_arm_q_min: np.ndarray = field(default_factory=lambda: np.array(
+        [-4.35, -0.07, -2.26, -1.99, -2.26, -0.95, -1.47],
+        dtype=np.float32))
+    left_arm_q_max: np.ndarray = field(default_factory=lambda: np.array(
+        [1.21, 3.04, 2.26, 0.25, 2.26, 0.95, 1.47],
+        dtype=np.float32))
+
+    # ── L2: 7-DoF per-arm velocity limits (rad/s) ──────────────
+    # min(URDF * 0.5, BRS-ctrl reset.py); same for both arms.
     arm_qvel_max: np.ndarray = field(default_factory=lambda: np.array(
-        [3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0], dtype=np.float32))
+        [1.6, 1.6, 1.6, 1.6, 4.0, 4.0, 4.0], dtype=np.float32))
+
+    # ── L2: 4-DoF torso ─────────────────────────────────────────
+    # BRS-ctrl R1ProInterface.torso_joint_high/low - 0.1 rad.
+    torso_q_min: np.ndarray = field(default_factory=lambda: np.array(
+        [-1.03, -2.69, -1.73, -2.95], dtype=np.float32))
+    torso_q_max: np.ndarray = field(default_factory=lambda: np.array(
+        [1.73, 2.43, 1.47, 2.95], dtype=np.float32))
+    torso_qvel_max: np.ndarray = field(default_factory=lambda: np.array(
+        [0.5, 0.5, 0.5, 0.5], dtype=np.float32))
+
+    # ── L2: 3-DoF chassis (only velocity + dead-zone) ──────────
+    # BRS-ctrl R1ProInterface.mobile_base_cmd_limit / threshold.
+    chassis_qvel_max: np.ndarray = field(default_factory=lambda: np.array(
+        [0.30, 0.30, 0.40], dtype=np.float32))  # vx, vy, wz
+    chassis_dead_zone: np.ndarray = field(default_factory=lambda: np.array(
+        [0.01, 0.01, 0.05], dtype=np.float32))
+
+    # ── L2: gripper (0-100% stroke) ────────────────────────────
+    gripper_pct_min: float = 0.0
+    gripper_pct_max: float = 100.0
+    max_gripper_step_pct: float = 30.0  # per-step delta cap
+
+    # ── L2: thresholds & gains ─────────────────────────────────
+    l2_warning_margin_rad: float = 0.15      # start scaling action
+    l2_critical_margin_rad: float = 0.05     # freeze that joint
+    l2_qvel_overspeed_factor: float = 1.20   # > 1.2x limit -> soft_hold
+    l2_qvel_warning_factor: float = 0.90     # > 0.9x limit -> scale 0.5
+
+    # ── L2 sub-layer toggles (let YAML disable individual checks) ──
+    enable_l2a_predict_q_clip: bool = True
+    enable_l2b_qpos_freeze: bool = True
+    enable_l2c_qvel_watchdog: bool = True
+    enable_l2d_cmd_speed_cap: bool = True
+    enable_l2_gripper: bool = True
+
+    # ── Step period used by L2d (s); should match Env.step_frequency. ──
+    dt_step: float = 0.10  # 10 Hz default
+
+    # ── Deprecated single-arm aliases (kept for back-compat) ────
+    # Old code used a single ``arm_q_min/max`` shared between arms.
+    # If a YAML still passes them, ``__post_init__`` will splat them
+    # into both ``right_arm_q_*`` and ``left_arm_q_*`` and emit a
+    # one-time warning so users can migrate.
+    arm_q_min: Optional[np.ndarray] = None  # deprecated: use right/left
+    arm_q_max: Optional[np.ndarray] = None  # deprecated: use right/left
 
     # ── L3a: per-arm TCP safety box (xyz + rpy in torso_link4) ──
     right_ee_min: np.ndarray = field(default_factory=lambda: np.array(
@@ -104,13 +175,40 @@ class SafetyConfig:
 
     def __post_init__(self):
         for attr in (
-            "arm_q_min", "arm_q_max", "arm_qvel_max",
+            "right_arm_q_min", "right_arm_q_max",
+            "left_arm_q_min", "left_arm_q_max",
+            "arm_qvel_max",
+            "torso_q_min", "torso_q_max", "torso_qvel_max",
+            "chassis_qvel_max", "chassis_dead_zone",
             "right_ee_min", "right_ee_max",
             "left_ee_min", "left_ee_max",
         ):
             v = getattr(self, attr)
             if isinstance(v, list):
                 setattr(self, attr, np.asarray(v, dtype=np.float32))
+
+        # Back-compat: legacy single-arm ``arm_q_min/max`` overrides.
+        if self.arm_q_min is not None:
+            arr = np.asarray(self.arm_q_min, dtype=np.float32).reshape(-1)[:7]
+            if arr.size == 7:
+                self.right_arm_q_min = arr.copy()
+                self.left_arm_q_min = arr.copy()
+                _logger.warning(
+                    "SafetyConfig.arm_q_min is deprecated; populated both "
+                    "right_arm_q_min and left_arm_q_min from it.  Migrate "
+                    "your YAML to use right_arm_q_min / left_arm_q_min "
+                    "(R1 Pro arms are mirrored on J2 -- see "
+                    "bt/docs/rwRL/safety_2_joinlimit_2.md §3.3).",
+                )
+        if self.arm_q_max is not None:
+            arr = np.asarray(self.arm_q_max, dtype=np.float32).reshape(-1)[:7]
+            if arr.size == 7:
+                self.right_arm_q_max = arr.copy()
+                self.left_arm_q_max = arr.copy()
+                _logger.warning(
+                    "SafetyConfig.arm_q_max is deprecated; populated both "
+                    "right_arm_q_max and left_arm_q_max from it.",
+                )
 
 
 # ────────────────────────── SafetyInfo ──────────────────────────
@@ -128,6 +226,18 @@ class SafetyInfo:
     emergency_stop: bool = False
     reason: List[str] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
+    # New in safety_2_joinlimit_2: per-joint, per-side L2 audit so
+    # analyzers can spot 'always saturated J6' style issues.  Schema:
+    #   {
+    #     "right": {"J3": {"L2a": 0.5, "L2c": "freeze"}, ...},
+    #     "left":  {"J7": {"L2b": "freeze"}},
+    #     "torso": {"T2": {"L2b": "freeze"}},
+    #     "chassis": {"vy": {"L2d": "deadzone"}, "wz": {"L2d": "cap"}},
+    #     "gripper_right": {"L2": "rate_cap"},
+    #   }
+    l2_per_joint_clip: Dict[str, Dict[str, dict]] = field(
+        default_factory=dict
+    )
 
     @property
     def hold_or_stop(self) -> bool:
@@ -193,10 +303,22 @@ class GalaxeaR1ProSafetySupervisor:
             info.reason.append("L1:clipped_to_unit_box")
         info.safe_action = clipped
 
-        # ── L2 per-joint limit ──────────────────────────────────
-        # We do not have raw qpos in the action (only deltas), so L2
-        # acts as a guard against absurdly large velocity demands.
-        # Predicted next q is checked through the EE clip + step cap.
+        # ── L2 per-joint limit (4 sub-layers + gripper) ─────────
+        # Sequence: predict-then-shrink (L2a) -> hard freeze (L2b)
+        # -> feedback velocity watchdog (L2c) -> commanded velocity
+        # cap (L2d) -> gripper position/rate cap.  Each sub-layer is
+        # individually toggleable via SafetyConfig.enable_l2*.
+        # See bt/docs/rwRL/safety_2_joinlimit_2.md §4 for rationale.
+        if self._cfg.enable_l2a_predict_q_clip:
+            self._check_l2a_predict_q_clip(info, state, action_schema)
+        if self._cfg.enable_l2b_qpos_freeze:
+            self._check_l2b_qpos_freeze(info, state, action_schema)
+        if self._cfg.enable_l2c_qvel_watchdog:
+            self._check_l2c_qvel_watchdog(info, state, action_schema)
+        if self._cfg.enable_l2d_cmd_speed_cap:
+            self._check_l2d_cmd_speed_cap(info, state, action_schema)
+        if self._cfg.enable_l2_gripper:
+            self._check_l2_gripper(info, state, action_schema)
 
         # ── L3a per-arm TCP safety box ──────────────────────────
         if action_schema.has_right_arm:
@@ -302,6 +424,482 @@ class GalaxeaR1ProSafetySupervisor:
             "hw/bms_capital_pct": bms_pct,
         }
         return info
+
+    # ── L2 sub-layer helpers ────────────────────────────────────
+
+    @staticmethod
+    def _record_per_joint_clip(
+        info: SafetyInfo,
+        side: str,
+        joint_label: str,
+        layer: str,
+        value,
+    ) -> None:
+        """Append a per-joint audit entry to ``info.l2_per_joint_clip``."""
+        side_dict = info.l2_per_joint_clip.setdefault(side, {})
+        joint_dict = side_dict.setdefault(joint_label, {})
+        joint_dict[layer] = value
+
+    def _arm_q_bounds(
+        self,
+        side: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if side == "right":
+            return self._cfg.right_arm_q_min, self._cfg.right_arm_q_max
+        return self._cfg.left_arm_q_min, self._cfg.left_arm_q_max
+
+    def _check_l2a_predict_q_clip(
+        self,
+        info: SafetyInfo,
+        state: "GalaxeaR1ProRobotState",
+        schema: "ActionSchema",
+    ) -> None:
+        """Predict next-step joint angles; if the worst joint margin
+        falls below ``warning_margin`` (or ``critical_margin``), shrink
+        the per-arm action proportionally.
+
+        In Cartesian EE control mode (the default for M1 bring-up)
+        ``schema.predict_arm_qpos`` returns the current qpos as a
+        no-op predictor, so this layer is essentially a placeholder
+        until an IK callback is plugged in.  The protection is then
+        delegated to L2b (post-hoc qpos freeze) and L2c (qvel
+        watchdog) — see safety_2_joinlimit_2.md §7.2.
+        """
+        for side in ("right", "left"):
+            if side == "right" and not schema.has_right_arm:
+                continue
+            if side == "left" and not schema.has_left_arm:
+                continue
+
+            # Skip when feedback hasn't arrived yet -- the default zero
+            # state vector lands on top of left J2's q_min (-0.07) and
+            # would make L2a fire on every first step before subscribers
+            # populate ``state.{side}_arm_qpos``.  L2b also enforces
+            # this guard for symmetry.
+            cur_q_raw = np.asarray(
+                state.get_arm_qpos(side), dtype=np.float32,
+            ).reshape(-1)
+            if cur_q_raw.size < 7 or not np.any(cur_q_raw[:7]):
+                continue
+
+            q_next = schema.predict_arm_qpos(side, info.safe_action, state)
+            if q_next is None:
+                continue
+            q_next = np.asarray(q_next, dtype=np.float32).reshape(-1)[:7]
+            if q_next.size != 7:
+                continue
+
+            q_min, q_max = self._arm_q_bounds(side)
+            margin_low = q_next - q_min
+            margin_high = q_max - q_next
+            margin = np.minimum(margin_low, margin_high)
+            worst = float(np.min(margin))
+            worst_idx = int(np.argmin(margin))
+
+            if worst < self._cfg.l2_critical_margin_rad:
+                scale = 0.0
+                tag_kind = "critical"
+            elif worst < self._cfg.l2_warning_margin_rad:
+                scale = max(
+                    0.0,
+                    worst / max(self._cfg.l2_warning_margin_rad, 1e-9),
+                )
+                tag_kind = "warning"
+            else:
+                continue  # plenty of room
+
+            info.safe_action = schema.rewrite_action_arm(
+                info.safe_action, side, scale,
+            )
+            info.clipped = True
+            info.reason.append(
+                f"L2a:{side}_q_{tag_kind} J{worst_idx + 1} "
+                f"margin={worst:+.3f}rad scale={scale:.2f}"
+            )
+            info.metrics[f"safety/l2a_{side}_scale"] = float(scale)
+            info.metrics[f"safety/l2a_{side}_worst_margin"] = float(worst)
+            self._record_per_joint_clip(
+                info, side, f"J{worst_idx + 1}", "L2a",
+                {"scale": float(scale), "margin": float(worst)},
+            )
+
+    def _check_l2b_qpos_freeze(
+        self,
+        info: SafetyInfo,
+        state: "GalaxeaR1ProRobotState",
+        schema: "ActionSchema",
+    ) -> None:
+        """If the *current* feedback qpos is already inside
+        ``critical_margin`` from any joint limit, freeze that arm
+        (or torso) for one step and raise ``soft_hold``.
+
+        This is the reactive complement to the predictive L2a: it
+        catches the case where last step's command pushed a joint
+        right up to its limit even though L2a believed margin was
+        OK (e.g. mobiman IK overshoot, mechanical play, or a
+        first-step where the policy violated its priors).
+        """
+        # Arms.
+        for side in ("right", "left"):
+            if side == "right" and not schema.has_right_arm:
+                continue
+            if side == "left" and not schema.has_left_arm:
+                continue
+
+            cur_q = np.asarray(
+                state.get_arm_qpos(side), dtype=np.float32,
+            ).reshape(-1)[:7]
+            if cur_q.size != 7:
+                continue
+            # Skip the freeze when feedback hasn't arrived yet
+            # (initial state vector is all-zeros, which would land
+            # on top of J2's limit and falsely freeze the arm).
+            if not np.any(cur_q):
+                continue
+            q_min, q_max = self._arm_q_bounds(side)
+            margin = np.minimum(cur_q - q_min, q_max - cur_q)
+
+            bad_idx = np.where(margin < self._cfg.l2_critical_margin_rad)[0]
+            if bad_idx.size > 0:
+                info.safe_action = schema.rewrite_action_arm(
+                    info.safe_action, side, 0.0,
+                )
+                info.soft_hold = True
+                joint_labels = ",".join(f"J{int(i) + 1}" for i in bad_idx)
+                info.reason.append(
+                    f"L2b:{side}_qpos_critical {joint_labels} "
+                    f"margin={float(margin[bad_idx].min()):+.3f}"
+                )
+                info.metrics[f"safety/l2b_{side}_freeze"] = 1.0
+                for i in bad_idx:
+                    self._record_per_joint_clip(
+                        info, side, f"J{int(i) + 1}", "L2b", "freeze",
+                    )
+
+        # Torso.
+        if schema.has_torso:
+            cur_t = np.asarray(
+                state.get_torso_qpos(), dtype=np.float32,
+            ).reshape(-1)[:4]
+            if cur_t.size == 4 and np.any(cur_t):
+                margin_t = np.minimum(
+                    cur_t - self._cfg.torso_q_min,
+                    self._cfg.torso_q_max - cur_t,
+                )
+                bad_t = np.where(margin_t < self._cfg.l2_critical_margin_rad)[0]
+                if bad_t.size > 0:
+                    info.safe_action = schema.rewrite_action_torso(
+                        info.safe_action, 0.0,
+                    )
+                    info.soft_hold = True
+                    tlst = ",".join(f"T{int(i) + 1}" for i in bad_t)
+                    info.reason.append(
+                        f"L2b:torso_qpos_critical {tlst} "
+                        f"margin={float(margin_t[bad_t].min()):+.3f}"
+                    )
+                    info.metrics["safety/l2b_torso_freeze"] = 1.0
+                    for i in bad_t:
+                        self._record_per_joint_clip(
+                            info, "torso", f"T{int(i) + 1}",
+                            "L2b", "freeze",
+                        )
+
+    def _check_l2c_qvel_watchdog(
+        self,
+        info: SafetyInfo,
+        state: "GalaxeaR1ProRobotState",
+        schema: "ActionSchema",
+    ) -> None:
+        """React to runaway velocity *as reported by the robot*.
+
+        Two thresholds (per the design doc):
+        - feedback |qvel| > overspeed_factor * qvel_max -> soft_hold
+        - feedback |qvel| > warning_factor   * qvel_max -> scale 0.5
+        """
+        over = float(self._cfg.l2_qvel_overspeed_factor)
+        warn = float(self._cfg.l2_qvel_warning_factor)
+
+        # Arms.
+        qvm_arm = self._cfg.arm_qvel_max
+        for side in ("right", "left"):
+            if side == "right" and not schema.has_right_arm:
+                continue
+            if side == "left" and not schema.has_left_arm:
+                continue
+            qv = np.asarray(
+                state.get_arm_qvel(side), dtype=np.float32,
+            ).reshape(-1)[:7]
+            if qv.size != 7:
+                continue
+            ratio = np.abs(qv) / np.maximum(qvm_arm, 1e-6)
+            max_ratio = float(np.max(ratio))
+            max_idx = int(np.argmax(ratio))
+            if max_ratio > over:
+                info.safe_action = schema.rewrite_action_arm(
+                    info.safe_action, side, 0.0,
+                )
+                info.soft_hold = True
+                info.reason.append(
+                    f"L2c:{side}_qvel_overspeed J{max_idx + 1} "
+                    f"max={max_ratio:.2f}x limit"
+                )
+                info.metrics[
+                    f"safety/l2c_{side}_overspeed_ratio"
+                ] = max_ratio
+                self._record_per_joint_clip(
+                    info, side, f"J{max_idx + 1}", "L2c", "freeze",
+                )
+            elif max_ratio > warn:
+                info.safe_action = schema.rewrite_action_arm(
+                    info.safe_action, side, 0.5,
+                )
+                info.clipped = True
+                info.reason.append(
+                    f"L2c:{side}_qvel_warning J{max_idx + 1} "
+                    f"max={max_ratio:.2f}x limit, scale=0.5"
+                )
+                info.metrics[
+                    f"safety/l2c_{side}_warn_ratio"
+                ] = max_ratio
+                self._record_per_joint_clip(
+                    info, side, f"J{max_idx + 1}", "L2c", "scale=0.5",
+                )
+
+        # Torso.
+        if schema.has_torso:
+            qv_t = np.asarray(
+                state.get_torso_qvel(), dtype=np.float32,
+            ).reshape(-1)[:4]
+            if qv_t.size == 4:
+                ratio_t = np.abs(qv_t) / np.maximum(
+                    self._cfg.torso_qvel_max, 1e-6,
+                )
+                if np.any(ratio_t > over):
+                    info.safe_action = schema.rewrite_action_torso(
+                        info.safe_action, 0.0,
+                    )
+                    info.soft_hold = True
+                    info.reason.append(
+                        f"L2c:torso_qvel_overspeed max={float(ratio_t.max()):.2f}x"
+                    )
+                    info.metrics["safety/l2c_torso_overspeed_ratio"] = float(
+                        ratio_t.max()
+                    )
+                elif np.any(ratio_t > warn):
+                    info.safe_action = schema.rewrite_action_torso(
+                        info.safe_action, 0.5,
+                    )
+                    info.clipped = True
+                    info.reason.append(
+                        f"L2c:torso_qvel_warning max={float(ratio_t.max()):.2f}x, scale=0.5"
+                    )
+
+        # Chassis.
+        if schema.has_chassis:
+            qv_c = np.asarray(
+                state.get_chassis_qvel(), dtype=np.float32,
+            ).reshape(-1)[:3]
+            if qv_c.size == 3:
+                ratio_c = np.abs(qv_c) / np.maximum(
+                    self._cfg.chassis_qvel_max, 1e-6,
+                )
+                if np.any(ratio_c > over):
+                    info.safe_action = schema.rewrite_action_chassis(
+                        info.safe_action, 0.0,
+                    )
+                    info.soft_hold = True
+                    info.reason.append(
+                        f"L2c:chassis_qvel_overspeed max={float(ratio_c.max()):.2f}x"
+                    )
+
+    def _check_l2d_cmd_speed_cap(
+        self,
+        info: SafetyInfo,
+        state: "GalaxeaR1ProRobotState",
+        schema: "ActionSchema",
+    ) -> None:
+        """Bound the *commanded* velocity for joint-mode arms,
+        torso (4-D twist) and chassis (3-D twist).
+
+        For Cartesian-mode arms (the default M1 path) we cannot map
+        EE deltas to joint-velocity demands without IK, so this
+        layer no-ops on the arm slice in that case (L4 already caps
+        Cartesian per-step distance).  When ``schema.use_joint_mode``
+        is True the arm slice is interpreted as a per-step joint
+        delta and capped via |delta_q| / dt <= qvel_max.
+
+        Chassis additionally honours the BRS-style dead-zone to
+        avoid command jitter triggering wheel buzz.
+        """
+        dt = max(float(self._cfg.dt_step), 1e-3)
+        d = schema.split(info.safe_action)
+
+        # Arms (joint-mode only).
+        if schema.use_joint_mode:
+            for side in ("right", "left"):
+                if side == "right" and not schema.has_right_arm:
+                    continue
+                if side == "left" and not schema.has_left_arm:
+                    continue
+                xyz = np.asarray(
+                    d.get(f"{side}_xyz", np.zeros(3)), dtype=np.float32,
+                ).reshape(-1)[:3]
+                rpy = np.asarray(
+                    d.get(f"{side}_rpy", np.zeros(3)), dtype=np.float32,
+                ).reshape(-1)[:3]
+                joint_delta6 = np.concatenate([xyz, rpy])
+                v_cmd = (
+                    joint_delta6 * float(schema.action_scale[0]) / dt
+                )
+                qvm = self._cfg.arm_qvel_max[: v_cmd.size]
+                ratio = np.abs(v_cmd) / np.maximum(qvm, 1e-6)
+                max_ratio = float(np.max(ratio)) if ratio.size else 0.0
+                if max_ratio > 1.0:
+                    scale = 1.0 / max_ratio
+                    info.safe_action = schema.rewrite_action_arm(
+                        info.safe_action, side, scale,
+                    )
+                    info.clipped = True
+                    info.reason.append(
+                        f"L2d:{side}_cmd_qvel_cap max={max_ratio:.2f}x limit, "
+                        f"scale={scale:.2f}"
+                    )
+
+        # Chassis: action *is* a velocity vector (m/s, m/s, rad/s).
+        if schema.has_chassis:
+            v_raw = np.asarray(
+                d.get("chassis_twist", np.zeros(3)), dtype=np.float32,
+            ).reshape(-1)[:3]
+            v = v_raw.copy()
+            modified = False
+            # Dead-zone (per-axis).
+            dead = np.abs(v) < self._cfg.chassis_dead_zone
+            if np.any(dead & (v != 0.0)):
+                v = np.where(dead, 0.0, v).astype(np.float32)
+                modified = True
+                self._record_per_joint_clip(
+                    info, "chassis", "deadzone",
+                    "L2d", v_raw.tolist(),
+                )
+            # Per-axis cap.
+            v_clip = np.clip(
+                v,
+                -self._cfg.chassis_qvel_max,
+                self._cfg.chassis_qvel_max,
+            )
+            if not np.array_equal(v_clip, v):
+                modified = True
+                self._record_per_joint_clip(
+                    info, "chassis", "cap",
+                    "L2d", v.tolist(),
+                )
+                v = v_clip
+            if modified:
+                info.safe_action = schema.rewrite_action_chassis_set(
+                    info.safe_action, v,
+                )
+                info.clipped = True
+                info.reason.append(
+                    f"L2d:chassis_cmd_speed_cap raw={v_raw.tolist()}"
+                )
+
+        # Torso: action is a 4-D twist (v_x, v_z, w_pitch, w_yaw),
+        # already capped by L4 in absolute units.  L2d here only
+        # adds the per-joint qvel envelope cap; symbolic units match
+        # ``torso_qvel_max[i]`` per axis.
+        if schema.has_torso:
+            v_t = np.asarray(
+                d.get("torso_twist", np.zeros(4)), dtype=np.float32,
+            ).reshape(-1)[:4]
+            ratio_t = np.abs(v_t) / np.maximum(self._cfg.torso_qvel_max, 1e-6)
+            if ratio_t.size and np.any(ratio_t > 1.0):
+                scale = 1.0 / float(ratio_t.max())
+                info.safe_action = schema.rewrite_action_torso(
+                    info.safe_action, scale,
+                )
+                info.clipped = True
+                info.reason.append(
+                    f"L2d:torso_cmd_speed_cap scale={scale:.2f}"
+                )
+
+    def _check_l2_gripper(
+        self,
+        info: SafetyInfo,
+        state: "GalaxeaR1ProRobotState",
+        schema: "ActionSchema",
+    ) -> None:
+        """Two L2 checks for each enabled gripper:
+
+        1. Per-step delta cap (``max_gripper_step_pct``):
+           |Δ pct| ≤ max_gripper_step_pct.
+        2. Position bound: predicted next pct ∈
+           [gripper_pct_min, gripper_pct_max].
+
+        Both are implemented in the predict-clip-rewrite style used
+        by L3a so that the rest of the pipeline sees a clean
+        normalised action.
+        """
+        if schema.no_gripper:
+            return
+        scale_g = max(float(schema.action_scale[2]), 1e-9)
+        max_step = float(self._cfg.max_gripper_step_pct)
+        lo = float(self._cfg.gripper_pct_min)
+        hi = float(self._cfg.gripper_pct_max)
+        for side in ("right", "left"):
+            if side == "right" and not schema.has_right_arm:
+                continue
+            if side == "left" and not schema.has_left_arm:
+                continue
+            d = schema.split(info.safe_action)
+            key = f"{side}_gripper"
+            if key not in d:
+                continue
+            a_g = float(d[key])           # already in [-1, 1] post L1
+            cur_pct = float(state.get_gripper_pos(side))
+            delta_pct = a_g * scale_g
+
+            # 1) rate cap
+            new_a = a_g
+            rate_capped = False
+            if abs(delta_pct) > max_step:
+                new_a = float(np.sign(a_g) * max_step / scale_g)
+                rate_capped = True
+
+            # 2) position bound
+            next_pct = cur_pct + new_a * scale_g
+            pos_capped = False
+            if next_pct < lo or next_pct > hi:
+                target = float(np.clip(next_pct, lo, hi))
+                new_a = float((target - cur_pct) / scale_g)
+                pos_capped = True
+
+            if rate_capped or pos_capped:
+                info.safe_action = schema.set_gripper_action(
+                    info.safe_action, side, new_a,
+                )
+                info.clipped = True
+                tag_parts = []
+                if rate_capped:
+                    tag_parts.append(
+                        f"rate_cap |Δ|={abs(delta_pct):.1f}>{max_step:.1f}%/step"
+                    )
+                if pos_capped:
+                    tag_parts.append(
+                        f"pos_cap pred={next_pct:.1f}->[{lo:.1f},{hi:.1f}]"
+                    )
+                info.reason.append(
+                    f"L2:{side}_gripper " + " ".join(tag_parts)
+                )
+                self._record_per_joint_clip(
+                    info, f"gripper_{side}", "g",
+                    "L2",
+                    {
+                        "rate_cap": rate_capped,
+                        "pos_cap": pos_capped,
+                        "raw_a": a_g,
+                        "new_a": new_a,
+                    },
+                )
 
     # ── Internal helpers ────────────────────────────────────────
 

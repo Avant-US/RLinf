@@ -157,6 +157,23 @@ class GalaxeaR1ProRobotState:
             self.right_gripper_pos if side == "right" else self.left_gripper_pos
         )
 
+    def get_gripper_vel(self, side: str) -> float:
+        return float(
+            self.right_gripper_vel if side == "right" else self.left_gripper_vel
+        )
+
+    def get_torso_qpos(self) -> np.ndarray:
+        return np.asarray(self.torso_qpos, dtype=np.float32).reshape(-1)[:4]
+
+    def get_torso_qvel(self) -> np.ndarray:
+        return np.asarray(self.torso_qvel, dtype=np.float32).reshape(-1)[:4]
+
+    def get_chassis_qpos(self) -> np.ndarray:
+        return np.asarray(self.chassis_qpos, dtype=np.float32).reshape(-1)[:3]
+
+    def get_chassis_qvel(self) -> np.ndarray:
+        return np.asarray(self.chassis_qvel, dtype=np.float32).reshape(-1)[:3]
+
     def get_state_vector(
         self,
         use_left_arm: bool = False,
