@@ -3200,7 +3200,7 @@ gantt
 
 **任务定义**:
 - gym id: `GalaxeaR1ProSingleArmReach-joint-v1`
-- 右臂从 home `[0, 0.3, 0, -1.5, 0, 1.8, 0]` 到达 target `[0.5, 0.5, 0, -1.2, 0, 1.5, 0]`
+- 右臂从 home `[0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0]` 到达 target `[0.5, 0.5, 0, -1.2, 0, 1.5, 0]`
 - 无夹爪, 无相机 (可选 dummy 像)
 - max_episode_steps = 100
 - 奖励: `r = -‖q_current - q_target‖_2` (稠密) + `+1.0 if ‖.‖ < 0.05` (稀疏)
