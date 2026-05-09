@@ -1,0 +1,110 @@
+# Env subconfig for the M1+ SingleArmReach task with joint **delta**
+# sub-mode (per design doc r1pro6op47.md §3.6).
+#
+# Task identity (gym id, init pose, target, reward) is identical to
+# the abs sub-mode YAML at
+# realworld_galaxea_r1_pro_singlearm_reach_joint.yaml -- the ONLY
+# differences are the two cfg flags:
+#   * use_joint_mode: true      (master switch -- joint vs ee, unchanged)
+#   * joint_delta_mode: true    (joint sub-mode flag -- abs vs delta)
+#   * joint_delta_scale_right:  per-joint rad/step cap
+#
+# This means the same gym task class GalaxeaR1ProSingleArmReachJointEnv
+# runs in either sub-mode just by switching this YAML; the task code
+# does not need to know which sub-mode it's in (it only reads
+# state.right_arm_qpos and computes reward from it).
+
+env_type: realworld
+
+total_num_envs: null
+auto_reset: true
+ignore_terminations: true
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 100
+max_episode_steps: 100
+
+use_spacemouse: false
+use_gello: false
+keyboard_reward_wrapper: single_stage
+no_gripper: true
+use_relative_frame: false
+use_quat2euler_wrapper: false
+main_image_key: null
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: GalaxeaR1ProSingleArmReach-joint-v1
+  num_envs: null
+  override_cfg:
+    # ─── master switches per r1pro6op47.md §3.5 ───────────────
+    use_joint_mode: true
+    joint_delta_mode: true                      # <- THIS is the only essential
+                                                #    delta-mode flag
+
+    # ─── robot identity (same as abs YAML) ────────────────────
+    use_right_arm: true
+    use_left_arm: false
+    use_torso: false
+    use_chassis: false
+    no_gripper: true
+
+    # ─── ROS2 environment ─────────────────────────────────────
+    ros_domain_id: ${oc.env:ROS_DOMAIN_ID,41}
+    ros_localhost_only: false
+    galaxea_install_path: /home/nvidia/galaxea/install
+    mobiman_launch_mode: joint
+
+    # ─── Joint mode params (shared by both sub-modes) ─────────
+    arm_q_min_right: [-4.35, -3.04, -2.26, -1.99, -2.26, -0.95, -1.47]
+    arm_q_max_right: [ 1.21,  0.07,  2.26,  0.25,  2.26,  0.95,  1.47]
+    arm_qvel_max: [3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0]
+    home_q_right: [0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0]
+    target_q_right: [0.5, 0.5, 0.0, -1.2, 0.0, 1.5, 0.0]
+    joint_tolerance_rad: 0.05
+
+    # ─── Joint DELTA sub-mode specific ────────────────────────
+    # Per-joint rad/step cap.  Choose ~ arm_qvel_max[i] * dt_step for
+    # 10 Hz step (so [3*0.1, 3*0.1, ..., 5*0.1, 5*0.1, 5*0.1] ~=
+    # [0.30, 0.30, 0.30, 0.30, 0.50, 0.50, 0.50]).  We default to a
+    # more conservative envelope below to avoid cumulative drift
+    # in chunk replay (per r1pro6op47.md §3.6.1 third defense layer).
+    joint_delta_scale_right: [0.10, 0.10, 0.10, 0.10, 0.20, 0.20, 0.20]
+
+    # ─── Gripper (unused: no_gripper=true) ────────────────────
+    gripper_min_pct: 0.0
+    gripper_max_pct: 90.0
+
+    # ─── Cameras: none for M1+ bring-up ────────────────────────
+    cameras: []
+
+    # ─── Step rate ─────────────────────────────────────────────
+    step_frequency: 10.0
+    success_hold_steps: 5
+
+    # ─── Safety (per r1pro6op47.md §6.9) ──────────────────────
+    safety_cfg:
+      operator_heartbeat_timeout_ms: 1500.0
+      bms_low_battery_threshold_pct: 20.0
+      feedback_stale_threshold_ms: 200.0
+      max_linear_step_m: 0.10
+      max_angular_step_rad: 0.30
+      enable_l2_gripper: false
+      arm_qvel_max: [3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0]
+      # In delta sub-mode the supervisor's L4 per-step cap is
+      # **redundant** -- joint_delta_scale already enforces it.
+      # Keeping it on doesn't hurt (just adds a re-check), but if
+      # you see L4 spam in metrics, set this to false:
+      # enable_l4_per_step_cap: false
+
+use_galaxea_r1_pro_joystick: false
+use_galaxea_r1_pro_vr: false
+use_galaxea_r1_pro_dual_arm_collision: false
+use_galaxea_r1_pro_action_smoother: false

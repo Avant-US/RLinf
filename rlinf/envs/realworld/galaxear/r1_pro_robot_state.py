@@ -193,20 +193,41 @@ class GalaxeaR1ProRobotState:
         use_chassis: bool = False,
         include_grippers: bool = True,
         include_ee: bool = True,
+        *,
+        gripper_closed_stroke_mm: float = 0.0,
+        gripper_open_stroke_mm: float = 100.0,
     ) -> np.ndarray:
         """Flatten subset of state into a 1-D vector.
 
         Order is deterministic: right_qpos -> right_ee -> right_gripper
         -> left_qpos -> left_ee -> left_gripper -> torso -> chassis.
+
+        Gripper scalars: ``[-1, 1]`` with ``-1`` = closed, ``+1`` = open,
+        from :meth:`get_gripper_pos_norm` ``[0, 1]`` via ``2*pos - 1``.
+        Stroke endpoints default ``0/100`` mm (legacy span).
         """
+        g_closed = float(gripper_closed_stroke_mm)
+        g_open = float(gripper_open_stroke_mm)
+        if g_open <= g_closed:
+            g_closed, g_open = 0.0, 100.0
         parts: list[np.ndarray] = []
+
+        def _gripper_obs11(side: str) -> float:
+            pos01 = self.get_gripper_pos_norm(
+                side,
+                closed_stroke_mm=g_closed,
+                open_stroke_mm=g_open,
+            )
+            return float(np.clip(2.0 * pos01 - 1.0, -1.0, 1.0))
+
         if use_right_arm:
             parts.append(self.right_arm_qpos.astype(np.float32))
             if include_ee:
                 parts.append(self.right_ee_pose.astype(np.float32))
             if include_grippers:
                 parts.append(np.array(
-                    [self.right_gripper_pos / 100.0], dtype=np.float32,
+                    [_gripper_obs11("right")],
+                    dtype=np.float32,
                 ))
         if use_left_arm:
             parts.append(self.left_arm_qpos.astype(np.float32))
@@ -214,7 +235,8 @@ class GalaxeaR1ProRobotState:
                 parts.append(self.left_ee_pose.astype(np.float32))
             if include_grippers:
                 parts.append(np.array(
-                    [self.left_gripper_pos / 100.0], dtype=np.float32,
+                    [_gripper_obs11("left")],
+                    dtype=np.float32,
                 ))
         if use_torso:
             parts.append(self.torso_qpos.astype(np.float32))

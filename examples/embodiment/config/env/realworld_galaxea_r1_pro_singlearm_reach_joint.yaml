@@ -1,0 +1,107 @@
+# Env subconfig for the Galaxea R1 Pro single-arm joint-mode reach task.
+#
+# Per design doc r1pro6op47.md §10.2 (M1 bring-up) and §3.2.  This is
+# the recommended FIRST real-robot RL task: right arm only, joint-space
+# action (8 = 7 joints + 0 gripper -- here we set no_gripper=true so
+# the action is exactly 7-D), no camera, no torso, no chassis.
+#
+# The action layout is:
+#   action[i] in [-1, 1] -> joint i absolute target (linearly mapped
+#   to [arm_q_min_right[i], arm_q_max_right[i]]).  The dispatcher
+#   publishes JointState to /motion_target/target_joint_state_arm_right.
+
+env_type: realworld
+
+total_num_envs: null
+auto_reset: true
+ignore_terminations: true
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 100
+max_episode_steps: 100
+
+# Disable Franka-style intervention wrappers; they don't apply to
+# Galaxea joint-mode and would only confuse the action layout.
+use_spacemouse: false
+use_gello: false
+keyboard_reward_wrapper: single_stage
+no_gripper: true
+use_relative_frame: false
+use_quat2euler_wrapper: false
+main_image_key: null   # proprio-only task
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: GalaxeaR1ProSingleArmReach-joint-v1
+  num_envs: null
+  override_cfg:
+    # ─────────── Master switch (r1pro6op47.md §3.5) ───────────
+    use_joint_mode: true
+
+    # ─────────── Robot identity ────────────────────────────────
+    use_right_arm: true
+    use_left_arm: false
+    use_torso: false
+    use_chassis: false
+    no_gripper: true
+
+    # ─────────── ROS 2 environment (read from shell) ────────────
+    # Per r1pro6op47.md §1.2 #10: ROS_DOMAIN_ID is read from the
+    # shell instead of being hard-coded.  At Galaxea's site this is
+    # typically 41; legacy code default 72 is wrong.
+    ros_domain_id: ${oc.env:ROS_DOMAIN_ID,41}
+    ros_localhost_only: false
+    galaxea_install_path: /home/nvidia/galaxea/install
+    mobiman_launch_mode: joint
+
+    # ─────────── Joint mode params ──────────────────────────────
+    # Per-arm 7-D joint position bounds in radians.  Defaults below
+    # match SafetyConfig.right_arm_q_min/max (URDF - 0.1 rad margin),
+    # but you may tighten further for bring-up.  Setting these here
+    # lets JointStateDispatcher use them directly without parsing URDF.
+    arm_q_min_right: [-4.35, -3.04, -2.26, -1.99, -2.26, -0.95, -1.47]
+    arm_q_max_right: [ 1.21,  0.07,  2.26,  0.25,  2.26,  0.95,  1.47]
+    # Per-axis maximum velocity (rad/s) written to JointState.velocity
+    # for mobiman joint_tracker.  Galaxea-recommended envelope.
+    arm_qvel_max: [3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0]
+    # Safe initial joint angles published by reset_to_safe_pose().
+    home_q_right: [0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0]
+    # Task target joint angles (M1 reach goal).
+    target_q_right: [0.5, 0.5, 0.0, -1.2, 0.0, 1.5, 0.0]
+    joint_tolerance_rad: 0.05
+
+    # ─────────── Gripper (irrelevant when no_gripper=true) ──────
+    gripper_min_pct: 0.0
+    gripper_max_pct: 90.0   # configurable per r1pro6op47.md §3.4
+
+    # ─────────── Cameras: none for M1 bring-up ──────────────────
+    cameras: []
+
+    # ─────────── Step rate ──────────────────────────────────────
+    step_frequency: 10.0    # Hz; matched to Pi0.5 chunk replay rate
+    success_hold_steps: 5
+
+    # ─────────── Safety (r1pro6op47.md §6) ──────────────────────
+    safety_cfg:
+      # Heartbeat: env.step() now calls safety.heartbeat() at every
+      # step (per §6.5), so timeout doesn't need to be huge.
+      operator_heartbeat_timeout_ms: 1500.0
+      bms_low_battery_threshold_pct: 20.0
+      feedback_stale_threshold_ms: 200.0
+      max_linear_step_m: 0.10
+      max_angular_step_rad: 0.30
+      enable_l2_gripper: false   # no gripper -> disable to skip noise
+      arm_qvel_max: [3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0]
+
+# Galaxea-specific intervention switches (off by default).
+use_galaxea_r1_pro_joystick: false
+use_galaxea_r1_pro_vr: false
+use_galaxea_r1_pro_dual_arm_collision: false
+use_galaxea_r1_pro_action_smoother: false

@@ -14,15 +14,19 @@
 
 """Galaxea R1 Pro task registrations.
 
-Importing this package registers six Gym environments via
+Importing this package registers eight Gym environments via
 :func:`gymnasium.envs.registration.register`:
 
-* ``GalaxeaR1ProSingleArmReach-v1`` (M1 bring-up, full)
-* ``GalaxeaR1ProPickPlace-v1`` (M1 main, full)
-* ``GalaxeaR1ProDualArmHandover-v1`` (M2, skeleton)
-* ``GalaxeaR1ProDualArmCapTighten-v1`` (M2 alt, skeleton)
-* ``GalaxeaR1ProWholeBodyCleanup-v1`` (M3, skeleton)
-* ``GalaxeaR1ProMobileManipulation-v1`` (M4, skeleton)
+* ``GalaxeaR1ProSingleArmReach-v1`` (M1 bring-up, full -- legacy ee-RPY)
+* ``GalaxeaR1ProSingleArmReach-joint-v1`` (M1 main, joint mode --
+  per r1pro6op47.md §10.2; the recommended first real-robot task)
+* ``GalaxeaR1ProSingleArmReach-ee-v1`` (M2, ee+quat mode --
+  per r1pro6op47.md §10.3)
+* ``GalaxeaR1ProPickPlace-v1`` (M3, full)
+* ``GalaxeaR1ProDualArmHandover-v1`` (M4, skeleton)
+* ``GalaxeaR1ProDualArmCapTighten-v1`` (M4 alt, skeleton)
+* ``GalaxeaR1ProWholeBodyCleanup-v1`` (M5, skeleton)
+* ``GalaxeaR1ProMobileManipulation-v1`` (M5, skeleton)
 """
 
 from gymnasium.envs.registration import register
@@ -32,6 +36,8 @@ from .r1_pro_dual_arm_handover import GalaxeaR1ProDualArmHandoverEnv
 from .r1_pro_mobile_manipulation import GalaxeaR1ProMobileManipulationEnv
 from .r1_pro_pick_place import GalaxeaR1ProPickPlaceEnv
 from .r1_pro_single_arm_reach import GalaxeaR1ProSingleArmReachEnv
+from .r1_pro_single_arm_reach_ee import GalaxeaR1ProSingleArmReachEeEnv
+from .r1_pro_single_arm_reach_joint import GalaxeaR1ProSingleArmReachJointEnv
 from .r1_pro_whole_body_cleanup import GalaxeaR1ProWholeBodyCleanupEnv
 
 _TASKS = (
@@ -39,6 +45,16 @@ _TASKS = (
         "GalaxeaR1ProSingleArmReach-v1",
         "rlinf.envs.realworld.galaxear.tasks.r1_pro_single_arm_reach"
         ":GalaxeaR1ProSingleArmReachEnv",
+    ),
+    (
+        "GalaxeaR1ProSingleArmReach-joint-v1",
+        "rlinf.envs.realworld.galaxear.tasks.r1_pro_single_arm_reach_joint"
+        ":GalaxeaR1ProSingleArmReachJointEnv",
+    ),
+    (
+        "GalaxeaR1ProSingleArmReach-ee-v1",
+        "rlinf.envs.realworld.galaxear.tasks.r1_pro_single_arm_reach_ee"
+        ":GalaxeaR1ProSingleArmReachEeEnv",
     ),
     (
         "GalaxeaR1ProPickPlace-v1",
@@ -82,6 +98,8 @@ _register_all()
 
 __all__ = [
     "GalaxeaR1ProSingleArmReachEnv",
+    "GalaxeaR1ProSingleArmReachJointEnv",
+    "GalaxeaR1ProSingleArmReachEeEnv",
     "GalaxeaR1ProPickPlaceEnv",
     "GalaxeaR1ProDualArmHandoverEnv",
     "GalaxeaR1ProDualArmCapTightenEnv",

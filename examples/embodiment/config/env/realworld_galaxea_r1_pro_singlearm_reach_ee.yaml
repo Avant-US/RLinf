@@ -1,0 +1,85 @@
+# Env subconfig for the Galaxea R1 Pro single-arm EE+quat reach task.
+#
+# Per design doc r1pro6op47.md §10.3 (M2 task) and §3.3.  This is the
+# follow-up to M1 (joint mode).  Action layout: 3 xyz + 4 quat (+ 0
+# gripper here, since no_gripper=true).  ROS 2 publishes
+# PoseStamped to /motion_target/target_pose_arm_right; depends on
+# mobiman relaxed_ik being launched on Orin.
+
+env_type: realworld
+
+total_num_envs: null
+auto_reset: true
+ignore_terminations: true
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 100
+max_episode_steps: 100
+
+use_spacemouse: false
+use_gello: false
+keyboard_reward_wrapper: single_stage
+no_gripper: true
+use_relative_frame: false
+use_quat2euler_wrapper: false
+main_image_key: null
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: GalaxeaR1ProSingleArmReach-ee-v1
+  num_envs: null
+  override_cfg:
+    use_joint_mode: false
+    use_new_dispatcher: true     # opt into the EE+quat dispatcher path
+    use_right_arm: true
+    use_left_arm: false
+    use_torso: false
+    use_chassis: false
+    no_gripper: true
+
+    ros_domain_id: ${oc.env:ROS_DOMAIN_ID,41}
+    ros_localhost_only: false
+    galaxea_install_path: /home/nvidia/galaxea/install
+    mobiman_launch_mode: pose
+
+    # Per-arm xyz workspace box (m) in torso_link4 frame.  These are
+    # the same defaults as SafetyConfig.right_ee_min/max[:3] but
+    # made explicit here so the dispatcher uses them directly.
+    ee_min_right: [0.20, -0.40, 0.10]
+    ee_max_right: [0.70,  0.40, 0.80]
+    # Safe initial pose published by reset_to_safe_pose() (xyz + quat).
+    home_pose_right: [0.40, 0.0, 0.50, 0.0, 0.0, 0.0, 1.0]
+    # Task target (M2 reach goal).
+    target_pose_right: [0.45, -0.10, 0.30, 0.0, 0.0, 0.0, 1.0]
+    xyz_tolerance_m: 0.03
+    quat_dot_threshold: 0.95
+
+    gripper_min_pct: 0.0
+    gripper_max_pct: 90.0
+
+    cameras: []
+
+    step_frequency: 10.0
+    success_hold_steps: 5
+
+    safety_cfg:
+      operator_heartbeat_timeout_ms: 1500.0
+      bms_low_battery_threshold_pct: 20.0
+      feedback_stale_threshold_ms: 200.0
+      max_linear_step_m: 0.05
+      max_angular_step_rad: 0.20
+      right_ee_min: [0.20, -0.40, 0.10, -3.20, -0.30, -0.30]
+      right_ee_max: [0.70,  0.40, 0.80,  3.20,  0.30,  0.30]
+      enable_l2_gripper: false
+
+use_galaxea_r1_pro_joystick: false
+use_galaxea_r1_pro_vr: false
+use_galaxea_r1_pro_dual_arm_collision: false
+use_galaxea_r1_pro_action_smoother: false

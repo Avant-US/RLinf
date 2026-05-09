@@ -44,14 +44,15 @@ from rlinf.envs.realworld.galaxear.r1_pro_safety import (
     SafetyConfig,
 )
 
-
 # ─────────────────────── Helpers / fixtures ────────────────────
 
 
 def _schema_single():
     return ActionSchema(
-        has_left_arm=False, has_right_arm=True,
-        has_torso=False, has_chassis=False,
+        has_left_arm=False,
+        has_right_arm=True,
+        has_torso=False,
+        has_chassis=False,
         no_gripper=False,
         action_scale=np.array([0.05, 0.10, 1.0], dtype=np.float32),
     )
@@ -59,8 +60,10 @@ def _schema_single():
 
 def _schema_dual():
     return ActionSchema(
-        has_left_arm=True, has_right_arm=True,
-        has_torso=False, has_chassis=False,
+        has_left_arm=True,
+        has_right_arm=True,
+        has_torso=False,
+        has_chassis=False,
         no_gripper=False,
         action_scale=np.array([0.05, 0.10, 1.0], dtype=np.float32),
     )
@@ -69,8 +72,10 @@ def _schema_dual():
 def _schema_full():
     """Right arm + torso + chassis (no left arm to keep dim small)."""
     return ActionSchema(
-        has_left_arm=False, has_right_arm=True,
-        has_torso=True, has_chassis=True,
+        has_left_arm=False,
+        has_right_arm=True,
+        has_torso=True,
+        has_chassis=True,
         no_gripper=False,
         action_scale=np.array([0.05, 0.10, 1.0], dtype=np.float32),
     )
@@ -85,10 +90,8 @@ def _strict_l2_only_cfg() -> SafetyConfig:
     """
     cfg = SafetyConfig()
     # Loosen L3a so it never clips in these tests.
-    cfg.right_ee_min = np.array([-100, -100, -100, -100, -100, -100],
-                                dtype=np.float32)
-    cfg.right_ee_max = np.array([100, 100, 100, 100, 100, 100],
-                                dtype=np.float32)
+    cfg.right_ee_min = np.array([-100, -100, -100, -100, -100, -100], dtype=np.float32)
+    cfg.right_ee_max = np.array([100, 100, 100, 100, 100, 100], dtype=np.float32)
     cfg.left_ee_min = cfg.right_ee_min.copy()
     cfg.left_ee_max = cfg.right_ee_max.copy()
     # Disable L3b.
@@ -108,6 +111,16 @@ def _strict_l2_only_cfg() -> SafetyConfig:
     cfg.feedback_stale_threshold_ms = 1e9
     cfg.operator_heartbeat_timeout_ms = 1e9
     cfg.a2_fall_risk_pct = -1.0
+    # Disable L2 gripper rate cap.  L2c / L2a / L2b / L2d arm tests
+    # in this file deliberately use gripper action 1.0 to assert that
+    # the gripper slice is untouched by arm-side rewrites; without
+    # disabling L2 gripper, the gripper rate cap (max_gripper_step=0.3)
+    # would fire and rewrite the gripper dim from 1.0 down to 0.3,
+    # producing false-positive failures unrelated to the layer
+    # under test.  Each L2 sub-layer has its own dedicated test file
+    # in any case, so we keep the L2 gripper layer testable
+    # elsewhere -- here we just need to isolate.
+    cfg.enable_l2_gripper = False
     return cfg
 
 
@@ -127,10 +140,8 @@ def _state_with_qpos(
     st = GalaxeaR1ProRobotState()
     # Identity orientation EE so L3a never falsely trips even when
     # someone forgets to grow the box.
-    st.right_ee_pose = np.array([0.4, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0],
-                                dtype=np.float32)
-    st.left_ee_pose = np.array([0.4, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
-                               dtype=np.float32)
+    st.right_ee_pose = np.array([0.4, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    st.left_ee_pose = np.array([0.4, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
     if right_qpos is not None:
         st.right_arm_qpos = np.asarray(right_qpos, dtype=np.float32)
     if right_qvel is not None:
@@ -154,6 +165,7 @@ def _state_with_qpos(
 
 
 # 1. URDF cross-check ----------------------------------------------
+
 
 def _find_urdf() -> str | None:
     candidates = [
@@ -182,8 +194,9 @@ def test_l2_defaults_match_urdf_with_margin():
         if j.get("type") != "revolute":
             continue
         name = j.get("name", "")
-        if not (name.startswith("left_arm_joint")
-                or name.startswith("right_arm_joint")):
+        if not (
+            name.startswith("left_arm_joint") or name.startswith("right_arm_joint")
+        ):
             continue
         lim = j.find("limit")
         if lim is None:
@@ -225,6 +238,7 @@ def test_l2_defaults_match_urdf_with_margin():
 
 # 2. Left/right J2 mirror -------------------------------------------
 
+
 def test_l2_left_right_j2_are_mirrored():
     """R1 Pro arms are mechanically mirrored on J2 only -- the
     SafetyConfig defaults must reflect that."""
@@ -242,6 +256,7 @@ def test_l2_left_right_j2_are_mirrored():
 
 # 3. L2a warning_margin -> linear shrink -----------------------------
 
+
 def test_l2a_warning_margin_triggers_proportional_scale():
     """When predicted q is inside warning_margin (but outside critical),
     L2a should scale the per-arm action proportionally to
@@ -257,8 +272,7 @@ def test_l2a_warning_margin_triggers_proportional_scale():
     # Place J6 at +0.85 rad (q_max=0.95, so margin=0.10).  An action
     # +1 with action_scale[0]=0.05 will move J6 to 0.90 -> margin
     # 0.05 (right at critical).  Pick J3 instead, plenty of room.
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.85, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.85, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q)
     # action[5] (J6) = +1 -> delta = +0.05 -> q_next J6 = 0.90.
     a = np.zeros(7, dtype=np.float32)
@@ -278,12 +292,11 @@ def test_l2a_warning_margin_triggers_proportional_scale():
     # delta (J6) = a[5] * action_scale[0] = 0.05 -> q_next J6 = 0.85,
     # margin = q_max(0.95) - 0.85 = 0.10 -> scale = 0.10/0.20 = 0.5.
     expected_scale = 0.5
-    assert info.safe_action[5] == pytest.approx(
-        a[5] * expected_scale, abs=1e-5
-    )
+    assert info.safe_action[5] == pytest.approx(a[5] * expected_scale, abs=1e-5)
 
 
 # 4. L2a critical_margin -> scale zero -------------------------------
+
 
 def test_l2a_critical_margin_freezes_arm_slice():
     """When predicted q falls inside critical_margin, L2a forces
@@ -296,8 +309,7 @@ def test_l2a_critical_margin_freezes_arm_slice():
     schema.use_joint_mode = True
     # Start J6 at +0.93 rad (q_max=0.95) so even a +0.01 motion
     # crosses critical.
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.93, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.93, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q)
     a = np.zeros(7, dtype=np.float32)
     a[5] = 1.0
@@ -310,6 +322,7 @@ def test_l2a_critical_margin_freezes_arm_slice():
 
 # 5. L2a Cartesian mode is a no-op ----------------------------------
 
+
 def test_l2a_cartesian_mode_is_no_op_when_far_from_limits():
     """In Cartesian (default) mode, predict_arm_qpos returns the
     current qpos.  L2a must therefore not fire when the current
@@ -317,8 +330,7 @@ def test_l2a_cartesian_mode_is_no_op_when_far_from_limits():
     cfg = _strict_l2_only_cfg()
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     schema = _schema_single()  # default: use_joint_mode=False
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q)
     a = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
     info = sup.validate(a.copy(), state, schema)
@@ -329,14 +341,14 @@ def test_l2a_cartesian_mode_is_no_op_when_far_from_limits():
 
 # 6. L2b qpos already inside critical -> soft_hold -------------------
 
+
 def test_l2b_qpos_already_critical_triggers_soft_hold_and_zero():
     cfg = _strict_l2_only_cfg()
     cfg.l2_critical_margin_rad = 0.05
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     schema = _schema_single()
     # J6 at +0.93 (margin to q_max=0.95 is 0.02 < 0.05 critical).
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.93, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.93, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q)
     a = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5], dtype=np.float32)
     info = sup.validate(a.copy(), state, schema)
@@ -351,13 +363,13 @@ def test_l2b_qpos_already_critical_triggers_soft_hold_and_zero():
 
 # 7. L2c qvel warning -> scale 0.5 -----------------------------------
 
+
 def test_l2c_qvel_warning_scales_action_half():
     cfg = _strict_l2_only_cfg()
     cfg.l2_qvel_warning_factor = 0.90
     cfg.l2_qvel_overspeed_factor = 1.20
     # Pick non-zero qpos so L2b doesn't fire.
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     # J5 qvel = 3.8 rad/s, limit = 4.0 -> ratio = 0.95 > 0.90.
     qvel = np.array([0.0, 0.0, 0.0, 0.0, 3.8, 0.0, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q, right_qvel=qvel)
@@ -375,12 +387,12 @@ def test_l2c_qvel_warning_scales_action_half():
 
 # 8. L2c qvel overspeed -> soft_hold ---------------------------------
 
+
 def test_l2c_qvel_overspeed_triggers_soft_hold():
     cfg = _strict_l2_only_cfg()
     cfg.l2_qvel_warning_factor = 0.90
     cfg.l2_qvel_overspeed_factor = 1.20
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     # J5 qvel = 5.0 rad/s, limit = 4.0 -> ratio = 1.25 > 1.20.
     qvel = np.array([0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q, right_qvel=qvel)
@@ -396,6 +408,7 @@ def test_l2c_qvel_overspeed_triggers_soft_hold():
 
 # 9. L2d chassis dead-zone ------------------------------------------
 
+
 def test_l2d_chassis_dead_zone_zeros_small_cmd():
     cfg = _strict_l2_only_cfg()
     cfg.chassis_dead_zone = np.array([0.05, 0.05, 0.05], dtype=np.float32)
@@ -408,8 +421,7 @@ def test_l2d_chassis_dead_zone_zeros_small_cmd():
     a[11] = 0.02
     a[12] = 0.5
     a[13] = 0.001
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q)
     info = sup.validate(a.copy(), state, schema)
     assert info.clipped is True
@@ -422,20 +434,18 @@ def test_l2d_chassis_dead_zone_zeros_small_cmd():
 
 # 10. L2d chassis cap on per-axis maximum ---------------------------
 
+
 def test_l2d_chassis_cap_clips_to_qvel_max():
     cfg = _strict_l2_only_cfg()
-    cfg.chassis_dead_zone = np.array([0.001, 0.001, 0.001],
-                                     dtype=np.float32)
-    cfg.chassis_qvel_max = np.array([0.30, 0.30, 0.40],
-                                    dtype=np.float32)
+    cfg.chassis_dead_zone = np.array([0.001, 0.001, 0.001], dtype=np.float32)
+    cfg.chassis_qvel_max = np.array([0.30, 0.30, 0.40], dtype=np.float32)
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     schema = _schema_full()
     a = np.zeros(14, dtype=np.float32)
     # Demand vx=1.0 (cap to 0.30) and wz=-1.0 (cap to -0.40).
     a[11] = 1.0
     a[13] = -1.0
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q)
     info = sup.validate(a.copy(), state, schema)
     assert info.clipped is True
@@ -446,6 +456,7 @@ def test_l2d_chassis_cap_clips_to_qvel_max():
 
 # 11. Gripper position clamp ----------------------------------------
 
+
 def test_l2_gripper_position_clamp_caps_to_max():
     """Use an action_scale[2]=50 so that the mm-flavoured heuristic
     triggers (50 > 5 -> scale_norm = 50/100 = 0.5).  A normalised
@@ -454,6 +465,9 @@ def test_l2_gripper_position_clamp_caps_to_max():
     position.  L1 will not clip a=1.0, so the L2 gripper layer can
     see the full request and rewrite it back via predict-clip-rewrite."""
     cfg = _strict_l2_only_cfg()
+    # Re-enable the L2 gripper layer (the helper disables it by default
+    # so non-gripper L2 tests can use unrestricted gripper actions).
+    cfg.enable_l2_gripper = True
     cfg.gripper_pos_min = 0.0
     cfg.gripper_pos_max = 1.0
     cfg.max_gripper_step = 1e6  # disable rate cap for this test
@@ -463,14 +477,15 @@ def test_l2_gripper_position_clamp_caps_to_max():
     # which is the natural range for the L2 gripper layer's predict-
     # clip-rewrite contract.)
     schema = ActionSchema(
-        has_left_arm=False, has_right_arm=True,
-        has_torso=False, has_chassis=False,
+        has_left_arm=False,
+        has_right_arm=True,
+        has_torso=False,
+        has_chassis=False,
         no_gripper=False,
         action_scale=np.array([0.05, 0.10, 50.0], dtype=np.float32),
     )
 
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     # Gripper at 95.0 mm -> cur_pos_norm = 0.95.  Heuristic: scale=50
     # > 5 -> scale_norm = 50/100 = 0.5.  a=1.0 -> delta_pos = 0.5.
     # Predicted next = 0.95+0.5 = 1.45 -> cap to 1.0 -> new_delta = 0.05
@@ -480,41 +495,44 @@ def test_l2_gripper_position_clamp_caps_to_max():
     a[6] = 1.0
     info = sup.validate(a.copy(), state, schema)
     assert info.clipped is True
-    assert any("L2:right_gripper" in r and "pos_cap" in r
-               for r in info.reason)
+    assert any("L2:right_gripper" in r and "pos_cap" in r for r in info.reason)
     assert info.safe_action[6] == pytest.approx(0.1, abs=1e-5)
 
 
 # 12. Gripper rate-limit --------------------------------------------
 
+
 def test_l2_gripper_rate_limit_caps_step():
     cfg = _strict_l2_only_cfg()
+    # Re-enable the L2 gripper layer (the helper disables it by default).
+    cfg.enable_l2_gripper = True
     cfg.gripper_pos_min = 0.0
     cfg.gripper_pos_max = 1.0
     cfg.max_gripper_step = 0.10
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     schema = ActionSchema(
-        has_left_arm=False, has_right_arm=True,
-        has_torso=False, has_chassis=False,
+        has_left_arm=False,
+        has_right_arm=True,
+        has_torso=False,
+        has_chassis=False,
         no_gripper=False,
         action_scale=np.array([0.05, 0.10, 50.0], dtype=np.float32),
     )
 
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q, right_gripper_pos=20.0)
     # a[6]=1.0, scale_norm=0.5 -> delta_pos=0.5 (above cap=0.10).
     a = np.zeros(7, dtype=np.float32)
     a[6] = 1.0
     info = sup.validate(a.copy(), state, schema)
     assert info.clipped is True
-    assert any("L2:right_gripper" in r and "rate_cap" in r
-               for r in info.reason)
+    assert any("L2:right_gripper" in r and "rate_cap" in r for r in info.reason)
     # Capped to max_step=0.10 -> new_a = 0.10 / 0.50 = 0.2.
     assert info.safe_action[6] == pytest.approx(0.2, abs=1e-5)
 
 
 # 13. Back-compat: legacy `arm_q_min/max` in YAML ---------------------
+
 
 def test_back_compat_legacy_arm_q_min_max_aliases():
     """Old YAML configs that pass ``arm_q_min`` / ``arm_q_max`` should
@@ -534,14 +552,14 @@ def test_back_compat_legacy_arm_q_min_max_aliases():
 
 # 14. SafetyInfo.l2_per_joint_clip is populated --------------------
 
+
 def test_safety_info_l2_per_joint_clip_audit_field():
     cfg = _strict_l2_only_cfg()
     cfg.l2_critical_margin_rad = 0.05
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     schema = _schema_single()
     # J6 at the limit -> L2b should fire.
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.93, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.93, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q)
     a = np.zeros(7, dtype=np.float32)
     info = sup.validate(a.copy(), state, schema)
@@ -553,6 +571,7 @@ def test_safety_info_l2_per_joint_clip_audit_field():
 
 # 15. Per-arm independence: only the violating arm is rewritten ----
 
+
 def test_l2a_dual_arm_only_violating_arm_is_scaled():
     cfg = _strict_l2_only_cfg()
     cfg.l2_warning_margin_rad = 0.20
@@ -561,16 +580,14 @@ def test_l2a_dual_arm_only_violating_arm_is_scaled():
     schema = _schema_dual()
     schema.use_joint_mode = True
     # Right arm J6 close to limit (will trigger L2a warning).
-    right_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.80, 0.0],
-                       dtype=np.float32)
+    right_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.80, 0.0], dtype=np.float32)
     # Left arm well inside limits.
-    left_q = np.array([0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0],
-                      dtype=np.float32)
+    left_q = np.array([0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=right_q, left_qpos=left_q)
     # Action layout (dual arm): right(7) + left(7) = 14.
     a = np.zeros(14, dtype=np.float32)
-    a[5] = 1.0   # right J6 +1
-    a[5 + 7] = 1.0   # left J6 +1
+    a[5] = 1.0  # right J6 +1
+    a[5 + 7] = 1.0  # left J6 +1
     info = sup.validate(a.copy(), state, schema)
     # right scaled by 0.5 (margin 0.10 / warning 0.20).
     assert info.safe_action[5] == pytest.approx(0.5, abs=1e-5)
@@ -582,6 +599,7 @@ def test_l2a_dual_arm_only_violating_arm_is_scaled():
 
 # 16. Toggles disable the corresponding sub-layer -------------------
 
+
 def test_l2_toggles_disable_sublayers():
     cfg = _strict_l2_only_cfg()
     cfg.enable_l2a_predict_q_clip = False
@@ -592,10 +610,8 @@ def test_l2_toggles_disable_sublayers():
     sup = GalaxeaR1ProSafetySupervisor(cfg)
     schema = _schema_single()
     # A pose that *would* trigger L2b otherwise.
-    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.93, 0.0],
-                     dtype=np.float32)
+    cur_q = np.array([0.0, -0.5, 0.0, -1.0, 0.0, 0.93, 0.0], dtype=np.float32)
     state = _state_with_qpos(right_qpos=cur_q, right_gripper_pos=99.0)
-    a = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0],
-                 dtype=np.float32)
+    a = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0], dtype=np.float32)
     info = sup.validate(a.copy(), state, schema)
     assert not any(r.startswith("L2") for r in info.reason)

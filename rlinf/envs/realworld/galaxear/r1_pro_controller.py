@@ -209,8 +209,12 @@ class GalaxeaR1ProController(Worker):
         self._executor.add_node(self._node)
 
     def _init_publishers(self) -> None:
-        from geometry_msgs.msg import PoseStamped, Twist, TwistStamped  # type: ignore
-        from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy  # type: ignore
+        from geometry_msgs.msg import PoseStamped, TwistStamped  # type: ignore
+        from rclpy.qos import (  # type: ignore
+            HistoryPolicy,
+            QoSProfile,
+            ReliabilityPolicy,
+        )
         from sensor_msgs.msg import JointState  # type: ignore
         from std_msgs.msg import Bool  # type: ignore
 
@@ -228,16 +232,16 @@ class GalaxeaR1ProController(Worker):
             )
             self._pubs["target_joint_state_arm_right"] = (
                 self._node.create_publisher(
-                    JointState,
-                    "/motion_target/target_joint_state_arm_right",
-                    reliable,
-                )
+                JointState,
+                "/motion_target/target_joint_state_arm_right",
+                reliable,
+            )
             )
             self._pubs["target_position_gripper_right"] = (
                 self._node.create_publisher(
-                    JointState,
-                    "/motion_target/target_position_gripper_right",
-                    reliable,
+                JointState,
+                "/motion_target/target_position_gripper_right",
+                reliable,
                 )
             )
         if self._use_left_arm:
@@ -248,16 +252,16 @@ class GalaxeaR1ProController(Worker):
             )
             self._pubs["target_joint_state_arm_left"] = (
                 self._node.create_publisher(
-                    JointState,
-                    "/motion_target/target_joint_state_arm_left",
-                    reliable,
-                )
+                JointState,
+                "/motion_target/target_joint_state_arm_left",
+                reliable,
+            )
             )
             self._pubs["target_position_gripper_left"] = (
                 self._node.create_publisher(
-                    JointState,
-                    "/motion_target/target_position_gripper_left",
-                    reliable,
+                JointState,
+                "/motion_target/target_position_gripper_left",
+                reliable,
                 )
             )
         if self._use_torso:
@@ -267,23 +271,30 @@ class GalaxeaR1ProController(Worker):
                 reliable,
             )
         if self._use_chassis:
+            # Per design doc r1pro6op47.md §4.2 #1, mobiman scripts under
+            # /home/nvidia/galaxea/install use TwistStamped for chassis
+            # commands even though the English doc table writes Twist.
+            # We follow the SDK reality.
             self._pubs["target_speed_chassis"] = self._node.create_publisher(
-                Twist,
+                TwistStamped,
                 "/motion_target/target_speed_chassis",
                 reliable,
             )
             self._pubs["chassis_acc_limit"] = self._node.create_publisher(
-                Twist,
+                TwistStamped,
                 "/motion_target/chassis_acc_limit",
                 reliable,
             )
-            self._pubs["brake_mode"] = self._node.create_publisher(
-                Bool,
-                "/motion_target/brake_mode",
-                reliable,
-            )
+        # brake_mode is always available regardless of chassis flag, since
+        # SafetySupervisor uses it to halt arm motion too.
+        self._pubs["brake_mode"] = self._node.create_publisher(
+            Bool,
+            "/motion_target/brake_mode",
+            reliable,
+        )
 
     def _init_subscribers(self) -> None:
+        from geometry_msgs.msg import PoseStamped  # type: ignore
         from rclpy.callback_groups import (  # type: ignore
             MutuallyExclusiveCallbackGroup,
         )
@@ -306,6 +317,19 @@ class GalaxeaR1ProController(Worker):
                 qos_profile_sensor_data,
                 callback_group=cb_state,
             ))
+            # NEW (r1pro6op47.md §3.3.4): subscribe EE pose feedback so
+            # state.right_ee_pose stops being all-zeros.  Without this
+            # subscription L3a (workspace box) clips against an invalid
+            # origin and ee-mode dispatch silently fails.
+            self._subs.append(
+                self._node.create_subscription(
+                    PoseStamped,
+                    "/motion_control/pose_ee_arm_right",
+                    self._on_pose_ee_right,
+                    qos_profile_sensor_data,
+                    callback_group=cb_state,
+                )
+            )
         if self._use_left_arm:
             self._subs.append(self._node.create_subscription(
                 JointState, "/hdas/feedback_arm_left",
@@ -319,67 +343,84 @@ class GalaxeaR1ProController(Worker):
                 qos_profile_sensor_data,
                 callback_group=cb_state,
             ))
+            self._subs.append(
+                self._node.create_subscription(
+                    PoseStamped,
+                    "/motion_control/pose_ee_arm_left",
+                    self._on_pose_ee_left,
+                    qos_profile_sensor_data,
+                    callback_group=cb_state,
+                )
+            )
         if self._use_torso:
             self._subs.append(self._node.create_subscription(
                 JointState, "/hdas/feedback_torso",
-                self._on_torso_feedback,
-                qos_profile_sensor_data,
-                callback_group=cb_state,
+                    self._on_torso_feedback,
+                    qos_profile_sensor_data,
+                    callback_group=cb_state,
             ))
         if self._use_chassis:
             self._subs.append(self._node.create_subscription(
                 JointState, "/hdas/feedback_chassis",
-                self._on_chassis_feedback,
-                qos_profile_sensor_data,
-                callback_group=cb_state,
+                    self._on_chassis_feedback,
+                    qos_profile_sensor_data,
+                    callback_group=cb_state,
             ))
         # IMU (best-effort)
         self._subs.append(self._node.create_subscription(
             Imu, "/hdas/imu_torso",
-            lambda msg: self._on_imu(msg, "torso"),
-            qos_profile_sensor_data,
-            callback_group=cb_state,
+                lambda msg: self._on_imu(msg, "torso"),
+                qos_profile_sensor_data,
+                callback_group=cb_state,
         ))
         self._subs.append(self._node.create_subscription(
             Imu, "/hdas/imu_chassis",
-            lambda msg: self._on_imu(msg, "chassis"),
-            qos_profile_sensor_data,
-            callback_group=cb_state,
+                lambda msg: self._on_imu(msg, "chassis"),
+                qos_profile_sensor_data,
+                callback_group=cb_state,
         ))
 
         # Optional: Galaxea custom messages (graceful fallback when
         # `hdas_msg` is not available on the controller node).
+        # Per r1pro6op47.md §6.2 / mismatch_realworld_1.md, the IDL
+        # generator produces PascalCase class names for Bms.msg /
+        # ControllerSignalStamped.msg / FeedbackStatus.msg; using
+        # snake_case (`bms`) silently ImportError'd and disabled L5.
         try:
             from hdas_msg.msg import (  # type: ignore[import]
-                bms as BmsMsg,
+                Bms as BmsMsg,
+            )
+            from hdas_msg.msg import (
                 ControllerSignalStamped as ControllerSignalMsg,
+            )
+            from hdas_msg.msg import (
                 FeedbackStatus as StatusMsg,
             )
             self._subs.append(self._node.create_subscription(
                 BmsMsg, "/hdas/bms",
-                self._on_bms,
-                qos_profile_sensor_data,
-                callback_group=cb_safety,
+                    self._on_bms,
+                    qos_profile_sensor_data,
+                    callback_group=cb_safety,
             ))
             self._subs.append(self._node.create_subscription(
                 ControllerSignalMsg, "/controller",
-                self._on_controller_signal,
-                qos_profile_sensor_data,
-                callback_group=cb_safety,
+                    self._on_controller_signal,
+                    qos_profile_sensor_data,
+                    callback_group=cb_safety,
             ))
             if self._use_right_arm:
                 self._subs.append(self._node.create_subscription(
                     StatusMsg, "/hdas/feedback_status_arm_right",
-                    lambda m: self._on_status(m, "right"),
-                    qos_profile_sensor_data,
-                    callback_group=cb_safety,
+                        lambda m: self._on_status(m, "right"),
+                        qos_profile_sensor_data,
+                        callback_group=cb_safety,
                 ))
             if self._use_left_arm:
                 self._subs.append(self._node.create_subscription(
                     StatusMsg, "/hdas/feedback_status_arm_left",
-                    lambda m: self._on_status(m, "left"),
-                    qos_profile_sensor_data,
-                    callback_group=cb_safety,
+                        lambda m: self._on_status(m, "left"),
+                        qos_profile_sensor_data,
+                        callback_group=cb_safety,
                 ))
         except ImportError:
             self.log_warning(
@@ -486,6 +527,31 @@ class GalaxeaR1ProController(Worker):
                     msg.velocity[:3], dtype=np.float32,
                 )
 
+    def _on_pose_ee_right(self, msg) -> None:
+        """Per r1pro6op47.md §3.3.4: write EE feedback into state.
+
+        Without this callback wired, ``state.right_ee_pose`` keeps the
+        identity-quat default ``[0, 0, 0, 0, 0, 0, 1]`` and L3a / ee
+        dispatcher operate on bogus geometry.
+        """
+        self._stamp_first_seen("pose_ee_arm_right")
+        p = msg.pose.position
+        q = msg.pose.orientation
+        with self._state_lock:
+            self._state.right_ee_pose = np.array(
+                [p.x, p.y, p.z, q.x, q.y, q.z, q.w],
+                dtype=np.float32,
+            )
+
+    def _on_pose_ee_left(self, msg) -> None:
+        self._stamp_first_seen("pose_ee_arm_left")
+        p = msg.pose.position
+        q = msg.pose.orientation
+        with self._state_lock:
+            self._state.left_ee_pose = np.array(
+                [p.x, p.y, p.z, q.x, q.y, q.z, q.w],
+                dtype=np.float32,)
+
     def _on_imu(self, msg, where: str) -> None:
         target = (
             self._state.imu_torso if where == "torso"
@@ -532,15 +598,32 @@ class GalaxeaR1ProController(Worker):
             )
 
     def _on_controller_signal(self, msg) -> None:
+        """Per r1pro6op47.md §1.2 #5 / §6.3, the real
+        ``hdas_msg/ControllerSignal.msg`` only has
+        ``left_x_axis / left_y_axis / right_x_axis / right_y_axis / mode``.
+        We populate the new field names but ALSO keep ``swa..swd`` keys
+        (filled with 0) for backward compatibility with any old code or
+        unit test that still queries them.  The estop logic now reads
+        ``mode`` (configured value, default 99) instead of ``swd``.
+        """
         with self._state_lock:
+            self._stamp_first_seen("controller")
             data = getattr(msg, "data", msg)
-            self._state.controller_signal = {
+            sig = {
+                "left_x_axis": float(getattr(data, "left_x_axis", 0.0)),
+                "left_y_axis": float(getattr(data, "left_y_axis", 0.0)),
+                "right_x_axis": float(getattr(data, "right_x_axis", 0.0)),
+                "right_y_axis": float(getattr(data, "right_y_axis", 0.0)),
+                "mode": int(getattr(data, "mode", 0)),
+                # Back-compat -- never present on real R1 Pro firmware,
+                # but old SafetyConfig.estop_swd_value_down logic reads
+                # this.  Defaults to 0 to keep the SWD branch silent.
                 "swa": int(getattr(data, "swa", 0)),
                 "swb": int(getattr(data, "swb", 0)),
                 "swc": int(getattr(data, "swc", 0)),
                 "swd": int(getattr(data, "swd", 0)),
-                "mode": int(getattr(data, "mode", 0)),
             }
+            self._state.controller_signal = sig
 
     def _on_status(self, msg, side: str) -> None:
         with self._state_lock:
@@ -589,7 +672,30 @@ class GalaxeaR1ProController(Worker):
         msg.pose.orientation.w = float(pose[6])
         self._pubs[topic].publish(msg)
 
-    def send_arm_joints(self, side: str, qpos: list) -> None:
+    DEFAULT_JOINT_NAMES = {
+        "right": [f"arm_right_j{i + 1}" for i in range(7)],
+        "left": [f"arm_left_j{i + 1}" for i in range(7)],
+    }
+    DEFAULT_QVEL_MAX = (3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0)  # rad/s
+
+    def send_arm_joints(
+        self,
+        side: str,
+        qpos: list,
+        qvel_max: Optional[list] = None,
+    ) -> None:
+        """Publish a 7-D joint target to the joint_tracker.
+
+        Per r1pro6op47.md §3.2.6, ``JointState.velocity`` is interpreted
+        by mobiman as the **per-joint maximum allowed speed** (rad/s)
+        during the move, not as a feedback velocity.  We default it to
+        the Galaxea-recommended envelope ``[3, 3, 3, 3, 5, 5, 5]`` if
+        the caller does not provide one.
+
+        ``msg.name`` is also populated so log captures show which side
+        was driven (joint_tracker actually does not require ``name``,
+        but it's free clarity).
+        """
         if self._is_dummy:
             return
         from sensor_msgs.msg import JointState  # type: ignore
@@ -600,7 +706,18 @@ class GalaxeaR1ProController(Worker):
             )
         msg = JointState()
         msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.position = [float(x) for x in list(qpos)[:7]]
+        msg.name = list(self.DEFAULT_JOINT_NAMES.get(side, []))
+        q = [float(x) for x in list(qpos)[:7]]
+        if len(q) < 7:
+            q = q + [0.0] * (7 - len(q))
+        msg.position = q
+        if qvel_max is None:
+            v = list(self.DEFAULT_QVEL_MAX)
+        else:
+            v = [float(x) for x in list(qvel_max)[:7]]
+            if len(v) < 7:
+                v = v + [self.DEFAULT_QVEL_MAX[i] for i in range(len(v), 7)]
+        msg.velocity = v
         self._pubs[topic].publish(msg)
 
     def send_gripper(self, side: str, position_pct: float) -> None:
@@ -631,16 +748,25 @@ class GalaxeaR1ProController(Worker):
         self._pubs["target_speed_torso"].publish(msg)
 
     def send_chassis_twist(self, twist3: np.ndarray) -> None:
+        """Publish chassis 3-D twist (vx, vy, wz).
+
+        Per r1pro6op47.md §4.2 #1, mobiman SDK example scripts use
+        ``geometry_msgs/TwistStamped`` for chassis even though the
+        English documentation table writes ``Twist``.  We follow the
+        SDK reality.
+        """
         if self._is_dummy or "target_speed_chassis" not in self._pubs:
             return
-        from geometry_msgs.msg import Twist  # type: ignore
+        from geometry_msgs.msg import TwistStamped  # type: ignore
+
         v = np.asarray(twist3, dtype=np.float32).reshape(-1)
         if v.size < 3:
             v = np.concatenate([v, np.zeros(3 - v.size, dtype=np.float32)])
-        msg = Twist()
-        msg.linear.x = float(v[0])
-        msg.linear.y = float(v[1])
-        msg.angular.z = float(v[2])
+        msg = TwistStamped()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.twist.linear.x = float(v[0])
+        msg.twist.linear.y = float(v[1])
+        msg.twist.angular.z = float(v[2])
         self._pubs["target_speed_chassis"].publish(msg)
 
     def apply_brake(self, on: bool) -> None:
@@ -648,6 +774,28 @@ class GalaxeaR1ProController(Worker):
             return
         from std_msgs.msg import Bool  # type: ignore
         self._pubs["brake_mode"].publish(Bool(data=bool(on)))
+
+    def get_subscription_count(self, topic: str) -> int:
+        """Return the number of subscribers on the publisher for *topic*.
+
+        Used by :meth:`ActionDispatcher.verify_topology` to fail fast
+        when the corresponding mobiman node (joint_tracker / relaxed_ik
+        / gripper controller) has not been launched.
+
+        In dummy mode we fake one subscriber so unit tests / CI runs do
+        not have to mock ROS 2.
+        """
+        if self._is_dummy:
+            return 1
+        # Match topic to publisher.  ROS 2 publisher.topic_name is
+        # absolute starting with '/'.
+        for pub in self._pubs.values():
+            try:
+                if getattr(pub, "topic_name", "") == topic:
+                    return int(pub.get_subscription_count())
+            except Exception:  # noqa: BLE001
+                continue
+        return 0
 
     def go_to_rest(
         self, side: str, qpos: list, timeout_s: float = 5.0

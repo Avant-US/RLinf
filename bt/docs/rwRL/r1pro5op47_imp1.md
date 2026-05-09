@@ -1223,8 +1223,8 @@ Orin 出厂系统为 Ubuntu 22.04 + Python 3.10。在 Orin 上创建 venv 时:
             from mobiman pose mode to joint tracker.  Not yet exposed
             beyond the controller skeleton.
     """
-请问 ActionSchema 类的 action_scale 属性有什么用? 怎么用?
-
+请问 ActionSchema 类的 action_scale 属性有什么用? 怎么用?   
+ActionSchema 类的 action_scale 属性是用来定义物理步长的（米 / rad / 夹爪语义等），配置里也有 action_scale。    
 它是一个长度为 3 的数组，约定为：
 
 `[pos_scale, ori_scale, gripper_scale]`

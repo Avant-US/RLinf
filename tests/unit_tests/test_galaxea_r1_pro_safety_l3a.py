@@ -47,7 +47,6 @@ from rlinf.envs.realworld.galaxear.r1_pro_safety import (
     SafetyConfig,
 )
 
-
 # ─────────────────────── Helpers / fixtures ────────────────────
 
 
@@ -85,10 +84,12 @@ def _state(
     """
     st = GalaxeaR1ProRobotState()
     st.right_ee_pose = np.array(
-        [*right_xyz, *right_quat], dtype=np.float32,
+        [*right_xyz, *right_quat],
+        dtype=np.float32,
     )
     st.left_ee_pose = np.array(
-        [*left_xyz, *left_quat], dtype=np.float32,
+        [*left_xyz, *left_quat],
+        dtype=np.float32,
     )
     return st
 
@@ -113,6 +114,17 @@ def _supervisor_with_box(
     if left_ee_max is not None:
         cfg.left_ee_max = np.asarray(left_ee_max, dtype=np.float32)
     cfg.dual_arm_collision_enable = dual_arm_collision_enable
+    # Disable the L2 gripper rate cap so L3a slice-isolation tests
+    # (notably ``test_l3a_does_not_modify_gripper_dim``) can use a
+    # gripper action above the default ``max_gripper_step`` (0.3)
+    # without triggering an unrelated L2 gripper rewrite.  L2 gripper
+    # has its own dedicated test coverage in
+    # ``test_galaxea_r1_pro_safety_l2.py``.
+    cfg.enable_l2_gripper = False
+    # Operator heartbeat fires after ~1.5 s when nobody calls
+    # ``safety.heartbeat()``; during these isolated unit tests there's
+    # no env loop calling it, so disable to avoid flaky reasons.
+    cfg.operator_heartbeat_timeout_ms = 1e9
     return GalaxeaR1ProSafetySupervisor(cfg)
 
 
@@ -158,7 +170,11 @@ def test_l3a_zero_action_inside_box_no_reason():
     ],
 )
 def test_l3a_clips_each_xyz_max_face(
-    axis_idx, box_max_val, cur_val, direction, physical_step,
+    axis_idx,
+    box_max_val,
+    cur_val,
+    direction,
+    physical_step,
 ):
     """Drive each of x/y/z towards a custom max face and verify the
     rewritten action lands the predicted EE *exactly* on the face.

@@ -18,7 +18,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic" "starvla" "lingbotvla" "dreamzero")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "galaxea_r1_pro")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "galaxea_r1_pro" "galaxea_r1_pro_orin")
 
 #=======================Utility Functions=======================
 
@@ -41,6 +41,18 @@ Common options:
     --use-mirror           Use mirrors for faster downloads.
     --no-root              Avoid system dependency installation for non-root users. Only use this if you are certain system dependencies are already installed.
     --install-rlinf        Install RLinf itself into the python.
+
+Notes:
+    --env galaxea_r1_pro       Standard server-side install with full embodied
+                               stack (sapien/robosuite/...).  Use on x86_64
+                               with a GPU server in the loop.
+    --env galaxea_r1_pro_orin  Single-node Jetson Orin install.  Reuses
+                               JetPack-shipped torch/ray/numpy via
+                               ``uv venv --system-site-packages``; NO
+                               simulator deps; NO apt sys_deps.sh; sources
+                               ROS2 Humble + Galaxea SDK on every venv
+                               activate.  Expected venv size: ~80-300 MB
+                               (vs multi-GB for galaxea_r1_pro).
 EOF
 }
 
@@ -660,11 +672,19 @@ install_env_only() {
     # galaxea_r1_pro requires Python 3.10 to match the ROS2 Humble rclpy .so ABI
     # on Ubuntu 22.04 (system Python is 3.10; rclpy .so is compiled for 3.10).
     case "$ENV_NAME" in
-        galaxea_r1_pro)
+        galaxea_r1_pro|galaxea_r1_pro_orin)
             PYTHON_VERSION="3.10.12"
             ;;
     esac
-    create_and_sync_venv
+    # The galaxea_r1_pro_orin env has its own venv-creation path that
+    # uses --system-site-packages (per design: reuse JetPack-shipped
+    # torch / ray / numpy / scipy / gymnasium / transformers / pyyaml
+    # without re-downloading; PyPI has no aarch64+CUDA torch wheel for
+    # Jetson at all).  We therefore SKIP create_and_sync_venv for that
+    # env and let install_galaxea_r1_pro_orin_env do its own thing.
+    if [ "$ENV_NAME" != "galaxea_r1_pro_orin" ]; then
+        create_and_sync_venv
+    fi
     case "$ENV_NAME" in
         franka)
             uv sync --extra franka --active $NO_INSTALL_RLINF_CMD
@@ -691,6 +711,14 @@ install_env_only() {
             fi
             install_common_embodied_deps
             install_galaxea_r1_pro_env
+            ;;
+        galaxea_r1_pro_orin)
+            # Single-node / Orin-only flavour: minimum disk usage,
+            # reuses JetPack system Python packages.  No simulator deps,
+            # no apt-installed Mesa/Vulkan stack (JetPack has its own
+            # EGL/CUDA), no torch reinstall (uses system aarch64+CUDA
+            # torch via --system-site-packages).
+            install_galaxea_r1_pro_orin_env
             ;;
         *)
             echo "Environment '$ENV_NAME' is not supported for env-only installation." >&2
@@ -852,6 +880,249 @@ install_franka_env() {
 
 install_xsquare_turtle2_env() {
     uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/xsquare_turtle_basics.git
+}
+
+install_galaxea_r1_pro_orin_env() {
+    # Single-node / Orin-only flavour of the Galaxea R1 Pro env.
+    #
+    # Goals (per user request, see commit message):
+    #   * Run the full RLinf real-robot CLI + Galaxea R1 Pro env on a
+    #     single Jetson AGX Orin (no GPU server, no ray cluster).
+    #   * MINIMUM disk footprint: do NOT re-download torch (the
+    #     JetPack-shipped 2.4.0a0 has aarch64+CUDA support and is the
+    #     ONLY CUDA-enabled torch available on Jetson; PyPI has no
+    #     aarch64+CUDA wheel).  Reuse the system Python's torch / ray /
+    #     numpy / scipy / gymnasium / transformers via
+    #     ``uv venv --system-site-packages``.
+    #   * NO simulator deps (sapien / robosuite / bddl / mesa / vulkan)
+    #     -- this is for the REAL robot, not for sim training.
+    #   * Source ROS2 Humble + Galaxea SDK on every venv activate.
+    #
+    # Expected size: ~80-300 MB (vs the standard ``--env galaxea_r1_pro``
+    # path which would balloon to multiple GB once it tries to install
+    # transformers / sapien / sys_deps GL libs etc.).
+
+    # ---- 0. Pre-flight: arch + Jetson + Python checks -------------
+    local arch
+    arch="$(uname -m)"
+    if [ "$arch" != "aarch64" ]; then
+        echo ""
+        echo "[install][galaxea_r1_pro_orin] WARNING: this profile is designed"
+        echo "  for Jetson AGX Orin (aarch64).  You are on '$arch'."
+        echo "  If you want the full server install instead, use:"
+        echo "    bash requirements/install.sh embodied --env galaxea_r1_pro"
+        echo ""
+    fi
+    if [ ! -f /etc/nv_tegra_release ]; then
+        echo "[install][galaxea_r1_pro_orin] WARNING: /etc/nv_tegra_release missing -- not a Jetson?  Continuing anyway."
+    fi
+    local sys_py="/usr/bin/python3.10"
+    if [ ! -x "$sys_py" ]; then
+        # Fallback: try plain python3 if the version-suffixed binary is
+        # absent.
+        sys_py="$(command -v python3 || true)"
+        if [ -z "$sys_py" ]; then
+            echo "[install][galaxea_r1_pro_orin] ERROR: no system Python 3 found." >&2
+            exit 1
+        fi
+    fi
+    local sys_py_mm
+    sys_py_mm="$("$sys_py" -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    if [ "$sys_py_mm" != "3.10" ]; then
+        echo "[install][galaxea_r1_pro_orin] ERROR: system Python is ${sys_py_mm}, but ROS2 Humble rclpy on Jetson needs 3.10." >&2
+        echo "  rclpy .so files at /opt/ros/humble/local/lib/python3.10/dist-packages cannot be loaded by ${sys_py_mm}." >&2
+        exit 1
+    fi
+    if [ ! -f /opt/ros/humble/setup.bash ]; then
+        echo ""
+        echo "[install][galaxea_r1_pro_orin] WARNING: /opt/ros/humble/setup.bash NOT found."
+        echo "  rclpy will NOT be importable until you install ROS2 Humble:"
+        echo "    bash requirements/embodied/ros2_humble_install.sh"
+        echo "  The Python venv will still be created so you can run --dummy mode."
+        echo ""
+    fi
+
+    install_uv
+
+    # ---- 1. Create venv with --system-site-packages ----------------
+    # Reusing system packages means rlinf's transitive deps (torch,
+    # ray, numpy, ...) will be resolved against the system installation
+    # without re-downloading.  We use the SYSTEM Python (not the
+    # python-build-standalone one uv normally fetches), so rclpy .so
+    # ABI matches.
+    if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/activate" ]; then
+        # Validate this venv was built with the right Python and
+        # --system-site-packages; otherwise rebuild.
+        local existing_py existing_ssp
+        existing_py="$($VENV_DIR/bin/python -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo unknown)"
+        existing_ssp="$(grep -c 'include-system-site-packages = true' "$VENV_DIR/pyvenv.cfg" 2>/dev/null || echo 0)"
+        if [ "$existing_py" != "3.10" ] || [ "$existing_ssp" -eq 0 ]; then
+            echo "[install][galaxea_r1_pro_orin] Existing venv at $VENV_DIR has wrong Python ($existing_py) or no --system-site-packages; recreating."
+            rm -rf "$VENV_DIR"
+        else
+            echo "[install][galaxea_r1_pro_orin] Reusing existing venv at $VENV_DIR (Python 3.10 + system-site-packages)."
+        fi
+    fi
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "[install][galaxea_r1_pro_orin] Creating venv at $VENV_DIR with system Python ($sys_py) and --system-site-packages."
+        uv venv "$VENV_DIR" --python "$sys_py" --system-site-packages
+    fi
+    # shellcheck disable=SC1090
+    source "$VENV_DIR/bin/activate"
+
+    # ---- 2. Source ROS2 + Galaxea SDK on every venv activate -------
+    # Done BEFORE the rlinf install so that the import-time check at
+    # the bottom of this function sees rclpy/sensor_msgs/etc.
+    if [ -f /opt/ros/humble/setup.bash ]; then
+        # Avoid duplicate lines on re-runs: idempotent grep-then-append.
+        if ! grep -q "source /opt/ros/humble/setup.bash" "$VENV_DIR/bin/activate"; then
+            echo "source /opt/ros/humble/setup.bash" >> "$VENV_DIR/bin/activate"
+        fi
+        # Source it now so the verification block below works.
+        set +euo pipefail
+        source /opt/ros/humble/setup.bash 2>/dev/null || true
+        set -euo pipefail
+    fi
+    local galaxea_install="${GALAXEA_INSTALL_PATH:-$HOME/galaxea/install}"
+    if [ -f "${galaxea_install}/setup.bash" ]; then
+        if ! grep -q "source ${galaxea_install}/setup.bash" "$VENV_DIR/bin/activate"; then
+            echo "source ${galaxea_install}/setup.bash" >> "$VENV_DIR/bin/activate"
+        fi
+        set +euo pipefail
+        source "${galaxea_install}/setup.bash" 2>/dev/null || true
+        set -euo pipefail
+    else
+        echo "[install][galaxea_r1_pro_orin] WARNING: Galaxea SDK setup.bash not found at $galaxea_install"
+        echo "  Set GALAXEA_INSTALL_PATH=/path/to/galaxea/install before re-running, or fix the workspace, then re-run this script."
+    fi
+    # Tell ray/RLinf which DDS the Galaxea field expects.
+    {
+        echo 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"'
+        echo 'export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-41}"'
+    } | while read -r line; do
+        if ! grep -qF "$line" "$VENV_DIR/bin/activate"; then
+            echo "$line" >> "$VENV_DIR/bin/activate"
+        fi
+    done
+
+    # ---- 3. Install MINIMUM Python deps ---------------------------
+    # uv pip install --no-deps for rlinf editable so we don't pull in
+    # torch>=2.5 (which has no aarch64+CUDA wheel) etc.  Then list the
+    # tiny set of deps the CLI / env actually needs that aren't
+    # already provided by the system Python (which we inherit via
+    # --system-site-packages).
+    #
+    # We deliberately use ``UV_LINK_MODE=hardlink`` to dedupe inodes
+    # between uv cache and the venv, shrinking on-disk usage further.
+    export UV_LINK_MODE=${UV_LINK_MODE:-hardlink}
+
+    # 3a. RLinf itself -- editable, no transitive deps (we hand-pick).
+    pushd "$SCRIPT_DIR/.." >/dev/null
+    uv pip install -e . --no-deps
+    popd >/dev/null
+
+    # 3b. Lightweight runtime deps NOT present in /usr/bin/python3.10
+    # (verified empirically on the local Jetson):
+    #   * omegaconf   (rlinf YAML configs; system has 2.3 but rlinf wants newer)
+    #   * hydra-core  (for OmegaConf interpolation in CLI YAML loaders)
+    #   * filelock    (rlinf.envs.realworld.realworld_env file lock)
+    #   * lark        (compat shim for ROS2 launch_testing pytest plugin
+    #                  -- otherwise pytest can't even collect)
+    #   * urllib3     (system 1.26 too old for ray>=2.55)
+    #   * pytest pytest-asyncio   (testing)
+    #   * ruff        (lint, matches CI)
+    # numpy / scipy / gymnasium / transformers / ray / cloudpickle /
+    # pyyaml / fsspec / msgpack / pillow / requests / certifi /
+    # torch / torchvision / pyrealsense2 / icmplib are inherited from
+    # system-site-packages (Jetson JetPack 6.0 + apt python3-* + pip
+    # default location /usr/local/lib/python3.10/dist-packages).
+    uv pip install \
+        omegaconf \
+        hydra-core \
+        filelock \
+        lark \
+        urllib3 \
+        pytest \
+        pytest-asyncio \
+        ruff \
+        || {
+            echo "[install][galaxea_r1_pro_orin] WARN: failed to install some lightweight deps."
+            echo "  Re-run with --use-mirror if you're behind a slow PyPI mirror."
+        }
+
+    # ---- 4. Verify imports + report disk footprint ----------------
+    echo ""
+    echo "[install][galaxea_r1_pro_orin] Verifying imports..."
+    local check
+    check=$(python <<'PYEOF' 2>&1 || true
+import importlib, importlib.metadata as m, os, sys, traceback
+mods = [
+    ("torch", "torch"),
+    ("numpy", "numpy"),
+    ("scipy", "scipy"),
+    ("ray", "ray"),
+    ("gymnasium", "gymnasium"),
+    ("hydra", "hydra"),
+    ("omegaconf", "omegaconf"),
+    ("filelock", "filelock"),
+    ("lark", "lark"),
+    ("rlinf", "rlinf"),
+]
+ros_mods = ["rclpy", "sensor_msgs.msg", "geometry_msgs.msg", "std_msgs.msg"]
+opt_mods = ["hdas_msg.msg"]   # Galaxea SDK -- optional, warn-only
+
+ok = True
+for label, modname in mods:
+    try:
+        importlib.import_module(modname)
+        try:
+            ver = m.version(modname)
+        except Exception:
+            ver = "(version unknown)"
+        print(f"  [OK ] {label}: {ver}")
+    except Exception as e:
+        ok = False
+        print(f"  [FAIL] {label}: {e}")
+
+for modname in ros_mods:
+    try:
+        importlib.import_module(modname)
+        print(f"  [OK ] {modname}")
+    except Exception as e:
+        ok = False
+        print(f"  [FAIL] {modname}: {e}  (ROS2 Humble not sourced?)")
+
+for modname in opt_mods:
+    try:
+        importlib.import_module(modname)
+        print(f"  [OK ] {modname}  (Galaxea SDK)")
+    except Exception as e:
+        # Optional -- only warn.
+        print(f"  [WARN] {modname}: {e}  (Galaxea SDK not sourced?)")
+
+print()
+print("OK_OVERALL" if ok else "FAILED_OVERALL")
+PYEOF
+)
+    echo "$check"
+    if echo "$check" | grep -q "FAILED_OVERALL"; then
+        echo ""
+        echo "[install][galaxea_r1_pro_orin] Some required imports FAILED -- see above."
+        echo "  Most common cause: ROS2 Humble not installed.  Run:"
+        echo "    bash requirements/embodied/ros2_humble_install.sh"
+        echo "  Then re-run this install script.  The venv is preserved."
+        # Don't exit non-zero -- venv is usable for --dummy CLI mode.
+    fi
+
+    # Disk footprint: just the venv dir, NOT system-site-packages
+    # (which would be ~10 GB of JetPack stuff).
+    local venv_size
+    venv_size=$(du -sh "$VENV_DIR" 2>/dev/null | awk '{print $1}')
+    echo ""
+    echo "[install][galaxea_r1_pro_orin] Disk usage of venv ($VENV_DIR): ${venv_size}"
+    echo "[install][galaxea_r1_pro_orin] env ready.  To use:"
+    echo "    source $VENV_DIR/bin/activate"
+    echo "    python toolkits/realworld_check/test_galaxea_r1_pro_cli_controller.py --help"
 }
 
 install_galaxea_r1_pro_env() {

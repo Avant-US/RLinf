@@ -1,0 +1,51 @@
+# Pi0.5 model config for the M1+ joint **delta** sub-mode task
+# (per design doc r1pro6op47.md §3.6 / §5.2).
+#
+# Differences from pi0_5_r1pro_single_arm_joint.yaml:
+#   * openpi.config_name swaps to the _delta variant so OpenPI's
+#     transforms know action[:7] is per-step delta (not absolute),
+#     while proprio (right_arm_qpos in rad) stays unchanged.
+#   * Everything else (action_dim, num_action_chunks, lora_rank,
+#     vision tower) is identical.
+#
+# Loading this YAML lets you fine-tune the same SFT checkpoint that
+# was trained with absolute-mode data: only the dataconfig name
+# changes; the action head weights are reused as-is because the
+# action distribution shape (8-D continuous) is identical -- only
+# the *interpretation* of [:7] differs.
+
+model_type: "openpi"
+
+# Path to the SFT checkpoint that was trained on LIBERO-style delta
+# data.  When fine-tuning from an abs-mode SFT checkpoint, just point
+# this at the abs checkpoint -- the action head transfers cleanly.
+model_path: "/path/to/checkpoints/pi05_r1pro_singlearm_reach_joint_delta"
+
+precision: null
+
+num_action_chunks: 4
+action_dim: 7         # 7 joints (no_gripper=true for M1+ task)
+
+is_lora: true
+lora_rank: 16
+
+use_proprio: true
+num_steps: 5
+add_value_head: false
+
+openpi:
+  # The _delta suffix tells the OpenPI dataconfig that action[:7] is
+  # per-step rad/step delta (proprio stays absolute rad).  See
+  # r1pro6op47.md §5.2 dataconfig table.
+  config_name: "pi05_r1pro_single_arm_joint_delta"
+  num_images_in_input: 1
+  noise_level: 0.5
+  action_chunk: ${actor.model.num_action_chunks}
+  num_steps: ${actor.model.num_steps}
+  train_expert_only: true
+  action_env_dim: ${actor.model.action_dim}
+  noise_method: "flow_sde"
+  add_value_head: ${actor.model.add_value_head}
+  value_after_vlm: false
+  value_vlm_mode: "mean_token"
+  detach_critic_input: null
