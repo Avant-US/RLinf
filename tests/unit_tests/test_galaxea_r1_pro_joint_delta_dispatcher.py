@@ -282,7 +282,7 @@ def test_reset_to_safe_pose_publishes_absolute_home_q_not_delta():
     """home reset is ALWAYS absolute -- inherited verbatim from
     JointStateDispatcher, just because the home is a known safe abs
     pose, not a delta from wherever the arm happens to be."""
-    home = np.array([0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0], dtype=np.float32)
+    home = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
     disp, ctrl = _make_dispatcher(no_gripper=True, home_q_right=home)
     disp.reset_to_safe_pose(_state_with_qpos(right_qpos=np.zeros(7)))
     args, _ = ctrl.send_arm_joints.call_args

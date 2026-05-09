@@ -269,7 +269,7 @@ def test_repl_home_dispatches_arm_joints():
     """`home` should issue a send_arm_joints with the home_q values
     (per design doc §4.5.5)."""
     cfg = _joint_cfg(no_gripper=True)
-    cfg.home_q_right = [0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0]
+    cfg.home_q_right = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     ctx, repl, captured = _make_repl(cfg)
     repl.handle_line("home r")
     arm_tx = [t for t in ctx.backend.tx_log if t["type"] == "arm_joints"]

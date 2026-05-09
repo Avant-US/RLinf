@@ -268,7 +268,7 @@ def test_home_in_delta_mode_publishes_absolute_home_q():
     joint_tracker -- not a delta from current state.  Inherited from
     JointStateDispatcher (per §3.6.5 / §3.6.7)."""
     cfg = _delta_cfg(no_gripper=True)
-    cfg.home_q_right = [0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0]
+    cfg.home_q_right = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     ctx, repl, _ = _make_repl(cfg)
     # Robot at some random current position
     ctx.backend.patch_state(

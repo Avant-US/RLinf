@@ -72,7 +72,7 @@ init_params:
     # for mobiman joint_tracker.  Galaxea-recommended envelope.
     arm_qvel_max: [3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0]
     # Safe initial joint angles published by reset_to_safe_pose().
-    home_q_right: [0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0]
+    home_q_right: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     # Task target joint angles (M1 reach goal).
     target_q_right: [0.5, 0.5, 0.0, -1.2, 0.0, 1.5, 0.0]
     joint_tolerance_rad: 0.05

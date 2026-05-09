@@ -216,7 +216,7 @@ def test_dispatch_returns_DispatchResult():
 
 
 def test_reset_to_safe_pose_publishes_home_q():
-    home_q = np.array([0.0, 0.5, 0.0, -1.0, 0.0, 1.5, 0.0], dtype=np.float32)
+    home_q = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
     ctrl = MagicMock()
     ctrl.send_arm_joints.return_value = None
     ctrl.send_gripper.return_value = None

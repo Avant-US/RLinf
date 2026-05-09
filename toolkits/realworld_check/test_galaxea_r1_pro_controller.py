@@ -1048,7 +1048,7 @@ _DEFAULT_BOX_MAX = SafetyConfig().right_ee_max.copy()
 _DEFAULT_ACTION_SCALE = (0.05, 0.10, 1.0)
 # Home Position: operator-defined "ready" joint configuration.
 # Mirrors :data:`GalaxeaR1ProRobotConfig.joint_reset_qpos_right`.
-_DEFAULT_HOME_QPOS = (0.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.0)
+_DEFAULT_HOME_QPOS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 # Zero Position: kinematic origin of the right arm (all joint angles = 0).
 # For Galaxea A2 this lies on / outside the default
 # ``SafetyConfig.arm_q_min/q_max`` (q4_max = 0.0, q6_min = -0.1), so the

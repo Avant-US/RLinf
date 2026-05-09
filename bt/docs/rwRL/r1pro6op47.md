@@ -2472,7 +2472,7 @@ train:
     arm_q_limits_source: urdf        # urdf | manual | reject
     urdf_path: null                  # null -> auto-resolve from SDK
     arm_qvel_max: [3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0]
-    home_q_right: [0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0]   # safe starting pose
+    home_q_right: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # safe starting pose
     target_q_right: [0.5, 0.5, 0.0, -1.2, 0.0, 1.5, 0.0]   # task goal
 
     # ─────────── EE mode params (ignored when use_joint_mode=true) ────
@@ -3745,3 +3745,72 @@ bash requirements/install.sh embodied --env galaxea_r1_pro_orin
 + 跳过 sys_deps.sh 的 apt 安装（Orin 已通过 JetPack 装好了 EGL/Vulkan，且模拟器 GL libs 用不到）
 + 写 ROS2 + Galaxea SDK source 到 .venv-orin/bin/activate
 + 预期占用：~80-300 MB（vs 标准 galaxea_r1_pro ~5-10 GB）
+
+## 额外附录B: R1 Pro Home Position
+
+结论：`home_q_right: [0.0, 0.3, 0.0, -1.5, 0.0, 1.8, 0.0]` **没有充分证据支持作为 R1 Pro 右臂真机 home pose**。基于当前 Orin、SDK 和 URDF，它反而很可疑，至少第 2、6 个关节与右臂 URDF/当前 YAML 限位不一致。
+
+更稳妥的 home 来源应是：
+
+1. 当前真机 HDAS feedback 的实测静止姿态；
+2. Galaxea SDK 示例中反复使用的零位或小幅弯肘姿态；
+3. URDF / SDK joint limit 校验后的人工标定姿态。
+
+我刚查了当前 Orin 上的真实反馈：
+
+```text
+/hdas/feedback_arm_right position:
+[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+/hdas/feedback_arm_left position:
+[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+```
+
+也就是说，当前这台 Orin/SDK/HDAS 现场最有证据的 home 值是：
+
+```yaml
+home_q_right: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+home_q_left:  [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+```
+
+SDK 示例也支持这个判断：`/home/nvidia/galaxea/install/mobiman/share/mobiman/scripts/robotOpenbox/R1Pro/r1pro_test_open_box.py` 和对应教程里多次用 `[0.0]*7` 作为回零/结束姿态；另一个相对保守的 SDK 示例姿态是：
+
+```yaml
+[0.0, 0.0, 0.0, -0.7, 0.0, 0.0, 0.0]
+```
+
+它比全零多了肘部轻微弯曲，也出现在 SDK 教程的 arm test 中。
+
+为什么当前文档里的值不可靠：
+
+| 关节 | 文档值 | 右臂 URDF 限位 | 结论 |
+|---|---:|---:|---|
+| J2 | `0.3` | `[-3.1416, 0.1745]` | 超上限 |
+| J6 | `1.8` | `[-1.047198, 1.047198]` | 明显超上限 |
+
+而且当前 RLinf YAML 里的 manual 右臂限位也写了：
+
+```yaml
+arm_q_max_right: [..., 0.07, ..., 0.95, ...]
+```
+
+所以 `0.3` 和 `1.8` 同样不满足 RLinf 自己的右臂限位配置。
+
+我的判断是：`[0, 0.3, 0, -1.5, 0, 1.8, 0]` 更像是早期设计时人工写入的“假定安全姿态”，可能还混入了旧的 `joint_reset_qpos_right: [0, 0.3, 0, -1.8, 0, 2.1, 0]` 思路，但它不是 Galaxea SDK 明确给出的 home，也没有通过当前 URDF/HDAS 事实校验。
+
+建议改法：
+
+```yaml
+# 最保守，和当前 HDAS 实测一致
+home_q_right: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+home_q_left:  [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+```
+
+如果担心全零机械姿态太直，可以先用 SDK 示例中的轻微弯肘姿态，但必须现场慢速验证：
+
+```yaml
+home_q_right: [0.0, 0.0, 0.0, -0.7, 0.0, 0.0, 0.0]
+home_q_left:  [0.0, 0.0, 0.0, -0.7, 0.0, 0.0, 0.0]
+```
+
+`home_q_left` 不应该靠随手镜像 `home_q_right` 得出；它应该来自 `/hdas/feedback_arm_left` 的现场读数、SDK 成对动作示例，或 URDF left arm 限位校验。当前最有证据的 left home 同样是 `[0]*7`。
