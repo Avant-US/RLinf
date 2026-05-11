@@ -47,15 +47,15 @@ M1（"Milestone 1"）任务是 R1 Pro 上 **最简单的** RL 任务：
 
 | 选择 | 理由 |
 |------|------|
-| **MLP 策略**（3×256 tanh） | 输入 14 维、输出 7 维，参数量约 336K，CPU 推理 < 1ms。不需要 GPU 做推理，适合在 Orin 上低延迟运行。 |
-| **SAC**（Soft Actor-Critic） | Off-policy 算法，样本效率远高于 PPO。真实机器人交互昂贵（10Hz 控制频率 × 200 步/episode ≈ 20 秒/episode），SAC 通过 replay buffer 重复利用历史数据，比 PPO 节省 5-10 倍交互次数。 |
+| **MLP 策略**（$3 \times 256$ tanh） | 输入 14 维、输出 7 维，参数量约 $336\text{K}$，CPU 推理 $< 1\text{ms}$。不需要 GPU 做推理，适合在 Orin 上低延迟运行。 |
+| **SAC**（Soft Actor-Critic） | Off-policy 算法，样本效率远高于 PPO。真实机器人交互昂贵（$10\text{Hz}$ 控制频率 $\times$ $200$ 步/episode $\approx 20$ 秒/episode），SAC 通过 replay buffer 重复利用历史数据，比 PPO 节省 $5$-$10$ 倍交互次数。 |
 | **异步训练** | 机器人 10Hz 步进速度慢，同步训练时 GPU 90% 时间在空闲等待。AsyncEmbodiedRunner 让 GPU 在等待新轨迹时对 replay buffer 中的旧数据持续训练。 |
 
 ### 1.3 成功标准
 
-- **joint_l2**（7 关节与目标的 L2 距离）从初始约 2.0 逐渐降低到 < 0.05 rad
-- 每轮 reward 从约 -0.75 提升到接近 0.0（密集奖励）+ 1.0（稀疏奖金）
-- 机器人手臂在 10-20 个 episode 内可见明显趋向目标的运动
+- **joint_l2**（7 关节与目标的 $L_2$ 距离）从初始约 $2.0$ 逐渐降低到 $< 0.05\;\text{rad}$
+- 每轮 reward 从约 $-0.75$ 提升到接近 $0.0$（密集奖励）$+ 1.0$（稀疏奖金）
+- 机器人手臂在 $10$-$20$ 个 episode 内可见明显趋向目标的运动
 
 ### 1.4 架构总览
 
@@ -284,41 +284,41 @@ class GalaxeaR1ProSingleArmReachJointEnv(GalaxeaR1ProEnv):
 
 #### 3.2.3 动作空间：7 维 [-1, 1]
 
-策略输出 7 维动作，每维在 `[-1, 1]` 范围内。`JointStateDispatcher` 将其反归一化为绝对关节角度：
+策略输出 7 维动作，每维在 $[-1, 1]$ 范围内。`JointStateDispatcher` 将其反归一化为绝对关节角度：
 
-```
-q_target = q_min + (action + 1) × 0.5 × (q_max - q_min)
-```
+$$
+q_{\text{target}} = q_{\min} + (\text{action} + 1) \times 0.5 \times (q_{\max} - q_{\min})
+$$
 
-其中 `q_min` 和 `q_max` 是每个关节的安全限位（URDF 限位减去 0.1 rad 安全余量）：
+其中 $q_{\min}$ 和 $q_{\max}$ 是每个关节的安全限位（URDF 限位减去 $0.1\;\text{rad}$ 安全余量）：
 
-| 关节 | q_min (rad) | q_max (rad) | 零位含义 |
+| 关节 | $q_{\min}$ (rad) | $q_{\max}$ (rad) | 零位含义 |
 |------|------------|------------|---------|
-| J1 | -4.35 | 1.21 | 肩 yaw |
-| J2 | -3.04 | 0.07 | 肩 roll（右臂） |
-| J3 | -2.26 | 2.26 | 肩 yaw |
-| J4 | -1.99 | 0.25 | 肘弯曲 |
-| J5 | -2.26 | 2.26 | 腕 roll |
-| J6 | -0.95 | 0.95 | 腕 pitch |
-| J7 | -1.47 | 1.47 | 末端 roll |
+| J1 | $-4.35$ | $1.21$ | 肩 yaw |
+| J2 | $-3.04$ | $0.07$ | 肩 roll（右臂） |
+| J3 | $-2.26$ | $2.26$ | 肩 yaw |
+| J4 | $-1.99$ | $0.25$ | 肘弯曲 |
+| J5 | $-2.26$ | $2.26$ | 腕 roll |
+| J6 | $-0.95$ | $0.95$ | 腕 pitch |
+| J7 | $-1.47$ | $1.47$ | 末端 roll |
 
-**关键含义**：`action = 0` 不对应关节零位，而是对应 `(q_min + q_max) / 2`（关节限位的中点）。策略从 `[-1, 1]` 的"归一化空间"操作，完全覆盖关节可达范围。
+**关键含义**：$\text{action} = 0$ 不对应关节零位，而是对应 $(q_{\min} + q_{\max}) / 2$（关节限位的中点）。策略从 $[-1, 1]$ 的"归一化空间"操作，完全覆盖关节可达范围。
 
-#### 3.2.4 默认目标 `(0.5, 0.5, 0.0, -1.2, 0.0, 1.5, 0.0)`
+#### 3.2.4 默认目标 `(0.5, 0.5, 0.0, -1.2, 0.0, 1.5, 0.0)` @#TODO 用新目标???
 
 这组目标关节角描述一个"右臂微抬、肘部弯曲约 69°、腕部旋转"的姿态。每个值都在对应关节的安全限位范围内：
 
-| 关节 | 目标 (rad) | 在限位范围内？ | 距 Home (0.0) 的距离 |
+| 关节 | 目标 (rad) | 在限位范围内？ | 距 Home ($0.0$) 的距离 |
 |------|-----------|--------------|-------------------|
-| J1 | 0.5 | ✓ (∈ [-4.35, 1.21]) | 0.5 |
-| J2 | 0.5 | ✗ **超出** (max=0.07) | — |
-| J3 | 0.0 | ✓ (∈ [-2.26, 2.26]) | 0.0 |
-| J4 | -1.2 | ✓ (∈ [-1.99, 0.25]) | 1.2 |
-| J5 | 0.0 | ✓ (∈ [-2.26, 2.26]) | 0.0 |
-| J6 | 1.5 | ✗ **超出** (max=0.95) | — |
-| J7 | 0.0 | ✓ (∈ [-1.47, 1.47]) | 0.0 |
+| J1 | $0.5$ | ✓ ($\in [-4.35, 1.21]$) | $0.5$ |
+| J2 | $0.5$ | ✗ **超出** ($\max=0.07$) | — |
+| J3 | $0.0$ | ✓ ($\in [-2.26, 2.26]$) | $0.0$ |
+| J4 | $-1.2$ | ✓ ($\in [-1.99, 0.25]$) | $1.2$ |
+| J5 | $0.0$ | ✓ ($\in [-2.26, 2.26]$) | $0.0$ |
+| J6 | $1.5$ | ✗ **超出** ($\max=0.95$) | — |
+| J7 | $0.0$ | ✓ ($\in [-1.47, 1.47]$) | $0.0$ |
 
-> **⚠ 重要发现**：默认目标的 J2=0.5 和 J6=1.5 **超出了安全限位**。`JointStateDispatcher._unnormalize_arm` 会把策略输出 clip 到 `[q_min, q_max]` 范围，所以实际下发的关节目标被限制在合法范围内。但**奖励函数使用的是未 clip 的目标值**，这意味着 `||q - q_target||` 永远无法完全降为零。
+> **⚠ 重要发现**：默认目标的 $\text{J2}=0.5$ 和 $\text{J6}=1.5$ **超出了安全限位**。`JointStateDispatcher._unnormalize_arm` 会把策略输出 clip 到 $[q_{\min}, q_{\max}]$ 范围，所以实际下发的关节目标被限制在合法范围内。但**奖励函数使用的是未 clip 的目标值**，这意味着 $\|\mathbf{q} - \mathbf{q}_{\text{target}}\|$ 永远无法完全降为零。
 >
 > **建议**：如果发现训练收敛到一个非零平台，将目标修改为安全限位内的值，例如：
 >
@@ -328,106 +328,240 @@ q_target = q_min + (action + 1) × 0.5 × (q_max - q_min)
 
 #### 3.2.5 奖励函数
 
+##### 3.2.5.1 数学定义
+
+设当前右臂 7 个关节的角度向量为 $\mathbf{q} = (q_1, q_2, \ldots, q_7)^\top \in \mathbb{R}^7$，目标关节角为 $\mathbf{q}^* = (q_1^*, q_2^*, \ldots, q_7^*)^\top \in \mathbb{R}^7$。定义关节误差的 L2 范数：
+
+$$d(\mathbf{q}, \mathbf{q}^*) = \|\mathbf{q} - \mathbf{q}^*\|_2 = \sqrt{\sum_{i=1}^{7}(q_i - q_i^*)^2}$$
+
+则每步奖励 $r_t$ 由**密集项**和**稀疏奖金**两部分组成：
+
+$$\boxed{r_t = \underbrace{-\frac{d(\mathbf{q}_t,\, \mathbf{q}^*)}{\sqrt{n}}}_{\text{密集项 (dense)}} + \underbrace{c \cdot \mathbb{1}\bigl[d(\mathbf{q}_t,\, \mathbf{q}^*) < \epsilon\bigr]}_{\text{稀疏奖金 (sparse bonus)}}}$$
+
+其中 $n = 7$（关节数）、$c = 1.0$（奖金系数）、$\epsilon = 0.05\text{ rad}$（成功阈值）、$\mathbb{1}[\cdot]$ 是指示函数。
+
+对应代码实现：
+
 ```python
-r = -||q - q_target||_2 / sqrt(7)  +  1.0 × I(||q - q_target||_2 < 0.05)
+def _calc_step_reward(self, obs, sinfo) -> float:
+    q = np.asarray(self._state.right_arm_qpos, dtype=np.float32).reshape(7)
+    diff = q - self._target_q_right
+    l2 = float(np.linalg.norm(diff))           # d(q, q*)
+    dense = -l2 / np.sqrt(7.0)                 # 密集项
+    bonus = 1.0 if l2 < self._joint_tolerance else 0.0  # 稀疏奖金
+    return float(dense + bonus)
 ```
 
-- **密集部分** `−l2/√7`：L2 距离除以 `√7` 做归一化，使得"每个关节差 1 rad"的情况下密集奖励约为 -1.0。这让奖励值在 `[-π√7/√7, 0] ≈ [-3.14, 0]` 范围内有意义的梯度信号。
-- **稀疏奖金** `+1.0`：当 L2 距离低于 0.05 rad（约 2.9°每关节平均）时给予。这解决了密集奖励在目标附近梯度消失的问题。
-- **成功保持计数器**：连续 `success_hold_steps`（默认 5）步保持在阈值内则判定任务成功。
+##### 3.2.5.2 密集项的作用与原理
+
+**作用**：密集项 $r_{\text{dense}} = -d / \sqrt{n}$ 在每一步都向策略提供"方向信号"——关节越接近目标，奖励越高（越接近 0）。这是策略梯度方法能够学习的前提条件。
+
+**$\sqrt{n}$ 归一化的原因**：
+
+如果不做归一化，直接使用 $r = -d$，那么当 7 个关节各差 1 rad 时：
+
+$$d = \sqrt{7 \times 1^2} = \sqrt{7} \approx 2.646 \quad\Rightarrow\quad r = -2.646$$
+
+这个值的量级取决于关节数量 $n$ —— 如果换成 18 关节的整机任务，同样"每关节差 1 rad"会导致 $r = -\sqrt{18} \approx -4.24$，让奖励尺度随任务维度变化。除以 $\sqrt{n}$ 进行归一化后：
+
+$$r_{\text{dense}} = -\frac{\sqrt{\sum_{i=1}^{n}(q_i - q_i^*)^2}}{\sqrt{n}} = -\sqrt{\frac{1}{n}\sum_{i=1}^{n}(q_i - q_i^*)^2} = -\text{RMS}(\mathbf{q} - \mathbf{q}^*)$$
+
+即密集奖励实际上等于**关节误差的 RMS (Root Mean Square) 的负值**。这保证了无论关节数多少，"每个关节平均差 1 rad"时 $r_{\text{dense}} \approx -1.0$，使奖励的量级具有可解释性和跨任务可比性。
+
+**值域分析**：
+
+- 最坏情况：每个关节都在极限误差 $\pi$ rad 时，$d_{\max} = \pi\sqrt{7} \approx 8.31$，$r_{\text{dense}}^{\min} = -\pi \approx -3.14$
+- 最好情况：$d = 0$，$r_{\text{dense}} = 0$
+- 因此 $r_{\text{dense}} \in [-\pi,\, 0]$
+
+**梯度特性**：$r_{\text{dense}}$ 关于 $\mathbf{q}$ 的梯度为：
+
+$$\nabla_{\mathbf{q}} r_{\text{dense}} = -\frac{\mathbf{q} - \mathbf{q}^*}{\sqrt{n} \cdot \|\mathbf{q} - \mathbf{q}^*\|_2}$$
+
+这是一个单位方向向量（除以 $\sqrt{n}$ 缩放后），始终指向目标。重要的是，**梯度的幅度与 $d$ 无关**：无论当前离目标多远，梯度大小恒为 $1/\sqrt{n}$。这是 L2 范数的固有性质——它在原点处不可微，但在其他位置梯度幅度恒定。这意味着密集奖励提供了**方向信号但没有"加速度"信号**，策略不会因为离目标远而获得更强的驱动力。
+
+##### 3.2.5.3 稀疏奖金的作用与原理
+
+**问题**：虽然密集项的梯度幅度恒定，但当 $d$ 很小时（比如 $d < 0.1$ rad），密集奖励在 $[-0.038, 0]$ 范围内的变化量极小，critic 的 Q 值估计难以区分"差 0.1 rad"和"差 0.01 rad"之间的微妙差异。在 SAC 的 critic 训练中，这种微小的 TD target 差异会被函数逼近的噪声淹没。
+
+**解决方案**：在 $d < \epsilon$ 时引入一个**不连续的阶跃奖金** $+c$：
+
+$$r_{\text{bonus}} = c \cdot \mathbb{1}[d < \epsilon] = \begin{cases} 1.0 & \text{if } d < 0.05 \\ 0.0 & \text{otherwise} \end{cases}$$
+
+这在 $d = \epsilon$ 处制造了一个**值函数的突变**。考虑折扣累积回报，一旦策略学会进入 $d < \epsilon$ 区域，它每步额外获得 $+1.0$ 奖金，在 $\gamma = 0.96$ 下的累积价值为：
+
+$$V_{\text{bonus}} = \sum_{k=0}^{T-1} \gamma^k \cdot c = c \cdot \frac{1 - \gamma^T}{1 - \gamma}$$
+
+如果从进入成功区域到 episode 结束还剩 100 步，$V_{\text{bonus}} = 1.0 \times \frac{1 - 0.96^{100}}{1 - 0.96} \approx 24.0$。这个**远大于密集项**的信号为 critic 提供了清晰的"进入成功区域的价值"估计。
+
+**组合效果**：
+
+$$r_t = \underbrace{-\text{RMS}(\mathbf{q}_t - \mathbf{q}^*)}_{\in\, [-\pi,\, 0]} + \underbrace{\mathbb{1}[d_t < 0.05]}_{\in\, \{0,\, 1\}}$$
+
+| 情况 | $d$ 范围 | $r_{\text{dense}}$ | $r_{\text{bonus}}$ | $r_t$ 范围 |
+|------|---------|-------------------|-------------------|-----------|
+| 远离目标 | $d \gg \epsilon$ | $\ll 0$ | $0$ | $\approx [-3.14, -0.04]$ |
+| 接近但未达标 | $\epsilon < d < 0.3$ | $\approx [-0.11, -0.02]$ | $0$ | $\approx [-0.11, -0.02]$ |
+| 达标 | $d < \epsilon$ | $\approx [-0.02, 0]$ | $1.0$ | $\approx [0.98, 1.0]$ |
+
+**关键设计点**：奖金 $c = 1.0$ 远大于密集项在 $d \approx \epsilon$ 处的绝对值 $\approx 0.02$，因此跨越 $d = \epsilon$ 时奖励有**约 50 倍的跳变**（从 $-0.02$ 到 $+0.98$）。这让 critic 能非常容易地学到"$d < \epsilon$ 的状态价值远高于 $d > \epsilon$"。
+
+##### 3.2.5.4 成功保持计数器
+
+```python
+if bonus > 0.0:
+    self._success_hold_counter += 1
+else:
+    self._success_hold_counter = 0
+```
+
+仅在**连续** `success_hold_steps`（默认 5）步保持 $d < \epsilon$ 时判定任务成功。这防止策略"偶然路过"目标区域就算成功 —— 必须**稳定停留**。在 10 Hz 控制频率下，5 步 = 0.5 秒的保持时间，要求策略不仅到达目标，还要抑制过冲 (overshoot) 和振荡 (oscillation)。
+
+##### 3.2.5.5 在 SAC 中的具体作用
+
+SAC (Soft Actor-Critic) 的优化目标是最大化**带熵正则化的期望累积回报**：
+
+$$J(\pi) = \sum_{t=0}^{T-1} \mathbb{E}_{(\mathbf{s}_t, \mathbf{a}_t) \sim \rho_\pi}\Big[\gamma^t \Big(r(\mathbf{s}_t, \mathbf{a}_t) + \alpha \mathcal{H}\big(\pi(\cdot|\mathbf{s}_t)\big)\Big)\Big]$$
+
+其中 $\alpha$ 是熵温度系数，$\mathcal{H}(\pi(\cdot|\mathbf{s})) = -\mathbb{E}_{\mathbf{a} \sim \pi}[\log \pi(\mathbf{a}|\mathbf{s})]$ 是策略的熵。在 M1 任务中，$r(\mathbf{s}_t, \mathbf{a}_t)$ 就是上述奖励函数，$\mathbf{s}_t = (\mathbf{q}_t, \mathbf{p}_t^{\text{ee}}) \in \mathbb{R}^{14}$，$\mathbf{a}_t \in [-1, 1]^7$。
+
+**奖励函数影响 SAC 的三个关键环节**：
+
+**(1) Critic (Q 网络) 训练 —— TD target 计算**
+
+SAC 使用 Bellman 方程训练 Twin Q 网络 $(Q_{\theta_1}, Q_{\theta_2})$，其 TD target 为：
+
+$$y_t = r_t + \gamma \Big(\min_{j=1,2} Q_{\bar{\theta}_j}(\mathbf{s}_{t+1}, \tilde{\mathbf{a}}_{t+1}) - \alpha \log \pi_\phi(\tilde{\mathbf{a}}_{t+1}|\mathbf{s}_{t+1})\Big), \quad \tilde{\mathbf{a}}_{t+1} \sim \pi_\phi(\cdot|\mathbf{s}_{t+1})$$
+
+$$\mathcal{L}_Q(\theta_j) = \mathbb{E}_{(\mathbf{s}_t, \mathbf{a}_t, r_t, \mathbf{s}_{t+1}) \sim \mathcal{B}}\Big[\big(Q_{\theta_j}(\mathbf{s}_t, \mathbf{a}_t) - y_t\big)^2\Big]$$
+
+奖励 $r_t$ 直接进入 TD target $y_t$。由于奖励函数的组合设计：
+
+- 当机器人远离目标时，$r_t \approx -0.5$（负值为主），使 $y_t$ 较低，Q 值将远离目标的状态-动作对评为"差"
+- 当机器人接近目标且 $d < \epsilon$ 时，$r_t \approx +1.0$（正值），使 $y_t$ 显著升高。通过 Bellman 备份的递归传播，这个高奖励信号会**逆时间方向扩散**到更早的状态：
+
+$$Q(\mathbf{s}_{t-1}, \mathbf{a}_{t-1}) \approx r_{t-1} + \gamma \cdot Q(\mathbf{s}_t, \mathbf{a}_t)$$
+
+每步递推使 Q 值信号以 $\gamma = 0.96$ 的衰减率向过去传播。经过 $k$ 步传播后，稀疏奖金对 $Q(\mathbf{s}_{t-k}, \mathbf{a}_{t-k})$ 的贡献为 $\gamma^k \cdot c = 0.96^k$。在 50 步（5 秒）之前的状态仍能感受到 $0.96^{50} \approx 0.13$ 的信号 —— 足以驱动策略从 episode 早期就开始趋向目标。
+
+**(2) Actor (策略) 更新 —— 梯度方向**
+
+SAC 的 actor 损失为：
+
+$$\mathcal{L}_\pi(\phi) = \mathbb{E}_{\mathbf{s}_t \sim \mathcal{B}}\Big[\alpha \log \pi_\phi(\tilde{\mathbf{a}}_t|\mathbf{s}_t) - \min_{j=1,2} Q_{\theta_j}(\mathbf{s}_t, \tilde{\mathbf{a}}_t)\Big], \quad \tilde{\mathbf{a}}_t \sim \pi_\phi(\cdot|\mathbf{s}_t)$$
+
+策略更新的目标是最小化 $\mathcal{L}_\pi$，即**最大化 $Q$ 值同时最大化熵**。由于 Q 值已经"吸收"了奖励信号的结构，策略会学到：
+
+- **导航阶段**（远离目标）：选择让密集奖励增大（L2 减小）的动作方向
+- **精细调整阶段**（接近目标）：选择能跨过 $d = \epsilon$ 阈值获取 $+1.0$ 跳变的动作
+- **保持阶段**（已达标）：选择让自己停留在 $d < \epsilon$ 区域的动作（抑制振荡）
+
+**(3) 熵温度 $\alpha$ 自动调节**
+
+SAC 通过以下损失自动调节 $\alpha$：
+
+$$\mathcal{L}(\alpha) = \mathbb{E}_{\mathbf{a}_t \sim \pi_\phi}\Big[-\alpha \big(\log \pi_\phi(\mathbf{a}_t|\mathbf{s}_t) + \bar{\mathcal{H}}\big)\Big]$$
+
+其中 $\bar{\mathcal{H}} = -n_a = -7$ 是目标熵。奖励函数的量级**间接影响**了 $\alpha$ 的平衡点：
+
+- 如果奖励尺度太大（如不除以 $\sqrt{n}$），Q 值量级高，actor 的 $-Q$ 项主导 $\mathcal{L}_\pi$，$\alpha \log \pi$ 的影响被压缩 → $\alpha$ 被自动调低 → 探索不足
+- 如果奖励尺度太小，Q 值量级低，$\alpha \log \pi$ 主导 → $\alpha$ 被调高 → 过度探索
+
+$\sqrt{n}$ 归一化使奖励在 $[-\pi, +1]$ 的合理范围内，与 `initial_alpha = 0.01` 和 `target_entropy = -7.0` 的配置匹配，让 $\alpha$ 能稳定收敛到合适的探索-利用平衡点。
+
+##### 3.2.5.6 为什么不使用其他奖励设计
+
+| 替代方案 | 问题 |
+|---------|------|
+| $r = -\|\mathbf{q} - \mathbf{q}^*\|_2^2$（L2 平方） | 在 $d$ 较大时梯度 $\propto d$ 过大，Q 值估计不稳定；在 $d$ 较小时梯度 $\propto d$ 趋零，与 L1 问题类似 |
+| $r = -\|\mathbf{q} - \mathbf{q}^*\|_1$（L1） | 对各关节独立，无法鼓励"同时到达"；梯度为常数 ±1 但方向不连续 |
+| 纯稀疏 $r = \mathbb{1}[d < \epsilon]$ | 初始阶段 $d \gg \epsilon$ 时完全没有学习信号，策略纯靠随机探索"碰运气"到达目标区域，在真机上耗时不可接受 |
+| 基于末端位姿的奖励 $r = -\|\mathbf{p}^{\text{ee}} - \mathbf{p}^*\|$ | M1 是关节空间任务，同一末端位姿可对应多组关节角（逆运动学冗余），策略可能找到不安全的关节构型 |
+| Huber / smooth-L1 | 可行但增加一个超参数（$\delta$），且 M1 作为冒烟测试任务追求极简 |
 
 #### 3.2.6 MLP 策略架构
 
-```
-obs (14-D)
-    │
-    ▼
-┌──────────────┐
-│ Linear(14→256)│
-│ + tanh        │
-├──────────────┤
-│ Linear(256→256)│
-│ + tanh        │
-├──────────────┤
-│ Linear(256→256)│
-│ + tanh        │
-└──────┬───────┘
-       │ (backbone output: 256-D)
-       │
-  ┌────┴────┐
-  │         │
-  ▼         ▼
-┌────────┐ ┌────────┐
-│ mean   │ │ logstd │  ← SAC 模式: 两个 Linear(256→7)
-│ head   │ │ head   │    logstd 范围 clamp 到 [-5, 2]
-└───┬────┘ └───┬────┘
-    │          │
-    ▼          ▼
- tanh(μ)    exp(σ)     ← final_tanh=True, action_scale=(-1,1)
-    │          │
-    ▼          ▼
- 采样: a = tanh(μ + σ × ε),  ε ~ N(0,1)
-    │
-    ▼
- action (7-D, ∈ [-1, 1])
+```mermaid
+flowchart TB
+    OBS["obs (14-D)"]
 
-  同时:
-┌─────────────────────────┐
-│ Q-heads (×2)            │
-│ 输入: obs(14) + action(7)│
-│ 3×256 tanh → scalar     │
-│ Twin Q → min(Q1, Q2)    │
-└─────────────────────────┘
+    subgraph Backbone ["Backbone (3×256 tanh)"]
+        L1["Linear(14→256) + tanh"]
+        L2["Linear(256→256) + tanh"]
+        L3["Linear(256→256) + tanh"]
+        L1 --> L2 --> L3
+    end
+
+    OBS --> L1
+    L3 -->|"backbone output: 256-D"| SPLIT{" "}
+
+    subgraph ActorHeads ["SAC Actor Heads"]
+        MEAN["mean head\nLinear(256→7)"]
+        LOGSTD["logstd head\nLinear(256→7)\nclamp to [-5, 2]"]
+    end
+
+    SPLIT --> MEAN
+    SPLIT --> LOGSTD
+
+    MEAN --> MU["tanh(μ)"]
+    LOGSTD --> SIGMA["exp(σ)"]
+    MU --> SAMPLE["采样: a = tanh(μ + σ × ε)\nε ~ N(0,1)"]
+    SIGMA --> SAMPLE
+    SAMPLE --> ACTION["action (7-D, ∈ [-1, 1])"]
+
+    subgraph QHeads ["Q-heads (×2, Twin Q)"]
+        QIN["输入: obs(14) ⊕ action(7)"]
+        QMLP["3×256 tanh → scalar"]
+        QOUT["min(Q₁, Q₂)"]
+        QIN --> QMLP --> QOUT
+    end
+
+    OBS -.-> QIN
+    ACTION -.-> QIN
+
+    style Backbone fill:#e8f4fd,stroke:#4a90d9
+    style ActorHeads fill:#fdf2e8,stroke:#d99a4a
+    style QHeads fill:#e8fde8,stroke:#4ad94a
 ```
 
 参数量估算：
-- Backbone: 14×256 + 256 + 256×256 + 256 + 256×256 + 256 ≈ 135K
-- Actor heads: 256×7 × 2 ≈ 3.6K
-- Q-heads: (14+7)×256 + 256×256 + 256×256 + 256×1 × 2 × 2 ≈ 197K
-- **总计约 336K 参数**
+- Backbone: $14 \times 256 + 256 + 256 \times 256 + 256 + 256 \times 256 + 256 \approx 135\text{K}$
+- Actor heads: $256 \times 7 \times 2 \approx 3.6\text{K}$
+- Q-heads: $(14+7) \times 256 + 256 \times 256 + 256 \times 256 + 256 \times 1 \;\times\; 2 \;\times\; 2 \approx 197\text{K}$
+- **总计约 $336\text{K}$ 参数**
 
 ### 3.3 数据流详解
 
-```
-     ┌──────────── Env Worker (Orin) ────────────┐
-     │                                           │
-     │  GalaxeaR1ProSingleArmReachJointEnv       │
-     │    ├─ _get_observation()                  │
-     │    │   └─ _build_state_dict()             │
-     │    │       → {"right_arm_qpos": (7,),     │
-     │    │          "right_ee_pose": (7,)}       │
-     │    ├─ _wrap_obs()                         │
-     │    │   → alphabetical sort → concat       │
-     │    │   → obs["states"] = tensor(14,)      │
-     │    ├─ _calc_step_reward()                 │
-     │    │   → -||q - q_target||/√7 + bonus     │
-     │    └─ step(action)                        │
-     │        └─ JointStateDispatcher.dispatch()  │
-     │            → _unnormalize_arm(action[:7])  │
-     │            → q_target = q_min + (a+1)*0.5 │
-     │                         *(q_max - q_min)  │
-     │            → controller.send_arm_joint()  │
-     │              → ROS 2 /motion_target/      │
-     │                target_joint_state_arm_right│
-     │                                           │
-     └─────────────────────────────────────────-─┘
-             │ obs(14-D)        ▲ action(7-D)
-             ▼                  │
-     ┌─── Rollout Worker (GPU) ──┐
-     │ MLPPolicy.predict_action()│
-     │  backbone(obs) → μ, σ     │
-     │  a = tanh(μ + σ × ε)     │
-     └───────────────────────────┘
-             │ Trajectory
-             ▼
-     ┌─── Actor Worker (GPU) ────┐
-     │ replay_buffer.add(traj)   │
-     │ sample → SAC 训练:        │
-     │   critic loss: MSE(Q, r+γQ')│
-     │   actor loss: -Q + α·logπ │
-     │   alpha loss: α·(logπ+H̄) │
-     │ soft_update_target()      │
-     └───────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph ENV ["Env Worker (Orin)"]
+        direction TB
+        E1["GalaxeaR1ProSingleArmReachJointEnv"]
+        E2["_get_observation()\n└ _build_state_dict()\n  → right_arm_qpos: (7,)\n  → right_ee_pose: (7,)"]
+        E3["_wrap_obs()\n→ alphabetical sort → concat\n→ obs.states = tensor(14,)"]
+        E4["_calc_step_reward()\n→ −‖q − q_target‖/√7 + bonus"]
+        E5["step(action)\n└ JointStateDispatcher.dispatch()\n  → _unnormalize_arm(action[:7])\n  → q_target = q_min + (a+1)·0.5·(q_max − q_min)\n  → controller.send_arm_joint()\n  → ROS 2 /motion_target/target_joint_state_arm_right"]
+        E1 --- E2 --- E3 --- E4 --- E5
+    end
+
+    subgraph ROLLOUT ["Rollout Worker (GPU)"]
+        R1["MLPPolicy.predict_action()\nbackbone(obs) → μ, σ\na = tanh(μ + σ × ε)"]
+    end
+
+    subgraph ACTOR ["Actor Worker (GPU)"]
+        A1["replay_buffer.add(traj)"]
+        A2["sample → SAC 训练:\n  critic loss: MSE(Q, r + γQ')\n  actor loss: −Q + α·log π\n  alpha loss: α·(log π + H̄)"]
+        A3["soft_update_target()"]
+        A1 --> A2 --> A3
+    end
+
+    ENV -->|"obs (14-D)"| ROLLOUT
+    ROLLOUT -->|"action (7-D)"| ENV
+    ROLLOUT -->|"Trajectory"| ACTOR
+
+    style ENV fill:#fff3e0,stroke:#e65100
+    style ROLLOUT fill:#e3f2fd,stroke:#1565c0
+    style ACTOR fill:#e8f5e9,stroke:#2e7d32
 ```
 
 ---
@@ -868,16 +1002,16 @@ runner:
 - `id: GalaxeaR1ProSingleArmReachJointEnv`：`gym.make()` 的 id，会通过任务注册机制定位到 M1 任务类。
 - `mobiman_launch_mode: "joint"`：告诉 Controller Worker 启动 mobiman 的 joint tracker（而非 EE pose tracker）。
 - `target_q_right: [0.5, 0.0, 0.0, -1.2, 0.0, 0.9, 0.0]`：目标关节角（已修正 J2 和 J6 到安全范围内）。
-- `joint_reset_qpos_right: [0.0, 0.0, 0.0, -0.7, 0.0, 0.0, 0.0]`：episode 开始时的重置姿态（肘部微弯 -0.7 rad ≈ -40°，安全且远离奇异点）。
+- `joint_reset_qpos_right: [0.0, 0.0, 0.0, -0.7, 0.0, 0.0, 0.0]`：episode 开始时的重置姿态（肘部微弯 $-0.7\;\text{rad} \approx -40°$，安全且远离奇异点）。
 
 #### SAC 算法
 
-- `gamma: 0.96`：比经典的 0.99 略低。因为真机 episode 只有 200 步（20 秒），较低的 γ 让 agent 更关注近期奖励。
-- `tau: 0.005`：Target 网络的软更新系数。每次参数更新后：`θ_target = (1-τ)·θ_target + τ·θ`。
-- `critic_actor_ratio: 4`：每 1 次 actor 更新配 4 次 critic 更新。Critic 需要更频繁更新以提供准确的 Q 值估计。
-- `update_epoch: 32`：每收到 1 条新轨迹后，从 replay buffer 中采样并训练 32 个 epoch。真机数据珍贵，充分利用。
+- `gamma: 0.96`：比经典的 $0.99$ 略低。因为真机 episode 只有 $200$ 步（$20$ 秒），较低的 $\gamma$ 让 agent 更关注近期奖励。
+- `tau: 0.005`：Target 网络的软更新系数。每次参数更新后：$\theta_{\text{target}} = (1-\tau)\cdot\theta_{\text{target}} + \tau\cdot\theta$。
+- `critic_actor_ratio: 4`：每 $1$ 次 actor 更新配 $4$ 次 critic 更新。Critic 需要更频繁更新以提供准确的 $Q$ 值估计。
+- `update_epoch: 32`：每收到 $1$ 条新轨迹后，从 replay buffer 中采样并训练 $32$ 个 epoch。真机数据珍贵，充分利用。
 - `initial_alpha: 0.01`：初始熵权重设为小值，让 SAC 早期不要过度探索（真机探索有安全风险）。
-- `target_entropy: -7.0`：等于 `-action_dim`，是 SAC 论文的标准设置。
+- `target_entropy: -7.0`：等于 $-\text{action\_dim}$，是 SAC 论文的标准设置。
 
 #### Replay Buffer
 
@@ -1105,26 +1239,26 @@ python examples/embodiment/train_embodied_agent.py \
 #### 前 3 个 episode（约 1 分钟）
 
 - 策略输出随机动作，机器人手臂会"乱动"（但被关节限位约束在安全范围内）
-- reward 约为 -0.7 到 -0.5
+- reward 约为 $-0.7$ 到 $-0.5$
 - replay buffer 积累数据，尚未开始训练
 
 #### 第 3-10 个 episode（约 5 分钟）
 
 - replay buffer 达到 `min_buffer_size=3`，SAC 开始训练
 - 手臂开始出现趋向目标的运动趋势
-- reward 逐渐提升到 -0.3 附近
+- reward 逐渐提升到 $-0.3$ 附近
 
 #### 第 10-50 个 episode（约 15 分钟）
 
 - 策略明显收敛，手臂稳定地移向目标
-- joint_l2 降到 0.1-0.2 附近
-- 偶尔出现 sparse bonus (+1.0)
+- joint_l2 降到 $0.1$-$0.2$ 附近
+- 偶尔出现 sparse bonus ($+1.0$)
 
 #### 第 50-200+ episode（约 1 小时+）
 
-- joint_l2 持续降低到 < 0.05
+- joint_l2 持续降低到 $< 0.05$
 - 每个 episode 都能稳定获得 sparse bonus
-- success_hold_counter 经常达到 5（任务完成）
+- success_hold_counter 经常达到 $5$（任务完成）
 
 ### 8.3 TensorBoard 监控
 
@@ -1330,9 +1464,9 @@ python deploy_m1_reach.py \
 
 | 指标 | 合格标准 |
 |------|---------|
-| 成功率（joint_l2 < 0.05 至少 1 次） | > 80% episodes |
-| 平均 episode reward | > 0.0 |
-| 到达时间（首次 joint_l2 < 0.1 的步数） | < 100 步（< 10 秒） |
+| 成功率（$\text{joint\_l2} < 0.05$ 至少 1 次） | $> 80\%$ episodes |
+| 平均 episode reward | $> 0.0$ |
+| 到达时间（首次 $\text{joint\_l2} < 0.1$ 的步数） | $< 100$ 步（$< 10$ 秒） |
 
 ---
 
@@ -1466,7 +1600,7 @@ runner:
 
 **症状**：Orin 或 GPU 工作站 OOM（Out of Memory）
 
-**解决**：减小 `replay_buffer.cache_size`（从 10000 降到 2000）。M1 任务每条轨迹只占约 14×4×200 ≈ 11KB（观测）+ 7×4×200 ≈ 5.6KB（动作），2000 条约占 33MB，不应触发 OOM。如果仍 OOM，检查是否有其他进程占用内存。
+**解决**：减小 `replay_buffer.cache_size`（从 $10000$ 降到 $2000$）。M1 任务每条轨迹只占约 $14 \times 4 \times 200 \approx 11\text{KB}$（观测）$+ 7 \times 4 \times 200 \approx 5.6\text{KB}$（动作），$2000$ 条约占 $33\text{MB}$，不应触发 OOM。如果仍 OOM，检查是否有其他进程占用内存。
 
 ### 11.8 ROS 2 Domain ID 冲突
 
@@ -1503,20 +1637,29 @@ export ROS_DOMAIN_ID=72
 
 ## 附录 B：反归一化公式速查
 
-```
-策略输出:  action ∈ [-1, 1]^7
+**策略输出**：$\text{action} \in [-1, 1]^7$
 
-JointStateDispatcher._unnormalize_arm:
-  q_target = q_min + (action + 1) × 0.5 × (q_max - q_min)
+**`JointStateDispatcher._unnormalize_arm`**：
 
-等价于:
-  action = -1  →  q_target = q_min
-  action =  0  →  q_target = (q_min + q_max) / 2
-  action = +1  →  q_target = q_max
+$$
+q_{\text{target}} = q_{\min} + (\text{action} + 1) \times 0.5 \times (q_{\max} - q_{\min})
+$$
 
-逆映射 (用于 SFT 数据生成):
-  action = 2 × (q_target - q_min) / (q_max - q_min) - 1
-```
+**等价映射**：
+
+$$
+\begin{aligned}
+\text{action} = -1 &\;\Rightarrow\; q_{\text{target}} = q_{\min} \\
+\text{action} = 0 &\;\Rightarrow\; q_{\text{target}} = \frac{q_{\min} + q_{\max}}{2} \\
+\text{action} = +1 &\;\Rightarrow\; q_{\text{target}} = q_{\max}
+\end{aligned}
+$$
+
+**逆映射**（用于 SFT 数据生成）：
+
+$$
+\text{action} = \frac{2 \, (q_{\text{target}} - q_{\min})}{q_{\max} - q_{\min}} - 1
+$$
 
 ## 附录 C：观测维度验证
 
