@@ -3814,3 +3814,191 @@ home_q_left:  [0.0, 0.0, 0.0, -0.7, 0.0, 0.0, 0.0]
 ```
 
 `home_q_left` 不应该靠随手镜像 `home_q_right` 得出；它应该来自 `/hdas/feedback_arm_left` 的现场读数、SDK 成对动作示例，或 URDF left arm 限位校验。当前最有证据的 left home 同样是 `[0]*7`。
+
+## 额外附录A: install.sh 安装Orin上最小RLinf环境 .V3
+
+### 目标
+
+V3 的目标不再是“把 venv 做到几十 MB 且只装 RLinf editable”，也不是“把 ray/gym/hydra 等公共依赖装到系统 Python 池”。新的目标更明确：
+
+```bash
+bash requirements/install.sh embodied --env galaxea_r1_pro_orin
+```
+
+执行后得到一个能在 R1 Pro Orin 上完成以下两件事的最小 RLinf Python 环境：
+
+1. 运行 R1 Pro CLI 命令行交互工具：`toolkits/realworld_check/test_galaxea_r1_pro_cli_controller.py`。
+2. 运行 Orin 单机版的简单真机强化学习任务：`bt/docs/rwRL/r1pro6op47_reach_joint3.md` 中的 `joint_mode` M1 关节到达任务。
+
+“最小”的定义是：只安装这两个目标所需的运行闭包；不安装仿真器、不安装 VLA 大模型依赖、不安装 flash-attn/apex、不跑 `requirements/embodied/sys_deps.sh`。
+
+### 当前 Orin 事实
+
+当前真机 Orin 的基础事实：
+
+| 项 | 当前事实 | 安装策略 |
+|---|---|---|
+| 架构 | `aarch64` | 使用系统 Python 3.10 |
+| ROS2 | Humble，`rclpy` ABI 绑定 Python 3.10 | venv 必须用 `/usr/bin/python3.10` |
+| Galaxea SDK | `/home/nvidia/galaxea/install` | 激活 venv 时自动 source |
+| PyTorch | NVIDIA Jetson CUDA wheel，`torch.cuda.is_available()==True` | 复用系统/user Python 池 |
+| PyTorch distributed | `dist.is_available()==False` | 不使用 distributed；runner 有 import-time shim |
+| R1 Pro topic | `/hdas/feedback_arm_right` 可读，`/motion_target/target_joint_state_arm_right` 有 subscriber | CLI 与 M1 runner 都走 joint tracker |
+
+### V3 安装分层
+
+V3 分为两层：
+
+```text
+Tier A: system/user Python pool
+  只负责 NVIDIA Jetson CUDA PyTorch。
+  如果系统已有可 import 且 cuda=True 的 torch，则不重装。
+
+Tier B: .venv
+  RLinf editable + CLI/local SAC 所需的非 torch 运行依赖。
+  使用 --system-site-packages 看到 Tier A 的 torch。
+  activate 时 source ROS2 + Galaxea SDK。
+```
+
+与旧方案相比，关键变化是：`ray/gymnasium/hydra/omegaconf/numpy/scipy/pyyaml/...` 不再安装到系统池，而是安装到 venv。这样既不污染系统 Python，又能让 `rlinf` 的 import surface、CLI 和 local SAC runner 稳定可用。
+
+### venv 内安装的最小运行依赖
+
+V3 会在 venv 中安装：
+
+```text
+setuptools wheel pip
+numpy scipy
+gymnasium
+ray
+hydra-core omegaconf pyyaml
+filelock cloudpickle msgpack attrs typing_extensions packaging psutil
+fsspec jinja2 networkx einops imageio urllib3
+rlinf editable (--no-deps)
+```
+
+这些包的作用：
+
+| 依赖 | 为什么需要 |
+|---|---|
+| `numpy/scipy` | RLinf 安全、dispatcher、姿态/旋转工具需要 |
+| `gymnasium` | `GalaxeaR1ProEnv` 是 gym env |
+| `ray` | RLinf scheduler/worker 模块 import surface 需要；本地 runner 不启动 Ray 集群 |
+| `hydra-core/omegaconf` | RLinf config 与 resolver 需要 |
+| `pyyaml` | 本地 runner 读取 YAML 配置 |
+| `filelock/cloudpickle/msgpack/attrs/typing_extensions` | RLinf/ray/工具链基础运行依赖 |
+| `einops/imageio` | RLinf embodied import surface 常用 |
+| `rlinf editable --no-deps` | 避免 pyproject 的 `torch>=2.5` 约束替换 Jetson CUDA torch |
+
+明确不安装：
+
+```text
+sapien robosuite bddl maniskill libero pyrealsense2 flash-attn apex transformers peft timm
+```
+
+这些属于仿真、VLA 或服务器侧完整具身栈，不是 Orin CLI + M1 joint-mode local SAC 的最小运行闭包。
+
+### 为什么仍使用 `--system-site-packages`
+
+原因有两个：
+
+1. Jetson CUDA PyTorch 不适合从 PyPI 在 venv 内解析安装。PyPI 的 `torch` wheel 对 aarch64/JetPack CUDA 不匹配，容易变成 CPU wheel 或 ABI 不兼容 wheel。
+2. ROS2 Humble 与 Galaxea SDK 的 Python binding 来自系统/colcon install，必须通过系统 Python 3.10 ABI 与 `setup.bash` 注入路径。
+
+因此 V3 仍创建：
+
+```bash
+uv venv "$VENV_DIR" --python /usr/bin/python3.10 --system-site-packages
+```
+
+但这不再意味着“所有依赖都放系统池”。V3 的原则是：
+
+- PyTorch、ROS2、Galaxea SDK：继承系统/SDK。
+- RLinf 非 torch 运行依赖：安装到 venv。
+- RLinf 源码：editable 安装到 venv。
+
+### PyTorch 选择
+
+默认仍推荐当前 JetPack 6.0 GA 上稳定的 NVIDIA nv24.05 wheel：
+
+```text
+torch 2.4.0a0+07cecf4168.nv24.05
+CUDA available: True
+cuDNN: 8.9.x
+torch.distributed: False
+```
+
+`torch.distributed == False` 是已知事实。V3 的本地 joint-mode SAC runner 不启动 FSDP，不跑 process group，不调用 collective。它只在 import 阶段补 `dist.Work` / `torch.Event` 符号，避免 RLinf 某些模块的类型注解触发 import error。
+
+### 安装后的校验
+
+`install.sh` 会校验：
+
+```text
+torch / numpy / scipy / ray / gymnasium / hydra / omegaconf / filelock
+imageio / einops / pyyaml / cloudpickle / msgpack / attrs / packaging / psutil
+rlinf
+rclpy / sensor_msgs / geometry_msgs / std_msgs
+hdas_msg.msg
+torch.cuda kernel launch
+RLinf Galaxea local SAC imports:
+  SafetyConfig / JointStateDispatcher / GalaxeaR1ProSingleArmReachJointEnv / MLPPolicy
+```
+
+其中 `torch.distributed.is_available()==False` 不算失败，反而是当前 Orin 的预期状态。真正要保证的是 CUDA torch 可用，且 RLinf Galaxea local runner 的 import surface 可用。
+
+### 使用方式
+
+安装：
+
+```bash
+cd /home/nvidia/lg_ws/RL/RLinf
+bash requirements/install.sh embodied --env galaxea_r1_pro_orin
+```
+
+激活：
+
+```bash
+source .venv/bin/activate
+```
+
+激活脚本会自动执行：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/nvidia/galaxea/install/setup.bash
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-41}"
+```
+
+CLI 工具：
+
+```bash
+python toolkits/realworld_check/test_galaxea_r1_pro_cli_controller.py \
+    --backend rclpy \
+    --use-joint-mode \
+    --use-right-arm \
+    --strict-topo
+```
+
+单机 M1 joint-mode SAC：
+
+```bash
+python toolkits/realworld_check/train_r1pro_m1_orin_joint_mode_rlinf_sac.py \
+    --config examples/embodiment/config/r1pro_m1_orin_joint_mode_rlinf_sac.yaml
+```
+
+### 与旧附录A的差异
+
+| 维度 | 旧附录A | V3 |
+|---|---|---|
+| 系统池 | torch + ray + gym + hydra + 一批公共包 | 只确保 Jetson CUDA torch |
+| venv | 主要只有 RLinf editable | RLinf editable + 非 torch 最小运行闭包 |
+| 目标 | CLI / dummy / 推理为主 | CLI + Orin 单机 RLinf local SAC |
+| distributed | 未正面处理 local runner import 问题 | 明确 `dist=False`，runner import-time shim |
+| 安全任务 | 未绑定 `reach_joint3` | 面向 `joint_mode` + `SafetyConfigActionProjector` |
+| 仿真/VLA | 跳过 | 继续跳过 |
+
+### 结论
+
+V3 是当前 Orin 最合适的最小 RLinf 环境方案：它不试图把 Orin 变成完整 GPU 服务器，也不把所有 Python 依赖塞进系统池；它只保证 RLinf 在 Orin 上完成两个主要任务所需的运行能力：R1 Pro CLI 交互工具，以及单机 joint-mode 真机强化学习 M1 任务。

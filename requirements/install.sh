@@ -46,13 +46,45 @@ Notes:
     --env galaxea_r1_pro       Standard server-side install with full embodied
                                stack (sapien/robosuite/...).  Use on x86_64
                                with a GPU server in the loop.
-    --env galaxea_r1_pro_orin  Single-node Jetson Orin install.  Reuses
-                               JetPack-shipped torch/ray/numpy via
-                               ``uv venv --system-site-packages``; NO
-                               simulator deps; NO apt sys_deps.sh; sources
-                               ROS2 Humble + Galaxea SDK on every venv
-                               activate.  Expected venv size: ~80-300 MB
-                               (vs multi-GB for galaxea_r1_pro).
+    --env galaxea_r1_pro_orin  Single-node Jetson Orin (real R1 Pro) V3 install.
+                               Purpose-built for:
+                                 * RLinf R1 Pro CLI tools
+                                   (toolkits/realworld_check/test_galaxea_*.py)
+                                 * RLinf local single-process M1 joint-mode SAC
+                                   on Orin (no Ray cluster, no FSDP, no torch.distributed)
+                               Minimal layout:
+                                 * System/user Python pool — NVIDIA Jetson CUDA
+                                   PyTorch only.  Reuse an existing working torch
+                                   when present; otherwise install the selected
+                                   NVIDIA wheel.
+                                 * Venv ($VENV_DIR) — RLinf editable plus the
+                                   small runtime closure needed by CLI + local
+                                   SAC: ray core import surface, gymnasium,
+                                   hydra/omegaconf, numpy/scipy, pyyaml,
+                                   filelock/cloudpickle/msgpack/attrs/einops.
+                                   No simulators, no VLA deps, no flash-attn/apex.
+                               The venv uses --system-site-packages so it can see
+                               Jetson torch and, after activation, ROS 2 / Galaxea
+                               SDK Python bindings.
+                               PyTorch wheel via RLINF_ORIN_JP_PYTORCH:
+                                 v60  (default) torch 2.4.0a0 nv24.05 — cuDNN 8,
+                                                NO cuSPARSELt needed.
+                                                Best fit for stock JetPack 6.0 GA.
+                                 v60-nv24.06    torch 2.4.0a0 + cuSPARSELt
+                                 v60-nv24.07    torch 2.4.0a0 + cuSPARSELt
+                                 v61            torch 2.5.0a0 nv24.08 — cuDNN 9
+                                                + cuSPARSELt (JetPack 6.1 image
+                                                or manually-upgraded cuDNN 9 only)
+                               Env overrides:
+                                 RLINF_ORIN_PYTORCH_WHEEL_URL=...   custom .whl
+                                 RLINF_ORIN_CUSPARSELT=pypi|apt     cusparselt path
+                                                                    (default pypi,
+                                                                    LD_LIBRARY_PATH)
+                                 RLINF_ORIN_SKIP_NV_TORCH=1         skip torch wheel
+                                 RLINF_ORIN_SKIP_SYSTEM_POOL=1      skip torch system pool
+                                 RLINF_ORIN_SYSTEM_POOL_SUDO=1      sudo install
+                                 RLINF_ORIN_INSTALL_DEV=1           pytest-asyncio etc.
+                               NO simulator deps; NO apt sys_deps.sh.
 EOF
 }
 
@@ -676,12 +708,11 @@ install_env_only() {
             PYTHON_VERSION="3.10.12"
             ;;
     esac
-    # The galaxea_r1_pro_orin env has its own venv-creation path that
-    # uses --system-site-packages (per design: reuse JetPack-shipped
-    # torch / ray / numpy / scipy / gymnasium / transformers / pyyaml
-    # without re-downloading; PyPI has no aarch64+CUDA torch wheel for
-    # Jetson at all).  We therefore SKIP create_and_sync_venv for that
-    # env and let install_galaxea_r1_pro_orin_env do its own thing.
+    # The galaxea_r1_pro_orin env has its own venv-creation path:
+    # reuse Jetson CUDA torch via --system-site-packages, but install the
+    # minimal RLinf runtime closure into the venv.  PyPI has no usable
+    # aarch64+CUDA torch wheel for Jetson, and the full embodied sync would
+    # pull simulators/VLA deps that are irrelevant on the robot.
     if [ "$ENV_NAME" != "galaxea_r1_pro_orin" ]; then
         create_and_sync_venv
     fi
@@ -713,11 +744,9 @@ install_env_only() {
             install_galaxea_r1_pro_env
             ;;
         galaxea_r1_pro_orin)
-            # Single-node / Orin-only flavour: minimum disk usage,
-            # reuses JetPack system Python packages.  No simulator deps,
-            # no apt-installed Mesa/Vulkan stack (JetPack has its own
-            # EGL/CUDA), no torch reinstall (uses system aarch64+CUDA
-            # torch via --system-site-packages).
+            # Single-node / Orin-only V3 profile: CLI + local M1 joint-mode
+            # RLinf SAC.  Reuses Jetson CUDA torch, installs non-torch RLinf
+            # runtime deps into the venv, skips simulators and VLA deps.
             install_galaxea_r1_pro_orin_env
             ;;
         *)
@@ -882,25 +911,357 @@ install_xsquare_turtle2_env() {
     uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/xsquare_turtle_basics.git
 }
 
+# ---------------------------------------------------------------------------
+# Galaxea R1 Pro on Jetson AGX Orin — single-node, MINIMAL venv design.
+#
+# Two-tier package layout:
+#
+#   Tier A — SYSTEM POOL (system Python or ~/.local, shared across projects)
+#     Common AI / robotics packages that any other project on this Orin
+#     might reuse: torch (NVIDIA Jetson CUDA wheel), ray, gymnasium,
+#     omegaconf / hydra-core, filelock, einops, imageio, msgpack,
+#     cloudpickle, fsspec, jinja2, networkx, attrs, typing_extensions.
+#     Installed via the SYSTEM Python's pip (default: ``--user`` to avoid
+#     sudo; opt into a system-wide install with RLINF_ORIN_SYSTEM_POOL_SUDO=1).
+#
+#   Tier B — VENV (.venv at $VENV_DIR, the smallest possible footprint)
+#     Only RLinf itself (editable, --no-deps), wired to source ROS 2 +
+#     Galaxea SDK on every ``source .venv/bin/activate``.  Inherits Tier A
+#     via ``uv venv --system-site-packages`` (which also exposes user-site).
+#
+# Why this layout:
+#   * Galaxea R1 Pro real-robot training / inference on a single Jetson Orin
+#     is bottlenecked by env / ROS / camera I/O, not by which dir torch lives
+#     in.  Keep the venv pure so we can rm -rf .venv freely without losing
+#     a 1+ GB CUDA torch.
+#   * Other R1 Pro tools and Jetson AI demos can ``import torch`` / ``import
+#     ray`` directly from /usr/bin/python3.10 without a venv.
+#   * Real RL training (FSDP / Megatron actor) actually runs on a remote
+#     GPU server, not Orin.  Orin only runs EnvWorker + lightweight
+#     model inference, so we do not need transformers / accelerate /
+#     huggingface-hub / wandb / tensorboard / datasets here at all.
+# ---------------------------------------------------------------------------
+
+# NVIDIA Jetson PyTorch wheel selection.
+#
+# IMPORTANT — Jetson-specific caveat: every NVIDIA-published Jetson PyTorch
+# wheel (any nv24.xx tag, jp/v60 and jp/v61 alike) is built with
+# torch.distributed DISABLED.  i.e.:
+#     >>> torch.distributed.is_available()      # False
+#     >>> hasattr(torch.distributed, "Work")    # False
+# This means ``rlinf.scheduler`` (which imports ``dist.Work`` for type hints
+# in collective.async_work / collective_group / multi_channel_pg) cannot be
+# imported with these wheels.  The CLI tools (``test_galaxea_r1_pro_cli_*``)
+# are still usable thanks to the ``_bootstrap_minimal_env_stubs`` shim, but
+# real-robot training/inference that touches RLinf's scheduler will not work
+# until either RLinf grows a distributed-disabled fallback for Orin OR you
+# replace torch with a distributed-enabled aarch64 build.
+#
+# Distributed-enabled aarch64 builds exist at https://pypi.jetson-ai-lab.io
+# (``jp6/cu126`` torch 2.8/2.9/2.10/2.11), but those link CUDA 12.6 and call
+# ``cudaGetDriverEntryPointByVersion`` (CUDA 12.5+).  On stock JetPack 6.0 GA
+# (this image: L4T R36.3, CUDA 12.2.140, libcudnn8 8.9.4) those wheels fail
+# with ``undefined symbol: cudaGetDriverEntryPointByVersion`` in libc10_cuda.
+# Bottom line: distributed-enabled torch on Jetson currently requires a
+# JetPack 6.1+ image (CUDA 12.6+, cuDNN 9), and is NOT installable on top
+# of stock JP6.0 GA.
+#
+# Recommended default — ``v60`` (nv24.05, torch 2.4.0a0):
+#   * Links cuDNN **8** (matches what JetPack 6.0 GA ships: libcudnn8 8.9.x)
+#   * Does NOT depend on cuSPARSELt — no extra NVIDIA repo / sudo dpkg
+#   * On this Orin (CUDA 12.2 + cuDNN 8.9.4) it imports cleanly and runs
+#     FP16 GEMM 2048×2048 at ~2.4 TFLOPs (verified during development).
+#   * Compatible with RLinf's real-robot Orin path: env worker + small-net
+#     inference (CLI controllers).  Real RL training stays on the remote
+#     GPU server (torch 2.6 pinned in pyproject.toml).
+#
+# Optional newer variants (see RLINF_ORIN_JP_PYTORCH below):
+#   * v60-nv24.07 — torch 2.4.0a0 with cuSPARSELt structured-sparse kernels.
+#     Requires libcusparseLt0 (auto-installed via PyPI nvidia-cusparselt-cu12
+#     unless you pass RLINF_ORIN_CUSPARSELT=apt for the NVIDIA Tegra deb).
+#     Still distributed-disabled (NVIDIA wheel).
+#   * v61 — torch 2.5.0a0 (nv24.08).  Links cuDNN **9** and cuSPARSELt.
+#     Matches RLinf pyproject.toml's ``torch>=2.5,<=2.9`` version window
+#     and picks up newer FSDP / dynamo APIs.  But on stock JetPack 6.0 GA
+#     the system cuDNN is 8.9 — you must install libcudnn9 yourself (apt)
+#     before this wheel will import.  Recommended ONLY on JetPack 6.1+
+#     images.  Still distributed-disabled.
+#   * jetson-ai-lab cu126 (RLINF_ORIN_PYTORCH_WHEEL_URL=...): only on
+#     JetPack 6.1+ images (CUDA 12.6+).  This is the only distributed-
+#     enabled aarch64 path today.
+_galaxea_orin_default_torch_wheel_url() {
+    case "${RLINF_ORIN_JP_PYTORCH:-v60}" in
+        v60|jp60|60|6.0)
+            echo "https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/torch-2.4.0a0+07cecf4168.nv24.05.14710581-cp310-cp310-linux_aarch64.whl"
+            ;;
+        v60-nv24.06|v60-nv2406)
+            echo "https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/torch-2.4.0a0+f70bd71a48.nv24.06.15634931-cp310-cp310-linux_aarch64.whl"
+            ;;
+        v60-nv24.07|v60-nv2407)
+            echo "https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/torch-2.4.0a0+3bcc3cddb5.nv24.07.16234504-cp310-cp310-linux_aarch64.whl"
+            ;;
+        v61|jp61|61|6.1)
+            echo "https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Whether the chosen wheel needs cuSPARSELt at runtime.
+_galaxea_orin_wheel_needs_cusparselt() {
+    case "${RLINF_ORIN_JP_PYTORCH:-v60}" in
+        v60|jp60|60|6.0) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Whether the chosen wheel links cuDNN 9 (vs the JP6.0 default cuDNN 8).
+_galaxea_orin_wheel_needs_cudnn9() {
+    case "${RLINF_ORIN_JP_PYTORCH:-v60}" in
+        v61|jp61|61|6.1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Install cuSPARSELt for Tegra into the user-pool so torch can dlopen
+# libcusparseLt.so.0.  Two paths:
+#   * default (no sudo): PyPI ``nvidia-cusparselt-cu12==0.6.3`` aarch64 wheel,
+#     wires LD_LIBRARY_PATH into the venv activate hook.
+#   * RLINF_ORIN_CUSPARSELT=apt: NVIDIA Tegra local deb installer (sudo).
+_galaxea_orin_install_cusparselt() {
+    local sys_py="$1"
+    if [ "${RLINF_ORIN_CUSPARSELT:-pypi}" = "apt" ]; then
+        echo "[install][galaxea_r1_pro_orin] Installing cuSPARSELt via NVIDIA Tegra deb (sudo)..."
+        local tmp deb url
+        url="https://developer.download.nvidia.com/compute/cusparselt/0.7.0/local_installers/cusparselt-local-tegra-repo-ubuntu2204-0.7.0_1.0-1_arm64.deb"
+        tmp="$(mktemp -d)"; deb="$tmp/cusparselt.deb"
+        if ! curl -fL -o "$deb" "$url"; then
+            echo "[install][galaxea_r1_pro_orin] ERROR: failed to download cuSPARSELt deb." >&2
+            return 1
+        fi
+        sudo dpkg -i "$deb" || true
+        sudo cp /var/cusparselt-local-tegra-repo-ubuntu2204-0.7.0/cusparselt-*-keyring.gpg /usr/share/keyrings/ 2>/dev/null || true
+        sudo apt-get update -qq
+        sudo apt-get install -y libcusparselt0 libcusparselt-dev
+        rm -rf "$tmp"
+    else
+        echo "[install][galaxea_r1_pro_orin] Installing cuSPARSELt via PyPI nvidia-cusparselt-cu12 wheel (no sudo)..."
+        if ! _galaxea_orin_system_pip "$sys_py" install "nvidia-cusparselt-cu12==0.6.3"; then
+            echo "[install][galaxea_r1_pro_orin] ERROR: failed to install nvidia-cusparselt-cu12 from PyPI." >&2
+            echo "  Re-run with RLINF_ORIN_CUSPARSELT=apt to use the NVIDIA Tegra deb path." >&2
+            return 1
+        fi
+        # Wheel installs to <site>/cusparselt/lib/libcusparseLt.so.0; need to
+        # add that to LD_LIBRARY_PATH for torch to find it at import time.
+        local _ld_dir
+        _ld_dir="$("$sys_py" - <<'PY'
+import os, sysconfig, importlib.util
+spec = importlib.util.find_spec('cusparselt')
+if spec and spec.submodule_search_locations:
+    print(os.path.join(spec.submodule_search_locations[0], 'lib'))
+PY
+)"
+        if [ -n "$_ld_dir" ] && [ -f "$_ld_dir/libcusparseLt.so.0" ]; then
+            local _line='export LD_LIBRARY_PATH="'"$_ld_dir"':${LD_LIBRARY_PATH:-}"'
+            if [ -f "$VENV_DIR/bin/activate" ] && ! grep -qF "$_ld_dir" "$VENV_DIR/bin/activate"; then
+                echo "$_line" >> "$VENV_DIR/bin/activate"
+            fi
+            export LD_LIBRARY_PATH="${_ld_dir}:${LD_LIBRARY_PATH:-}"
+            echo "[install][galaxea_r1_pro_orin] cuSPARSELt at: $_ld_dir/libcusparseLt.so.0"
+            echo "  (added to venv activate via LD_LIBRARY_PATH)"
+        else
+            echo "[install][galaxea_r1_pro_orin] WARN: could not locate cusparselt lib dir from PyPI wheel."
+            return 1
+        fi
+    fi
+}
+
+# Decide whether to invoke the system pip with ``--user`` or system-wide.
+#   RLINF_ORIN_SYSTEM_POOL_SUDO=1    — system-wide via sudo (multi-user)
+#   default                          — ``--user`` (writes to ~/.local; no sudo)
+_galaxea_orin_system_pip() {
+    local sys_py="$1"
+    shift
+    if [ "${RLINF_ORIN_SYSTEM_POOL_SUDO:-0}" = "1" ]; then
+        sudo -E "$sys_py" -m pip "$@"
+    else
+        "$sys_py" -m pip --no-input "$@" --user
+    fi
+}
+
+# Install only the CUDA-enabled NVIDIA Jetson PyTorch wheel into the system
+# Python (or ~/.local).  V3 deliberately keeps ray/gym/hydra/etc. out of the
+# system pool; those live in the venv so this env remains focused on RLinf.
+# Idempotent: if a working CUDA torch is already present, this does nothing.
+_galaxea_orin_install_system_pool() {
+    if [ "${RLINF_ORIN_SKIP_SYSTEM_POOL:-0}" = "1" ]; then
+        echo "[install][galaxea_r1_pro_orin] Skipping Jetson torch system pool (RLINF_ORIN_SKIP_SYSTEM_POOL=1)."
+        return 0
+    fi
+    local sys_py="$1"
+
+    echo "[install][galaxea_r1_pro_orin] Tier A — ensuring NVIDIA Jetson CUDA PyTorch in SYSTEM Python pool."
+    if [ "${RLINF_ORIN_SYSTEM_POOL_SUDO:-0}" = "1" ]; then
+        echo "  Mode: sudo system-wide  (set RLINF_ORIN_SYSTEM_POOL_SUDO=0 to use --user)"
+    else
+        echo "  Mode: pip --user        (set RLINF_ORIN_SYSTEM_POOL_SUDO=1 to install into /usr/local/lib)"
+    fi
+
+    # Ensure modern pip / wheel; pin setuptools <80 so colcon-core 0.20.x
+    # (system) keeps importing.
+    _galaxea_orin_system_pip "$sys_py" install --upgrade pip wheel "setuptools>=69.5.1,<80" \
+        >/dev/null 2>&1 || true
+
+    # NVIDIA Jetson PyTorch (CUDA) — the only package intentionally managed in
+    # the system/user pool.  PyPI does not provide aarch64 CUDA torch wheels.
+    if [ "${RLINF_ORIN_SKIP_NV_TORCH:-0}" = "1" ]; then
+        echo "[install][galaxea_r1_pro_orin] Skipping NVIDIA PyTorch wheel (RLINF_ORIN_SKIP_NV_TORCH=1)."
+        return 0
+    fi
+    if [ "$(uname -m)" != "aarch64" ]; then
+        echo "[install][galaxea_r1_pro_orin] Not aarch64; skipping NVIDIA Jetson PyTorch wheel."
+        return 0
+    fi
+    if "$sys_py" -c 'import torch; assert torch.cuda.is_available()' >/dev/null 2>&1; then
+        local _v
+        _v="$("$sys_py" -c 'import torch;print(torch.__version__)')"
+        echo "[install][galaxea_r1_pro_orin] System Python already has CUDA torch (${_v}); skipping NVIDIA wheel."
+        return 0
+    fi
+
+    local wheel_url
+    if [ -n "${RLINF_ORIN_PYTORCH_WHEEL_URL:-}" ]; then
+        wheel_url="${RLINF_ORIN_PYTORCH_WHEEL_URL}"
+    else
+        wheel_url="$(_galaxea_orin_default_torch_wheel_url)" || {
+            echo "[install][galaxea_r1_pro_orin] ERROR: unknown RLINF_ORIN_JP_PYTORCH='${RLINF_ORIN_JP_PYTORCH:-}'." >&2
+            echo "  Use one of: v60 (default, nv24.05 — no cuSPARSELt needed), v60-nv24.06, v60-nv24.07, v61." >&2
+            exit 1
+        }
+    fi
+
+    # Pre-flight check: cuDNN 9 vs system cuDNN 8.
+    if _galaxea_orin_wheel_needs_cudnn9; then
+        if [ ! -f /usr/lib/aarch64-linux-gnu/libcudnn.so.9 ] \
+           && ! ldconfig -p 2>/dev/null | grep -q 'libcudnn\.so\.9'; then
+            echo "[install][galaxea_r1_pro_orin] ERROR: chosen wheel (RLINF_ORIN_JP_PYTORCH=${RLINF_ORIN_JP_PYTORCH}) links cuDNN 9 but the system has only cuDNN 8." >&2
+            echo "  Options:" >&2
+            echo "    * Recommended: re-run without RLINF_ORIN_JP_PYTORCH (defaults to v60 / nv24.05 / cuDNN 8 — works on this JetPack 6.0 GA image)." >&2
+            echo "    * Or upgrade to cuDNN 9: sudo apt-get install -y libcudnn9-cuda-12 libcudnn9-dev-cuda-12 (after adding the matching NVIDIA repo)." >&2
+            echo "    * Or override the wheel URL with a cuDNN-8 build: RLINF_ORIN_PYTORCH_WHEEL_URL=..." >&2
+            exit 1
+        fi
+    fi
+
+    # Pre-flight: cuSPARSELt (auto-install if missing).
+    if _galaxea_orin_wheel_needs_cusparselt; then
+        if [ -f /usr/lib/aarch64-linux-gnu/libcusparseLt.so.0 ] \
+           || ldconfig -p 2>/dev/null | grep -q 'libcusparseLt\.so\.0'; then
+            echo "[install][galaxea_r1_pro_orin] System cuSPARSELt found via ldconfig — skipping auto-install."
+        else
+            _galaxea_orin_install_cusparselt "$sys_py" || {
+                echo "[install][galaxea_r1_pro_orin] ERROR: cuSPARSELt setup failed." >&2
+                exit 1
+            }
+        fi
+    fi
+
+    echo "[install][galaxea_r1_pro_orin] Installing NVIDIA Jetson PyTorch wheel into system Python:"
+    echo "  $wheel_url"
+    if ! _galaxea_orin_system_pip "$sys_py" install --no-cache-dir --no-deps --force-reinstall "$wheel_url"; then
+        echo "[install][galaxea_r1_pro_orin] ERROR: NVIDIA PyTorch wheel install failed." >&2
+        echo "  See the JetPack/PyTorch compatibility matrix:" >&2
+        echo "    https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform-release-notes/pytorch-jetson-rel.html" >&2
+        echo "  Override with RLINF_ORIN_PYTORCH_WHEEL_URL=... or RLINF_ORIN_JP_PYTORCH={v60,v60-nv24.06,v60-nv24.07,v61}." >&2
+        exit 1
+    fi
+
+    # Detect ImportError early with actionable hints.
+    local _torch_err
+    if ! _torch_err="$("$sys_py" -c 'import torch' 2>&1)"; then
+        echo "[install][galaxea_r1_pro_orin] ERROR: torch installed into system pool but fails to import:" >&2
+        echo "$_torch_err" >&2
+        if echo "$_torch_err" | grep -q 'libcudnn\.so\.9'; then
+            echo "  Fix: this wheel needs cuDNN 9; install libcudnn9-cuda-12 / libcudnn9-dev-cuda-12 from the NVIDIA repo, OR re-run with RLINF_ORIN_JP_PYTORCH=v60 (default, cuDNN-8 compatible)." >&2
+        elif echo "$_torch_err" | grep -q 'libcudnn\.so\.8'; then
+            echo "  Fix: install libcudnn8 (sudo apt-get install -y libcudnn8 libcudnn8-dev)." >&2
+        elif echo "$_torch_err" | grep -q cusparseLt; then
+            echo "  Fix: rerun this script (cuSPARSELt auto-install will trigger), or install via apt:" >&2
+            echo "    RLINF_ORIN_CUSPARSELT=apt bash requirements/install.sh embodied --env galaxea_r1_pro_orin" >&2
+        fi
+        exit 1
+    fi
+    echo "[install][galaxea_r1_pro_orin] Tier A torch import OK: $("$sys_py" -c 'import torch;print(torch.__version__,"cuda=",torch.cuda.is_available(),"cudnn=",torch.backends.cudnn.version())')"
+}
+
+_galaxea_orin_install_venv_runtime_deps() {
+    # V3 runtime closure for the two supported Orin use cases:
+    #   1. R1 Pro CLI controller (dummy/rclpy/ray backend)
+    #   2. local single-process RLinf M1 joint-mode SAC runner
+    #
+    # Keep this deliberately smaller than ``uv sync --extra embodied``:
+    # no simulators (sapien/robosuite/bddl), no VLA stack, no flash-attn/apex,
+    # no torch install from PyPI.  Torch is inherited from the Jetson system
+    # pool through --system-site-packages.
+    local runtime_deps=(
+        # Build / editable-install basics.
+        "setuptools>=69.5.1,<80"
+        wheel
+        pip
+        # Numeric + gym API.  NumPy is capped to stay compatible with Ubuntu
+        # 22.04's system scipy when scipy comes from apt; scipy wheel is
+        # installed when available so scipy.spatial Rotation works reliably.
+        "numpy>=1.24,<1.27"
+        "scipy>=1.8,<1.12"
+        gymnasium
+        # RLinf import/config/runtime surface.
+        "ray>=2.47.0"
+        hydra-core
+        omegaconf
+        pyyaml
+        filelock
+        cloudpickle
+        msgpack
+        attrs
+        typing_extensions
+        packaging
+        psutil
+        fsspec
+        jinja2
+        networkx
+        einops
+        imageio
+        urllib3
+    )
+
+    echo "[install][galaxea_r1_pro_orin] Tier B — installing minimal RLinf runtime deps into venv."
+    uv pip install --upgrade "${runtime_deps[@]}"
+
+    if [ "${RLINF_ORIN_INSTALL_DEV:-0}" = "1" ]; then
+        echo "[install][galaxea_r1_pro_orin] Installing optional dev/test tools into venv."
+        uv pip install --upgrade pytest pytest-asyncio lark ruff
+    fi
+}
+
 install_galaxea_r1_pro_orin_env() {
-    # Single-node / Orin-only flavour of the Galaxea R1 Pro env.
+    # Single-node / Orin-only V3 env for Galaxea R1 Pro.
     #
-    # Goals (per user request, see commit message):
-    #   * Run the full RLinf real-robot CLI + Galaxea R1 Pro env on a
-    #     single Jetson AGX Orin (no GPU server, no ray cluster).
-    #   * MINIMUM disk footprint: do NOT re-download torch (the
-    #     JetPack-shipped 2.4.0a0 has aarch64+CUDA support and is the
-    #     ONLY CUDA-enabled torch available on Jetson; PyPI has no
-    #     aarch64+CUDA wheel).  Reuse the system Python's torch / ray /
-    #     numpy / scipy / gymnasium / transformers via
-    #     ``uv venv --system-site-packages``.
-    #   * NO simulator deps (sapien / robosuite / bddl / mesa / vulkan)
-    #     -- this is for the REAL robot, not for sim training.
-    #   * Source ROS2 Humble + Galaxea SDK on every venv activate.
+    # Purpose:
+    #   * Run RLinf's R1 Pro CLI tools on Orin.
+    #   * Run the local single-process M1 joint-mode SAC guide
+    #     (bt/docs/rwRL/r1pro6op47_reach_joint3.md).
     #
-    # Expected size: ~80-300 MB (vs the standard ``--env galaxea_r1_pro``
-    # path which would balloon to multiple GB once it tries to install
-    # transformers / sapien / sys_deps GL libs etc.).
+    # Layout:
+    #   * System/user Python pool — NVIDIA Jetson CUDA PyTorch only.
+    #     PyPI has no usable aarch64 CUDA torch wheel for this JetPack.
+    #   * This venv — RLinf editable + minimal Python runtime closure
+    #     for CLI/local SAC (ray import surface, gymnasium, hydra,
+    #     omegaconf, numpy/scipy, pyyaml, filelock/cloudpickle/msgpack).
+    #   * ROS2 + Galaxea SDK — sourced into the venv activation script.
+    #
+    # Explicitly skipped: simulators, VLA deps, sys_deps.sh, flash-attn, apex.
 
     # ---- 0. Pre-flight: arch + Jetson + Python checks -------------
     local arch
@@ -944,15 +1305,15 @@ install_galaxea_r1_pro_orin_env() {
 
     install_uv
 
-    # ---- 1. Create venv with --system-site-packages ----------------
-    # Reusing system packages means rlinf's transitive deps (torch,
-    # ray, numpy, ...) will be resolved against the system installation
-    # without re-downloading.  We use the SYSTEM Python (not the
-    # python-build-standalone one uv normally fetches), so rclpy .so
-    # ABI matches.
+    # ---- 1. Tier A — system/user pool (Jetson CUDA torch only) ----
+    # Done BEFORE creating the venv so --system-site-packages can expose torch.
+    _galaxea_orin_install_system_pool "$sys_py"
+
+    # ---- 2. Tier B — minimal RLinf runtime venv -------------------
+    # Uses the SYSTEM Python (not python-build-standalone) so ROS2 Humble
+    # rclpy .so ABI matches.  Uses --system-site-packages so ``import torch``
+    # sees the Jetson CUDA wheel from Tier A.
     if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/activate" ]; then
-        # Validate this venv was built with the right Python and
-        # --system-site-packages; otherwise rebuild.
         local existing_py existing_ssp
         existing_py="$($VENV_DIR/bin/python -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo unknown)"
         existing_ssp="$(grep -c 'include-system-site-packages = true' "$VENV_DIR/pyvenv.cfg" 2>/dev/null || echo 0)"
@@ -970,15 +1331,16 @@ install_galaxea_r1_pro_orin_env() {
     # shellcheck disable=SC1090
     source "$VENV_DIR/bin/activate"
 
-    # ---- 2. Source ROS2 + Galaxea SDK on every venv activate -------
-    # Done BEFORE the rlinf install so that the import-time check at
-    # the bottom of this function sees rclpy/sensor_msgs/etc.
+    # Install the minimal runtime closure into the venv before RLinf editable.
+    # Use --no-deps for RLinf itself later so pyproject's torch>=2.5 constraint
+    # cannot replace the Jetson CUDA torch.
+    _galaxea_orin_install_venv_runtime_deps
+
+    # ---- 3. Source ROS 2 + Galaxea SDK on every venv activate -----
     if [ -f /opt/ros/humble/setup.bash ]; then
-        # Avoid duplicate lines on re-runs: idempotent grep-then-append.
         if ! grep -q "source /opt/ros/humble/setup.bash" "$VENV_DIR/bin/activate"; then
             echo "source /opt/ros/humble/setup.bash" >> "$VENV_DIR/bin/activate"
         fi
-        # Source it now so the verification block below works.
         set +euo pipefail
         source /opt/ros/humble/setup.bash 2>/dev/null || true
         set -euo pipefail
@@ -995,7 +1357,7 @@ install_galaxea_r1_pro_orin_env() {
         echo "[install][galaxea_r1_pro_orin] WARNING: Galaxea SDK setup.bash not found at $galaxea_install"
         echo "  Set GALAXEA_INSTALL_PATH=/path/to/galaxea/install before re-running, or fix the workspace, then re-run this script."
     fi
-    # Tell ray/RLinf which DDS the Galaxea field expects.
+    # DDS / RLinf env vars Galaxea SDK expects.
     {
         echo 'export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"'
         echo 'export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-41}"'
@@ -1005,58 +1367,44 @@ install_galaxea_r1_pro_orin_env() {
         fi
     done
 
-    # ---- 3. Install MINIMUM Python deps ---------------------------
-    # uv pip install --no-deps for rlinf editable so we don't pull in
-    # torch>=2.5 (which has no aarch64+CUDA wheel) etc.  Then list the
-    # tiny set of deps the CLI / env actually needs that aren't
-    # already provided by the system Python (which we inherit via
-    # --system-site-packages).
-    #
-    # We deliberately use ``UV_LINK_MODE=hardlink`` to dedupe inodes
-    # between uv cache and the venv, shrinking on-disk usage further.
+    # ---- 4. RLinf editable install (without dependency resolution) -
+    # Walk upward from $SCRIPT_DIR until we find RLinf's pyproject.toml.
+    # Avoids the trap of running this script from a copied-out directory
+    # (e.g. mobiman/share/mobiman/requirements) where ``$SCRIPT_DIR/..``
+    # is not the RLinf root.
     export UV_LINK_MODE=${UV_LINK_MODE:-hardlink}
+    local rlinf_root parent_dir
+    rlinf_root="$SCRIPT_DIR"
+    while [ ! -f "${rlinf_root}/pyproject.toml" ]; do
+        if [ "$rlinf_root" = "/" ]; then
+            rlinf_root=""
+            break
+        fi
+        parent_dir="$(dirname "$rlinf_root")"
+        if [ "$parent_dir" = "$rlinf_root" ]; then
+            rlinf_root=""
+            break
+        fi
+        rlinf_root="$parent_dir"
+    done
+    if [ -z "$rlinf_root" ] || [ ! -f "${rlinf_root}/pyproject.toml" ]; then
+        echo "[install][galaxea_r1_pro_orin] ERROR: could not find RLinf pyproject.toml above SCRIPT_DIR=${SCRIPT_DIR}" >&2
+        echo "  Use a full RLinf git checkout (with pyproject.toml at the repo root), not a partial copy." >&2
+        exit 1
+    fi
+    rlinf_root="$(cd "$rlinf_root" && pwd)"
+    unset UV_PROJECT UV_WORKSPACE 2>/dev/null || true
+    uv pip install -e "$rlinf_root" --no-deps
 
-    # 3a. RLinf itself -- editable, no transitive deps (we hand-pick).
-    pushd "$SCRIPT_DIR/.." >/dev/null
-    uv pip install -e . --no-deps
-    popd >/dev/null
-
-    # 3b. Lightweight runtime deps NOT present in /usr/bin/python3.10
-    # (verified empirically on the local Jetson):
-    #   * omegaconf   (rlinf YAML configs; system has 2.3 but rlinf wants newer)
-    #   * hydra-core  (for OmegaConf interpolation in CLI YAML loaders)
-    #   * filelock    (rlinf.envs.realworld.realworld_env file lock)
-    #   * lark        (compat shim for ROS2 launch_testing pytest plugin
-    #                  -- otherwise pytest can't even collect)
-    #   * urllib3     (system 1.26 too old for ray>=2.55)
-    #   * pytest pytest-asyncio   (testing)
-    #   * ruff        (lint, matches CI)
-    # numpy / scipy / gymnasium / transformers / ray / cloudpickle /
-    # pyyaml / fsspec / msgpack / pillow / requests / certifi /
-    # torch / torchvision / pyrealsense2 / icmplib are inherited from
-    # system-site-packages (Jetson JetPack 6.0 + apt python3-* + pip
-    # default location /usr/local/lib/python3.10/dist-packages).
-    uv pip install \
-        omegaconf \
-        hydra-core \
-        filelock \
-        lark \
-        urllib3 \
-        pytest \
-        pytest-asyncio \
-        ruff \
-        || {
-            echo "[install][galaxea_r1_pro_orin] WARN: failed to install some lightweight deps."
-            echo "  Re-run with --use-mirror if you're behind a slow PyPI mirror."
-        }
-
-    # ---- 4. Verify imports + report disk footprint ----------------
+    # ---- 5. Verify imports + GPU + report sizes -------------------
     echo ""
-    echo "[install][galaxea_r1_pro_orin] Verifying imports..."
+    echo "[install][galaxea_r1_pro_orin] Verifying imports from inside the venv..."
     local check
     check=$(python <<'PYEOF' 2>&1 || true
-import importlib, importlib.metadata as m, os, sys, traceback
-mods = [
+import importlib, importlib.metadata as m, sys
+
+# Required: must all import for CLI + local single-process RLinf SAC on Orin.
+required = [
     ("torch", "torch"),
     ("numpy", "numpy"),
     ("scipy", "scipy"),
@@ -1065,20 +1413,29 @@ mods = [
     ("hydra", "hydra"),
     ("omegaconf", "omegaconf"),
     ("filelock", "filelock"),
-    ("lark", "lark"),
+    ("imageio", "imageio"),
+    ("einops", "einops"),
+    ("pyyaml", "yaml"),
+    ("cloudpickle", "cloudpickle"),
+    ("msgpack", "msgpack"),
+    ("attrs", "attr"),
+    ("packaging", "packaging"),
+    ("psutil", "psutil"),
     ("rlinf", "rlinf"),
 ]
+# ROS 2 Humble + standard message bindings.
 ros_mods = ["rclpy", "sensor_msgs.msg", "geometry_msgs.msg", "std_msgs.msg"]
-opt_mods = ["hdas_msg.msg"]   # Galaxea SDK -- optional, warn-only
+# Galaxea SDK message types — warn-only (no SDK on dev machine is OK).
+opt_mods = ["hdas_msg.msg"]
 
 ok = True
-for label, modname in mods:
+for label, modname in required:
     try:
         importlib.import_module(modname)
         try:
             ver = m.version(modname)
         except Exception:
-            ver = "(version unknown)"
+            ver = "?"
         print(f"  [OK ] {label}: {ver}")
     except Exception as e:
         ok = False
@@ -1097,8 +1454,50 @@ for modname in opt_mods:
         importlib.import_module(modname)
         print(f"  [OK ] {modname}  (Galaxea SDK)")
     except Exception as e:
-        # Optional -- only warn.
-        print(f"  [WARN] {modname}: {e}  (Galaxea SDK not sourced?)")
+        print(f"  [WARN] {modname}: {e}  (Galaxea SDK not sourced — fine for dummy/CI)")
+
+# GPU smoke test (Orin iGPU); warn-only — CI / no-driver still passes.
+try:
+    import torch
+    import torch.distributed as dist
+    print(f"  [OK ] torch.distributed.is_available(): {dist.is_available()} (False is expected on NVIDIA Jetson wheels)")
+    if torch.cuda.is_available():
+        try:
+            x = torch.zeros(1, device="cuda")
+            x.add_(1.0)
+            print(f"  [OK ] torch.cuda: {torch.cuda.get_device_name(0)}  (kernel launch OK)")
+        except Exception as e:
+            print(f"  [WARN] torch.cuda available but kernel launch failed: {e}")
+    else:
+        print("  [WARN] torch.cuda.is_available() is False (CPU-only torch or driver missing)")
+except Exception as e:
+    print(f"  [WARN] torch CUDA probe failed: {e}")
+
+# RLinf local-runner import smoke.  The Orin torch wheel has
+# torch.distributed disabled, while some RLinf import paths refer to
+# dist.Work / torch.Event in type annotations.  The guide runner installs the
+# same import-time shim before importing these modules; verify that path here.
+try:
+    import torch
+    import torch.distributed as dist
+    if not hasattr(dist, "Work"):
+        class _StubWork:
+            def wait(self, *args, **kwargs):
+                raise RuntimeError("torch.distributed is disabled on this Orin.")
+            def is_completed(self):
+                return False
+        dist.Work = _StubWork
+    if not hasattr(torch, "Event"):
+        torch.Event = torch.cuda.Event if torch.cuda.is_available() else object
+    from rlinf.envs.realworld.galaxear.r1_pro_safety import build_safety_config
+    from rlinf.envs.realworld.galaxear.r1_pro_action_dispatcher import JointStateDispatcher
+    from rlinf.envs.realworld.galaxear.tasks.r1_pro_single_arm_reach_joint import GalaxeaR1ProSingleArmReachJointEnv
+    from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+    build_safety_config({})
+    print("  [OK ] RLinf Galaxea local SAC imports: SafetyConfig / JointStateDispatcher / Env / MLPPolicy")
+except Exception as e:
+    ok = False
+    print(f"  [FAIL] RLinf Galaxea local SAC imports: {e}")
 
 print()
 print("OK_OVERALL" if ok else "FAILED_OVERALL")
@@ -1107,22 +1506,26 @@ PYEOF
     echo "$check"
     if echo "$check" | grep -q "FAILED_OVERALL"; then
         echo ""
-        echo "[install][galaxea_r1_pro_orin] Some required imports FAILED -- see above."
-        echo "  Most common cause: ROS2 Humble not installed.  Run:"
-        echo "    bash requirements/embodied/ros2_humble_install.sh"
-        echo "  Then re-run this install script.  The venv is preserved."
-        # Don't exit non-zero -- venv is usable for --dummy CLI mode.
+        echo "[install][galaxea_r1_pro_orin] Some required imports FAILED — see above."
+        echo "  Common causes:"
+        echo "    * ROS2 Humble not installed:    bash requirements/embodied/ros2_humble_install.sh"
+        echo "    * Jetson CUDA torch missing:    re-run without RLINF_ORIN_SKIP_SYSTEM_POOL=1"
+        echo "    * Venv runtime deps missing:    re-run this script; it installs them into $VENV_DIR"
+        echo "  The venv is preserved — re-run after fixing."
     fi
 
-    # Disk footprint: just the venv dir, NOT system-site-packages
-    # (which would be ~10 GB of JetPack stuff).
-    local venv_size
+    local venv_size local_size
     venv_size=$(du -sh "$VENV_DIR" 2>/dev/null | awk '{print $1}')
+    local_size=$(du -sh "$HOME/.local/lib/python3.10/site-packages" 2>/dev/null | awk '{print $1}')
     echo ""
-    echo "[install][galaxea_r1_pro_orin] Disk usage of venv ($VENV_DIR): ${venv_size}"
+    echo "[install][galaxea_r1_pro_orin] Footprint:"
+    echo "    V3 venv runtime ($VENV_DIR):              ${venv_size:-(missing)}"
+    echo "    Jetson user site (~/.local, torch etc.):  ${local_size:-(empty / sudo mode)}"
     echo "[install][galaxea_r1_pro_orin] env ready.  To use:"
     echo "    source $VENV_DIR/bin/activate"
     echo "    python toolkits/realworld_check/test_galaxea_r1_pro_cli_controller.py --help"
+    echo "    python toolkits/realworld_check/train_r1pro_m1_orin_joint_mode_rlinf_sac.py --help"
+    echo "    python -c 'import torch; print(torch.cuda.is_available(), torch.__version__)'"
 }
 
 install_galaxea_r1_pro_env() {
