@@ -1,0 +1,228 @@
+# R1 Pro Orin single-process joint-mode SAC config (v3.2).
+#
+# Recommended start/target and speed values per
+# bt/docs/rwRL/r1pro6op47_reach_joint3_2.md §1.3 and §2.4.
+
+seed: 42
+device: auto                   # auto | cuda | cpu
+
+runtime:
+  # Fallbacks used ONLY when the matching shell env vars are not set:
+  # resolve_ros_env() always lets ROS_DOMAIN_ID / RMW_IMPLEMENTATION
+  # exported in the shell win, so you don't have to re-edit this file
+  # to match the running mobiman.  Keep this aligned with the most
+  # common bring-up so cold runs still work without an exported shell.
+  ros_domain_id: 1
+  rmw_implementation: rmw_cyclonedds_cpp
+  galaxea_install_path: /home/nvidia/galaxea/install
+  out_dir: logs/r1pro_m1_orin_joint_reach
+
+  # ============================================================
+  # Speed parameters (avoid robot oscillation, see guide §2)
+  # Per-step max joint travel = qvel_max * dt_step * safety_step_scale.
+  # With qvel_max=[1.6,...,4.0,...] and dt_step=0.10:
+  #   J1-J4: 0.024 rad ≈ 1.4°  per step
+  #   J5-J7: 0.060 rad ≈ 3.4°  per step
+  # ============================================================
+  safety_step_scale: 0.15
+  safety_margin_rad: null      # null = use SafetyConfig.l2_critical_margin_rad
+
+  # Preflight: how long to wait for mobiman to subscribe to the target
+  # joint-state topic before aborting with a diagnostic dump.
+  preflight_sub_wait_timeout_sec: 15.0
+  preflight_sub_poll_interval_sec: 0.5
+
+# ─── Phase 1: data generation ──────────────────────────────────────
+data_generation:
+  # The single (start, target) pair the anchor RL phase will use.
+  # Must appear verbatim in the ``pairs`` list below.
+  anchor_pair:
+    start_q:  [0.0,  0.0, 0.0,  0.0, 0.0,  0.0,  0.0]
+    target_q: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+
+  # All pairs swept during data collection (>= 1; first should match anchor).
+  # All values verified to lie inside SafetyConfig safe range (guide §1.2).
+  pairs:
+    # Pair 0 — anchor (required).
+    - start_q:  [0.0,  0.0, 0.0,  0.0, 0.0,  0.0,  0.0]
+      target_q: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+    # - start_q:  [0.10,  -0.25,  0.05, -0.50,  0.03, 0.12,  0.0]
+    #   target_q: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+    # - start_q:  [0.0,   -0.20,  0.0,  -0.65,  0.0,  0.25,  0.0]
+    #   target_q: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+    # - start_q:  0.20,  -0.40,  0.0,  -0.35,  0.0,  0.0,   0.0]
+    #   target_q: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+    # - start_q:  [0.0,   -0.15,  0.0,  -0.35,  0.0,  0.0,   0.0]
+    #   target_q: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+    # # Pair 1 — reverse direction.
+    # - start_q:  [0.10,  -0.25,  0.05, -0.50,  0.03, 0.12,  0.0]
+    #   target_q: [0.0,   -0.15,  0.0,  -0.35,  0.0,  0.0,   0.0]
+    # # Pair 2 — elbow + wrist coupling.
+    # - start_q:  [0.0,   -0.15,  0.0,  -0.35,  0.0,  0.0,   0.0]
+    #   target_q: [0.0,   -0.20,  0.0,  -0.65,  0.0,  0.25,  0.0]
+    # # Pair 3 — shoulder dominant motion.
+    # - start_q:  [0.0,   -0.15,  0.0,  -0.35,  0.0,  0.0,   0.0]
+    #   target_q: [0.20,  -0.40,  0.0,  -0.35,  0.0,  0.0,   0.0]
+
+  episodes_per_pair: 4
+  buffer_save_name: replay_buffer_phase1.npz
+
+  # ─── Variant: fixed target + random diverse starts ──────────────
+  # Used by `collect_random_start.py`.  Sampling-based; ignores
+  # `pairs` / `anchor_pair` above.  Defaults are tuned for the M1
+  # joint-reach task on R1 Pro right arm (||target-start|| ≈ 0.33 rad
+  # in the anchor pair, so 0.15-0.50 rad band gives reachable but
+  # non-trivial starts).
+  random_start:
+    # CLI --target-q overrides this; otherwise falls back to anchor_pair.target_q.
+    fixed_target_q: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+    num_starts: 8
+    min_distance_rad: 0.15           # ≥ this far from target → non-trivial
+    max_distance_rad: 1.50           # ≤ this far → reachable in max_num_steps
+    min_pairwise_dist_rad: 0.15      # Diversity floor between accepted starts
+    max_attempts_per_start: 500
+    fixed_axes:        [6]           # J7 pinned (matches anchor design)
+    fixed_axes_values: [0.0]
+    episodes_per_pair: 2
+    buffer_save_name: replay_buffer_phase1_random_start.npz
+    seed_offset: 7919                # Prime; decouples sampling RNG from main seed.
+
+  # ─── Trajectory synthesis strategies (Strategy Pattern) ─────────
+  # Each episode picks one strategy from this weighted mix.  The
+  # SafetyConfigActionProjector clamps every emitted action against
+  # SafetyConfig limits regardless of strategy, so adding strategies
+  # cannot violate safety.
+  #
+  # Strategies (NumPy-only, see toolkits/.../trajectory_strategies.py):
+  #   linear         — aim at target_q every step (constant-rate line)
+  #   min_jerk       — aim follows tau(s)=10s³-15s⁴+6s⁵ along the line
+  #   linear_jitter  — linear aim + per-step Gaussian noise on action
+  #   spline         — random via-points + cubic Hermite (Catmull-Rom)
+  #   random_walk    — RRT-style: goal_bias prob aim at target, else U[-1,1]
+  strategies:
+    - {name: linear,        weight: 2.0}
+    - {name: min_jerk,      weight: 3.0}
+    - {name: linear_jitter, weight: 2.0, params: {sigma: 0.10}}
+    - {name: spline,        weight: 1.0,
+       params: {num_via_min: 1, num_via_max: 3}}
+    - {name: random_walk,   weight: 0.5, params: {goal_bias: 0.5}}
+
+# ─── Environment ───────────────────────────────────────────────────
+env:
+  override_cfg:
+    is_dummy: false
+    # ros_domain_id is intentionally NOT set here — resolve_ros_env(cfg)
+    # writes the effective value (shell env > runtime.ros_domain_id) into
+    # this dict before build_env() runs.  If you hard-code a value here it
+    # will silently win and break shell-driven domain selection.
+    ros_localhost_only: false
+    galaxea_install_path: /home/nvidia/galaxea/install
+    mobiman_launch_mode: joint
+
+    use_joint_mode: true
+    joint_delta_mode: false
+    use_new_dispatcher: true
+
+    use_right_arm: true
+    use_left_arm: false
+    use_torso: false
+    use_chassis: false
+    no_gripper: true
+    cameras: []
+
+    step_frequency: 10.0
+    max_num_steps: 200
+    success_hold_steps: 5
+    joint_tolerance_rad: 0.05
+
+    # Overridden at runtime by the active pair (collect / train / eval).
+    target_q_right: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+    home_q_right:   [0.0,  0.0, 0.0,  0.0, 0.0,  0.0,  0.0]
+
+    # ============================================================
+    # Speed sent to mobiman joint tracker (msg.velocity field).
+    # Smaller than SafetyConfig.arm_qvel_max so the tracker moves slowly
+    # and smoothly (avoids overshoot / oscillation on real hardware).
+    # ============================================================
+    arm_qvel_max: [0.15, 0.15, 0.15, 0.15, 0.30, 0.30, 0.30]
+
+    safety_cfg:
+      right_arm_q_min: [-4.35, -3.04, -2.26, -1.99, -2.26, -0.95, -1.47]
+      right_arm_q_max: [ 1.21,  0.07,  2.26,  0.25,  2.26,  0.95,  1.47]
+      arm_qvel_max:    [1.6,   1.6,   1.6,   1.6,   4.0,   4.0,   4.0]
+      dt_step: 0.10
+      l2_warning_margin_rad:  0.15
+      l2_critical_margin_rad: 0.05
+      feedback_stale_threshold_ms:  300.0
+      operator_heartbeat_timeout_ms: 3000.0
+
+# ─── SAC ───────────────────────────────────────────────────────────
+sac:
+  obs_dim: 14                  # right_arm_qpos(7) + right_ee_pose(7)
+  action_dim: 7
+  gamma: 0.96
+  tau: 0.005
+  lr: 0.0003
+  alpha: 0.01
+  auto_alpha: true
+  target_entropy: -7.0
+  batch_size: 128
+  replay_size: 50000
+  start_steps: 0               # Phase 1 buffer prefills exploration data
+  update_after: 256
+  updates_per_env_step: 2
+
+# ─── SFT (optional Phase 2 — behaviour cloning) ────────────────────
+sft:
+  epochs: 50
+  lr: 0.001
+  batch_size: 64
+  checkpoint_name: sft_pretrained.pt
+
+# ─── Online RL training ────────────────────────────────────────────
+train:
+  total_episodes: 20
+  save_every_episodes: 10
+  safe_reset_tolerance_rad: 0.025
+  safe_reset_max_steps: 200
+
+# ─── Random-start online RL training ───────────────────────────────
+# Used by `train_sac_random_start.py`.  The target stays fixed (so the
+# 14-D obs / 7-D action SAC architecture is unchanged), but every
+# episode resets to a fresh / cycled random start sampled from the same
+# shell distribution `collect_random_start.py` uses.  The held-out eval
+# pool is sampled with a different seed offset so it never overlaps the
+# training distribution and reflects true generalisation.
+random_start_train:
+  # Fixed target_q (CLI --target-q overrides; otherwise falls back to
+  # data_generation.random_start.fixed_target_q, then anchor_pair.target_q).
+  fixed_target_q: [-1.0,  0.0,  0.0, 0.0,  0.0, 0.0,  0.0]
+
+  # Pool selection
+  pool_mode: fresh                # fresh | fixed
+  pool_size: 16                   # used only if pool_mode=fixed
+  shuffle_pool_each_epoch: true   # used only if pool_mode=fixed
+
+  # Distance band — same defaults as data_generation.random_start
+  min_distance_rad: 0.10
+  max_distance_rad: 0.50
+  min_pairwise_dist_rad: 0.05
+  max_attempts_per_start: 500
+  fixed_axes:        [6]
+  fixed_axes_values: [0.0]
+
+  # Held-out evaluation
+  eval_pool_size: 4               # 0 → eval disabled
+  eval_every_episodes: 20         # 0 → eval disabled
+  eval_episodes_per_start: 1
+
+  # Logging
+  success_window: 20              # rolling-window success rate
+
+  # Reproducibility
+  seed_offset: 13127              # different from data_generation.random_start.seed_offset
+  eval_seed_offset: 50021         # ensures eval pool ≠ train pool
+
+# ─── Evaluation ────────────────────────────────────────────────────
+eval:
+  episodes: 10

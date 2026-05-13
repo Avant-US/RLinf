@@ -12,6 +12,13 @@ TEST_BUILD=${TEST_BUILD:-0}
 # Absolute path to this script (resolves symlinks)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+# Immutable copies of the script's own location.  Some sourced setup
+# scripts (notably Galaxea SDK's mobiman.sh) reassign a bare ``SCRIPT_DIR``
+# in the current shell, which would otherwise corrupt our SCRIPT_DIR.
+# Use these *_RAW variables anywhere we need the install.sh location after
+# sourcing third-party setup scripts.
+readonly RLINF_INSTALL_SCRIPT_PATH="$SCRIPT_PATH"
+readonly RLINF_INSTALL_SCRIPT_DIR="$SCRIPT_DIR"
 USE_MIRRORS=0
 GITHUB_PREFIX=""
 NO_ROOT=0
@@ -1368,13 +1375,16 @@ install_galaxea_r1_pro_orin_env() {
     done
 
     # ---- 4. RLinf editable install (without dependency resolution) -
-    # Walk upward from $SCRIPT_DIR until we find RLinf's pyproject.toml.
-    # Avoids the trap of running this script from a copied-out directory
-    # (e.g. mobiman/share/mobiman/requirements) where ``$SCRIPT_DIR/..``
-    # is not the RLinf root.
+    # Walk upward from RLINF_INSTALL_SCRIPT_DIR until we find pyproject.toml.
+    # IMPORTANT: we use ``RLINF_INSTALL_SCRIPT_DIR`` (captured at install.sh
+    # entry, before any third-party sourcing) instead of ``SCRIPT_DIR``,
+    # because Galaxea SDK's mobiman.sh reassigns a bare ``SCRIPT_DIR`` to
+    # ``/home/.../mobiman/share/mobiman/environment`` when sourced above,
+    # which would corrupt the lookup and yield a spurious "could not find
+    # RLinf pyproject.toml" error.
     export UV_LINK_MODE=${UV_LINK_MODE:-hardlink}
     local rlinf_root parent_dir
-    rlinf_root="$SCRIPT_DIR"
+    rlinf_root="$RLINF_INSTALL_SCRIPT_DIR"
     while [ ! -f "${rlinf_root}/pyproject.toml" ]; do
         if [ "$rlinf_root" = "/" ]; then
             rlinf_root=""
@@ -1388,7 +1398,7 @@ install_galaxea_r1_pro_orin_env() {
         rlinf_root="$parent_dir"
     done
     if [ -z "$rlinf_root" ] || [ ! -f "${rlinf_root}/pyproject.toml" ]; then
-        echo "[install][galaxea_r1_pro_orin] ERROR: could not find RLinf pyproject.toml above SCRIPT_DIR=${SCRIPT_DIR}" >&2
+        echo "[install][galaxea_r1_pro_orin] ERROR: could not find RLinf pyproject.toml above RLINF_INSTALL_SCRIPT_DIR=${RLINF_INSTALL_SCRIPT_DIR}" >&2
         echo "  Use a full RLinf git checkout (with pyproject.toml at the repo root), not a partial copy." >&2
         exit 1
     fi

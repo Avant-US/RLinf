@@ -516,14 +516,18 @@ class ActionComposer:
                     cur_q,
                 )
             else:
-                q_min, q_max = self._q_bounds(side)
+                # Build a target vector that keeps all other joints at
+                # their current value; only the touched joint moves.
+                # Then normalise the full 7-vector through the same
+                # inverse mapping the abs branch above uses, so the
+                # downstream JointStateDispatcher receives a consistent
+                # `_latest[side][:7]` regardless of single- vs multi-axis
+                # input.  ``_q_rad_to_norm`` returns a (7,) ndarray; do
+                # NOT wrap in ``float()`` (that raises on length>1).
                 cur_q = self._read_cur_q(side)
                 q_target = cur_q.copy()
                 q_target[i] = q
-                # n = float(2.0 * (q - q_min[i]) / max(q_max[i] - q_min[i], 1e-9) - 1.0)
-                # self._latest[side][i] = n
-                n = float(2.0 * (q_target - q_min) / max(q_max - q_min, 1e-9) - 1.0)
-                self._latest[side][:7] = n  #@#TODO to test, expecting it can only change one joint
+                self._latest[side][:7] = self._q_rad_to_norm(side, q_target)
 
     def _compose_joint_norm(self, side: str, payload: dict) -> None:
         """``jn r ...`` is the raw normalised vector the model emits.
