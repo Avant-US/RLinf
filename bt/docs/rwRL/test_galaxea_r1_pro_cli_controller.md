@@ -1761,11 +1761,23 @@ ros2 topic info /motion_target/target_joint_state_arm_right -v   # 应有 subs >
 
 # 3. 启动 CLI
 # conda activate r1_pro_platform
-python toolkits/realworld_check/test_galaxea_r1_pro_cli_controller.py \
-    --backend rclpy \
-    --use-joint-mode --use-right-arm \
-    --gripper-min-pct 0 --gripper-max-pct 90 \
-    --strict-topo                          # 缺订阅就直接 fail-fast
+# python toolkits/realworld_check/test_galaxea_r1_pro_cli_controller.py \
+#     --backend rclpy \
+#     --use-joint-mode --use-right-arm \
+#     --gripper-min-pct 0 --gripper-max-pct 90 \
+#     --strict-topo                          # 缺订阅就直接 fail-fast
+# #复位:  j r 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+# j r 1.0 0.0 0.0 0.0 0.0 0.0 0.0
+# #reach 3_2
+# j r 0.0 -0.15 0.0 -0.35 0.0 0.0 0.0
+# j r 0.12 -0.30 0.08 -0.55 0.05 0.15 0.0
+# #home
+# j r 0 0 0 0 0 0 0
+# j r -1 0 0 0 0 0 0
+# #min
+# j r -4.35 -3.04 -2.26 -1.99 -2.26 -0.95 -1.47
+# #max
+# j r 1.21 0.07 2.26 0.25 2.26 0.95 1.47
 
 python toolkits/realworld_check/test_galaxea_r1_pro_cli_controller.py \
     --backend rclpy \

@@ -441,6 +441,10 @@ export PYTHONPATH=/home/nvidia/lg_ws/RL/RLinf:$PYTHONPATH
 python -m toolkits.realworld_check.r1pro_m1_orin.collect \
     --config toolkits/realworld_check/r1pro_m1_orin/config.yaml
 ```
+```bash
+python -m toolkits.realworld_check.r1pro_m1_orin.collect_random_start \
+    --config toolkits/realworld_check/r1pro_m1_orin/config.yaml
+```
 
 预期观察：
 - 机器人缓慢、平滑地移动（每步 ≤ 1.4° @ J1-J4）
@@ -476,7 +480,12 @@ python -m toolkits.realworld_check.r1pro_m1_orin.train_sac \
 python -m toolkits.realworld_check.r1pro_m1_orin.train_sac \
     --config toolkits/realworld_check/r1pro_m1_orin/config.yaml
 ```
+```bash
+python -m toolkits.realworld_check.r1pro_m1_orin.train_sac_random_start \
+    --config toolkits/realworld_check/r1pro_m1_orin/config.yaml \
+    --sft-checkpoint logs/r1pro_m1_orin_joint_reach/sft_pretrained.pt
 
+```
 ### 7.2 训练时观察要点
 
 | 现象 | 原因 | 处理 |
