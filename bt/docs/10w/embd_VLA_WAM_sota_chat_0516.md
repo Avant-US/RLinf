@@ -1,5 +1,5 @@
-# 具身智能预训练模型研究
-_Exported on 5/13/2026 at 20:53:43 GMT+8 from Cursor (3.3.30)_
+# 具身智能VLA预训练研究资料罗列
+_Exported on 5/16/2026 at 08:40:15 GMT+8 from Cursor (3.4.20)_
 
 ---
 
@@ -477,6 +477,8 @@ _Exported on 5/13/2026 at 20:53:43 GMT+8 from Cursor (3.3.30)_
 
 ---
 
+# VLA预训练考虑点分析.V1
+
 **User**
 
 要在超多的数据上训练一个超大的具身智能预训练模型,使得这模型能装在不同的机器人本体上zero-shot地执行各种不同的复杂任务,深入分析刚才你罗列的所参考的各个最新SOTA论文和研究成果等, 也可以到网上搜索相关资料, 仔细分析和深入思考一下, 要做这件事情要考虑哪些方面, 注意哪些细节, 将它们罗列出来. 
@@ -488,8 +490,6 @@ _Exported on 5/13/2026 at 20:53:43 GMT+8 from Cursor (3.3.30)_
 下面是一份**深度分析**——基于上一轮列出的 2026 SOTA 论文 + 这次新查到的关键工程实践,系统性地梳理"训一个能装到不同机器人本体上 zero-shot 执行复杂任务的超大具身基础模型"必须考虑的全部维度。我尽量按"**问题 → 关键挑战 → 2026 SOTA 给出的答案 → 实操坑点 → 具体数字**"的结构展开,共 **12 大维度**。
 
 ---
-
-# 顶层设计原则V1
 
 ## 顶层设计原则(2026 共识中决定项目能否成功的"6 条铁律")
 
@@ -926,8 +926,7 @@ Stage 5  Online RL & 持续学习(SOP / LWD / VLA-OPD,部署后持续涨点)
 
 ---
 
-# 顶层设计原则V2
-
+# VLA预训练考虑点分析.标出处并补漏.V2
 
 **User**
 
@@ -1350,4 +1349,788 @@ Stage 5  Online RL & 持续学习
 - 法规条款细节
 
 如果你需要,我可以专门针对其中几条**到文献里再深挖一轮**,把"找不到出处"逐项打掉。
+
+---
+
+# 世界模型考虑点.涉及DM0.V1
+
+**User**
+
+我要用超多的数据训练一个超大的能用于机器人领域,具身智能领域和VLA领域的世界模型,, 请问我该怎么做?要考虑那些方面和细节点.  列一下有些什么相关的, SOTA的2026年的论文, 文章或研究成果可以借鉴. 可上网搜索.
+
+---
+
+**Cursor**
+
+让我先看一下你工作区里的相关文件,理解一下你的项目背景,再做针对性的搜索和分析。
+
+了解你的项目背景了——你是在做 DM0(Dexmal & StepFun, arXiv 2602.14974)这条"具身原生 VLA"路线。现在你问的是**专门训世界模型(World Model)**,这是另一条与 VLA 紧密相关但相对独立的技术线。让我先搜一下 2026 年这块的最新进展。
+
+非常好,看了你工作区的 DM0 项目背景(arXiv 2602.14974, Feb 2026, "Embodied-Native VLA"),你之前问的是 VLA,现在专门聚焦"超大具身世界模型"——这是一条**与 VLA 紧密相关但目标不同**的路线。
+
+下面我做一份针对**2026 年具身世界模型(Embodied World Model, EWM)**的深度分析,所有论点都会标 2026 出处。
+
+---
+
+## 一、先把"世界模型"在 2026 重新定义清楚
+
+2026 年具身领域对"世界模型"已经分化出 **5 类**截然不同的形态,选错形态比训不动更危险。先要选对形态:
+
+| 形态 | 输入 → 输出 | 用途 | 代表 2026 工作 |
+|---|---|---|---|
+| **像素级视频生成 WM** | (o, a, l) → 未来视频帧 | 数据生成、sim2real、policy eval | NVIDIA Cosmos Predict 2.5、Genie 3、ABot-PhysWorld |
+| **Latent / token-space WM** | (o_t) → z_t → ẑ_{t+1} | imagination-based RL、规划 | Dreamer V4、CoLA-World、DIAL |
+| **3D / 4D 几何 WM** | (o, a) → 4D 点云/NeRF/Gaussian | 物理一致性、几何精确控制 | Kinema4D、Phys4D、Neural Fields as WM、DeepVerse |
+| **Action-Centric / WAM**(World–Action Model) | (o, l) → (a, o') 联合 | 直接做策略 + 想象 | GR00T N2 WAM、GigaWorld-Policy、STARRY、Cosmos Policy |
+| **Discrete / Mask WM** | (o, a) → 语义 mask / 离散 token | 抗噪、加速、评测 | Mask World Model、dWorldEval |
+
+> 一个判断窗口:**如果你的下游主要服务于 VLA**,优先 **WAM(形态 4)** 或 **Latent WM(形态 2)**;**如果是数据飞轮**,选 **像素 WM(形态 1)**;**如果做精细物理操作**,选 **4D WM(形态 3)** [GR00T N2, NVIDIA blog;World-VLA-Loop, arXiv 2602.06508;Kinema4D, arXiv 2603.16669]。
+
+---
+
+## 二、训练超大具身世界模型需要考虑的全部维度
+
+下面 14 个维度,**每条都标 2026 出处**(找不到出处的标注"工程经验")。
+
+### 1. 任务与目标定义(决定整个项目的上限)
+
+- **明确世界模型的"用途"**:数据飞轮 / policy eval / 想象 RL / 规划 / sim2real,**4 种用途的训练数据/损失/评测都不一样** [WorldArena 揭示 14 个模型存在 "perception-functionality gap":高画质 ≠ 强具身能力, arXiv 2602.08971]。
+- **决定**条件输入维度:语言、动作、proprio、相机轨迹、目标 bbox、点云,缺一种就限制一类用途 [Cosmos Predict 2.5 同时支持 Text2World/Image2World/Video2World, research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5;Action Images 把 7-DoF 动作渲染成"动作图像"作为像素条件, arXiv 2604.06168]。
+- **决定**输出形态:RGB 像素 / latent token / 3D 点云 / 4D Gaussian / 语义 mask / 离散 keyframe [Mask World Model 用语义 mask 替代 RGB,LIBERO/RLBench 全面优于 RGB WM, arXiv 2604.19683;dWorldEval 用稀疏 keyframe + progress token, arXiv 2604.22152]。
+- **决定**预测视野:秒级(1–5s)/ 分钟级 / 1000+ 帧 [Cosmos Predict 2.5 = 30 秒, research.nvidia.com;Infinite-World = 1000+ 帧, arXiv 2602.02393;HorizonDrive = 分钟级, arXiv 2605.11596]。
+
+### 2. 数据(规模、组合、对齐)
+
+- **数据量起步线**:Cosmos Predict 2.5 用了 **2 亿条高质量视频片段** [research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5];ABot-PhysWorld 用了 **3M 操作片段 + 物理标注** [arXiv 2603.23376];Kinema4D 用 **Robo4D-200k**(20 万 episodes,4D 标注) [arXiv 2603.16669]。
+- **数据组合(2026 共识)**:必须是 **互联网视频 + 真机机器人数据 + 仿真合成 + 第一人称人类视频** 的混合,任何单一来源都训不出泛化 [Cosmos 平台说明覆盖"机器人/AV/工业" 多 domain, nvidia.com/cosmos;DM0 同样混合 OXE/RoboMind/Agibot/Galaxea + LIBERO + RoboTwin 2.0 + Habitat, dm0.md §1.1 + DM0 论文]。
+- **物理标注**(关键差异点):2026 顶级 WM 不再只标语言,而是把"接触/物理事件"显式标注 [ABot-PhysWorld 用"physics-aware annotations"对抗 object penetration / anti-gravity 错误, arXiv 2603.23376]。
+- **4D 标注**:URDF + 关节 + 末端 + 点云对齐 [Kinema4D 用 URDF 推 4D 控制轨迹再投射到点图, arXiv 2603.16669]。
+- **多模态时序对齐**(RGB / depth / proprio / action / 触觉):必须做严格的时间戳同步 + 重采样到统一基频 [找不到 2026 单篇综述出处,工程惯例;DM0 用 keyframe sampling, dm0.md §1.3]。
+- **长程数据**:对训"分钟级"WM,必须有 ≥ 60s 的连续轨迹数据 [HorizonDrive 显式收集分钟级驾驶序列, arXiv 2605.11596;Infinite-World 1000+ 帧训练 schedule, arXiv 2602.02393]。
+- **数据过滤与配比**(同 VLA 路线):去重、模糊过滤、本体不相关样本剔除 [Naive 跨域 mixing 会负迁移, Rethinking VLA Scaling, arXiv 2602.09722;Cosmos Curator 是 NVIDIA 官方过滤工具, nvidia.com/cosmos]。
+
+### 3. 模型架构(2026 主流四选一)
+
+| 架构 | 优点 | 出处 |
+|---|---|---|
+| **DiT(Diffusion Transformer)像素生成** | 视觉质量最高 | [Cosmos Predict 2.5 = 2B/14B DiT, research.nvidia.com;ABot-PhysWorld 14B DiT, arXiv 2603.23376] |
+| **Block-causal Transformer + tokenizer** | 实时交互、低延迟 | [Dreamer V4, emergentmind.com/papers/2509.24527;Genie 3 实时 720p 20-24 fps, deepmind.google/genie] |
+| **Autoregressive 离散 token** | 与 VLA 共享 backbone 友好 | [DeepVerse 4D autoregressive, openreview pdf;dWorldEval discrete diffusion, arXiv 2604.22152] |
+| **Hybrid(latent + pixel + 3D)** | 兼顾几何精确与视觉真实 | [MosaicMem 显式 3D patch lift + 隐式条件, arXiv 2603.17117;Phys4D 三阶段 hybrid, arXiv 2603.03485] |
+
+- **Tokenizer**:Causal video tokenizer 是 2026 的事实标准 [Dreamer V4 用 masked-autoencoding causal tokenizer, emergentmind.com;Cosmos 有专用 video tokenizer, github.com/nvidia-cosmos/cosmos-predict2.5]。
+- **条件注入**:cross-attention / control net / latent concat,**动作条件首选 cross-attn**,不是 prompt embed [Action Images 把动作渲染成像素图直接当输入, arXiv 2604.06168;Cosmos Policy 把动作和状态当 latent video frames,统一进 DiT, huggingface.co/blog/nvidia/cosmos-policy-for-robot-control]。
+- **记忆 / 长程**:HPMC 分层 pose-free 记忆压缩器 [Infinite-World, arXiv 2602.02393];3D patch + 隐式 hybrid memory [MosaicMem, arXiv 2603.17117]。
+
+### 4. 训练目标 / Loss 设计
+
+- **Diffusion / Flow Matching loss**(主流) [Cosmos Predict 2.5, research.nvidia.com;ABot-PhysWorld DiT, arXiv 2603.23376]。
+- **Shortcut Forcing**(Dreamer V4 创新):泛化 diffusion forcing,直接预测干净 latent,**100× 数据效率** [Dreamer V4, emergentmind.com/papers/2509.24527]。
+- **Inverse Dynamics Reward**(物理可执行性对齐):用 IDM 当 reward 对齐生成视频 [EVA, arXiv 2603.17808]。
+- **DPO + 解耦判别器**(物理一致性后训练) [ABot-PhysWorld 物理 DPO, arXiv 2603.23376]。
+- **多视角 fidelity reward**(防止多步 rollout 坍塌) [Persistent Robot World Models RL post-training, arXiv 2603.25685]。
+- **Self-Corrective Rollout(SRR)**:训练时强迫从"被预测污染过的历史"重建未来,极大降低 drift [HorizonDrive SRR,FID -52% / FVD -37%, arXiv 2605.11596]。
+- **3D / 几何辅助 loss**(显式 depth / pointmap 监督) [DeepVerse 4D 几何约束, openreview;Phys4D 几何投射, arXiv 2603.03485]。
+- **Mask / 语义级 loss**(去 RGB 噪声) [MWM, arXiv 2604.19683]。
+
+### 5. WM 与 VLA 的联合训练(决定 WM 能不能"为下游服务")
+
+- ⭐ **World-VLA-Loop**:闭环 — VLA 失败 rollout 反馈精炼 WM,WM 再优化 VLA,**真机 +36.7%** [arXiv 2602.06508]。
+- ⭐ **VLAW**:迭代共改进,**+39.2% 绝对成功率,合成数据 +11.6%** [arXiv 2602.12063]。
+- **DIAL**:把"意图"和"动作"在 latent WM 里解耦 [arXiv 2603.29844]。
+- **GR00T N2 WAM**:World Action Model 直接预测物理状态,98% zero-shot 操作未见物体 [techbytes.app GR00T N2]。
+- **GigaWorld-Policy**:**比 π0.5 在 RoboTwin 2.0 上 +95%、推理快 9×** [arXiv 2603.17240]。
+- **STARRY**:WM 和动作联合 denoise,RoboTwin 双臂 93.82%,真机 42.5% → 70.8%(对比 π0.5) [arXiv 2604.26848]。
+- **Cosmos Policy**:NVIDIA 把动作和状态当 latent video frames,统一 DiT 同时做 visuomotor 控制 / WM / value 规划 [huggingface.co/blog/nvidia/cosmos-policy-for-robot-control]。
+- **CoLA-World**:Latent Action 和 WM **协同进化**,解决两阶段方法的表征坍塌 [arXiv 2510.26433]。
+
+### 6. 物理一致性(2026 真正的瓶颈)
+
+- 物理违例(物体穿模、反重力、违反守恒)是当前所有 SOTA WM 的最大缺陷 [ABot-PhysWorld 显式声明此问题, arXiv 2603.23376]。
+- 解法 1:**物理对齐 DPO 后训练** [ABot-PhysWorld, arXiv 2603.23376]。
+- 解法 2:**4D Gaussian / NeRF 几何先验** [Phys4D, arXiv 2603.03485;Neural Fields as WM, arXiv 2602.18690]。
+- 解法 3:**仿真 ground RL** [Phys4D 第三阶段, arXiv 2603.03485]。
+- 解法 4:**URDF + IK 显式注入** [Kinema4D, arXiv 2603.16669]。
+- 解法 5:**逆动力学一致性约束** [EVA inverse dynamics reward, arXiv 2603.17808]。
+
+### 7. 长程一致性 / 记忆 / Drift 抑制
+
+- ⭐ **Hierarchical Pose-free Memory(HPMC)**:递归压缩历史 latent,**1000 帧仍一致** [Infinite-World, arXiv 2602.02393]。
+- ⭐ **Self-Corrective Rollout(SRR)**:训练时显式让模型从坏历史恢复 [HorizonDrive, arXiv 2605.11596]。
+- ⭐ **RL on rollouts**:用多视角 fidelity reward 后训练,**98% 偏好对比** [Persistent Robot WM, arXiv 2603.25685]。
+- **Hybrid spatial memory**:3D patch lift + 隐式条件 [MosaicMem, arXiv 2603.17117]。
+- **离散稀疏 keyframe**:dWorldEval 用稀疏关键帧 + progress token 做评测 [arXiv 2604.22152]。
+
+### 8. 训练流程与课程
+
+- **3 阶段训练**(Phys4D 范式):
+  1. 伪监督预训(纯视频)
+  2. 物理 SFT(仿真数据)
+  3. 仿真 ground RL [Phys4D, arXiv 2603.03485]。
+- **2 阶段 latent + RL**(Dreamer V4):先训 WM,再"在 imagination 内"训 policy,**完全离线就能拿钻石** [Dreamer V4, emergentmind.com]。
+- **联合协同**(CoLA-World):LAM + WM 同时训,有 warm-up 防坍塌 [arXiv 2510.26433]。
+- **Cosmos Predict → Cosmos Policy 后训练**:先训通用世界模型,再把"动作和状态当 latent video frames"做 robot 后训练 [huggingface.co/blog/nvidia/cosmos-policy-for-robot-control]。
+
+### 9. 参数规模与算力
+
+- **Cosmos Predict 2.5**:2B / 14B 双尺寸 [research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5]。
+- **ABot-PhysWorld**:14B DiT [arXiv 2603.23376]。
+- **Dreamer V4**:**110M 在 4090 (8GB) 上实时跑** [github.com/machines-in-motion/dreamer-v4]。
+- **Genie 3**:具体规模未披露,**720p @ 20–24 fps 实时** [deepmind.google/blog/genie-3-a-new-frontier-for-world-models]。
+- **算力起步**:200M 视频片段训 14B DiT 至少 **2k–8k H100 × 周级** [找不到出处,基于 Cosmos 2.5 公开数据点反推]。
+
+### 10. 评测体系(2026 必须用 WorldArena)
+
+- ⭐ **WorldArena**(CVPR 2026 Challenge,清华 fib-lab):16 个指标 / 6 子维度 / **EWMScore** 单一指标;3 类评测:像素质量、具身功能、人评 [arXiv 2602.08971;world-arena.ai;cvpr2026challenge.world-arena.ai;github tsinghua-fib-lab/WorldArena]。
+- 关键发现:**"perception-functionality gap"——画质好 ≠ 具身有用** [arXiv 2602.08971]。
+- **dWorldEval**:用 WM 自身做 policy 大规模评测,跨千级环境/任务 [arXiv 2604.22152]。
+- **物理 metric**:object penetration rate / anti-gravity rate / 守恒违反率 [ABot-PhysWorld 提议, arXiv 2603.23376]。
+- **下游 utility metric**:把 WM 当 sim2real / RL 想象环境后,policy 真实成功率涨多少 [VLAW +39.2%, arXiv 2602.12063;World-VLA-Loop +36.7%, arXiv 2602.06508]。
+
+### 11. 部署与推理
+
+- **实时性硬指标**:Genie 3 = 720p / 20–24 fps [deepmind.google/genie];Dreamer V4 = 4090 上实时 [github.com/machines-in-motion/dreamer-v4]。
+- **数据飞轮服务态**(Cosmos Curator + Dataset Search + Evaluator)是 2026 的标准范式 [nvidia.com/cosmos]。
+- **像素 WM 用作 RL imagination**:必须能 ≥ 100Hz 出虚拟帧才有 RL 性价比 [Dreamer V4, emergentmind.com]。
+- **WM 当 policy evaluator**:dWorldEval 显式服务此场景 [arXiv 2604.22152]。
+- **Sim2Real 服务**(像素 WM 的最重要应用):Cosmos Transfer 2.5 配合 CARLA / Isaac Sim 把 sim 转 photoreal [nvidia.com/cosmos]。
+
+### 12. 与你的 DM0 项目对接(关键)
+
+DM0 论文里提供的"Embodied Spatial Scaffolding"已经在做**轻量级世界模型雏形**:
+- "End-effector trajectory prediction"≈ 1D 轨迹 WM [DM0 论文 §2.3, dm0.md §1.3]
+- "Goal bounding box prediction"≈ 2D 空间 WM [DM0 论文 §2.3]
+- "Subtask prediction"≈ 语义层 WM [DM0 论文 §2.3]
+- 全部通过 L_AR 自回归文本预测实现 [embd_pt_sota_princpl.md L140-145]
+
+如果要把 DM0 升级成"含真实 WM 的 VLA",**最自然的路径是按 Cosmos Policy 风格** — 把 action / state 当作 latent video frames 跟视频帧统一进 DiT [huggingface.co/blog/nvidia/cosmos-policy-for-robot-control];或按 World-VLA-Loop 做闭环 RL [arXiv 2602.06508]。
+
+### 13. 工程基础设施
+
+- 数据 pipeline / streaming(同 VLA 路线)[找不到出处,工程经验]。
+- **视频解码 GPU 加速**(NVIDIA DALI / torchcodec)对 200M 视频片段是必需 [找不到出处,工程惯例]。
+- DiT 训练特殊问题:**显存爆炸**(高清长视频),要用 stage-wise + sequence parallel [Cosmos 训练要点, github.com/nvidia-cosmos/cosmos-predict2.5]。
+- Async checkpoint / loss spike rollback(同大模型训练) [找不到出处,工程惯例]。
+
+### 14. 安全 / 合规
+
+- **生成式 WM 风险**:被用来伪造视频、deepfake [找不到出处,通用 AI safety 议题]。
+- **Cosmos 用 NVIDIA Open Model License** [research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5]。
+- **Genie 3 仅限 18+ 美国 Ultra 订阅用户**(说明 Google 评估了滥用风险) [deepmind.google blog;wikipedia.org/wiki/Genie_3]。
+- 生成视频水印 / provenance(C2PA) [找不到出处,行业实践]。
+
+---
+
+## 三、2026 必读 SOTA 清单(纯 World Model,不重复 VLA)
+
+> 全部为 **2025 Q4 – 2026 Q2** 的工作,标注首发月份/单位/链接关键词。
+
+### A. 通用具身世界基础模型(Generalist EWM)
+
+| 模型 | 时间 | 单位 | 关键贡献 | 出处 |
+|---|---|---|---|---|
+| ⭐ **NVIDIA Cosmos Predict 2.5** | 2026 | NVIDIA | 2B/14B DiT,200M video clips,统一 Text/Image/Video → World,30 秒预测 | research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5 |
+| ⭐ **NVIDIA Cosmos Transfer 2.5** | 2026 | NVIDIA | sim2real,配 CARLA / Isaac Sim | nvidia.com/cosmos |
+| ⭐ **NVIDIA Cosmos Reason** | 2026 | NVIDIA | physics-aware VLM,可与 WM 对接 | nvidia.com/cosmos |
+| ⭐ **NVIDIA Cosmos Policy** | 2026 | NVIDIA | 把 action/state 当 latent video frames 进 DiT,统一 visuomotor + WM + value | huggingface.co/blog/nvidia/cosmos-policy-for-robot-control |
+| ⭐ **Google Genie 3** | 2025.08 announce / 2026.01 公开 | DeepMind | 720p 20–24 fps 实时交互式 3D 世界 | deepmind.google/blog/genie-3-a-new-frontier-for-world-models |
+| **Waymo World Model**(Genie 3 衍生) | 2026.02 | Waymo | 自动驾驶 edge case 仿真 | wikipedia.org/wiki/Genie_3 |
+| ⭐ **Dreamer V4** | 2025.09 | DeepMind | block-causal Transformer,Shortcut Forcing,**Minecraft 钻石纯 offline,4090 上实时** | emergentmind.com/papers/2509.24527;github.com/machines-in-motion/dreamer-v4 |
+
+### B. 机器人专用 / VLA 集成 WM
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **GR00T N2 (WAM)** | techbytes.app GR00T N2 | World Action Model,Jetson Thor,98% zero-shot |
+| ⭐ **GigaWorld-Policy** | arXiv 2603.17240 | RoboTwin 2.0 比 π0.5 +95%,推理快 9× |
+| ⭐ **STARRY** | arXiv 2604.26848 | RoboTwin 双臂 93.82%,真机 42.5→70.8% vs π0.5 |
+| ⭐ **World-VLA-Loop** | arXiv 2602.06508 | VLA 与 WM 闭环 RL,真机 +36.7% |
+| ⭐ **VLAW** | arXiv 2602.12063 | 迭代共改进,+39.2% 绝对 |
+| **DIAL** | arXiv 2603.29844 | 意图 / 动作解耦的 latent WM |
+| **HiPolicy** | arXiv 2604.06067 | 多频率分层 |
+| **CoLA-World** | arXiv 2510.26433 | LAM + WM 协同进化,防坍塌 |
+| **OmniGuide** | arXiv 2604.20100 | 推理时 WM 引导 |
+| **DriveWorld-VLA** | arXiv 2602.06521 | 自动驾驶 |
+
+### C. Action-Conditioned 视频生成(把 WM 当 policy)
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| **Action Images** | arXiv 2604.06168 | 把 7-DoF 动作渲成像素图,视频骨干即 zero-shot policy |
+| **EVA** | arXiv 2603.17808 | inverse dynamics reward 对齐物理可执行性 |
+| **PhysGen** | arXiv 2603.00110 | 预训练视频模型当物理仿真器 |
+| **World Guidance(WoG)** | arXiv 2602.22010 | 用压缩条件空间建模未来 |
+
+### D. 物理 / 4D 一致性
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **ABot-PhysWorld** | arXiv 2603.23376 | 14B DiT + 物理 DPO + 解耦判别器,3M 物理标注片段 |
+| ⭐ **Kinema4D** | arXiv 2603.16669 | URDF → 4D 控制,Robo4D-200k 数据 |
+| ⭐ **Phys4D** | arXiv 2603.03485 | 3 阶段(伪监督 + 物理 SFT + 仿真 RL) |
+| **Neural Fields as World Models** | arXiv 2602.18690 | NeRF / 神经场作为 WM |
+| **DeepVerse** | openreview pdf 92cdb70... | 4D autoregressive,几何约束 |
+| **Mask World Model** | arXiv 2604.19683 | 语义 mask 替 RGB,LIBERO/RLBench 全胜 |
+| **Causal World Modeling** | arXiv 2601.21998 | 因果建模 |
+
+### E. 长程一致性 / 记忆
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **Infinite-World** | arXiv 2602.02393 | HPMC 分层 pose-free 记忆,**1000+ 帧** |
+| ⭐ **HorizonDrive** | arXiv 2605.11596 | SRR 自纠正,FID -52% / FVD -37%,分钟级 |
+| ⭐ **Persistent Robot WM** | arXiv 2603.25685 | RL 后训练 + 多视角 fidelity reward,98% 偏好 |
+| **MosaicMem** | arXiv 2603.17117 | 3D patch + 隐式 hybrid 记忆 |
+
+### F. 评测与下游 utility
+
+| 资源 | 出处 |
+|---|---|
+| ⭐ **WorldArena**(CVPR 2026 Challenge) | arXiv 2602.08971;world-arena.ai;github tsinghua-fib-lab/WorldArena |
+| ⭐ **dWorldEval** | arXiv 2604.22152 |
+| **CVPR 2026 Challenge** Track 1 / Track 2 | cvpr2026challenge.world-arena.ai |
+
+### G. 开源代码库 / 平台
+
+| 资源 | 出处 |
+|---|---|
+| ⭐ **NVIDIA Cosmos**(代码 + 模型) | github.com/nvidia-cosmos/cosmos-predict2.5;nvidia.com/cosmos |
+| ⭐ **WorldArena** | github.com/tsinghua-fib-lab/WorldArena |
+| **Dreamer V4 PyTorch 实现** | github.com/machines-in-motion/dreamer-v4 |
+
+---
+
+## 四、推荐训练路线(基于以上 SOTA)
+
+```text
+Stage 0  选定形态 + 用途
+        ├─ 数据飞轮服务?      → Cosmos Predict 2.5 风格(像素 DiT)
+        ├─ Imagination RL?    → Dreamer V4 风格(latent)
+        ├─ 物理精细操作?      → Phys4D / Kinema4D 风格(4D)
+        └─ 与 VLA 一起训?     → Cosmos Policy / World-VLA-Loop / GigaWorld 风格
+
+Stage 1  数据建设
+        ├─ 互联网视频(去重 + 美学过滤)10⁸+ 片段
+        ├─ 真机机器人(OXE / AgiBot World 2026 / 自采)10⁴ h+
+        ├─ 仿真合成(RoboTwin 2.0 / Isaac Lab / GR00T-Sim)10⁵+ 轨迹
+        ├─ 第一人称人类(Ego4D / EgoExo4D / UniHand-2.0)
+        └─ 物理标注 + 4D 标注(Robo4D-200k 风格)
+        关键工具: Cosmos Curator + Dataset Search + Evaluator
+
+Stage 2  WM 主体训练
+        ├─ Causal video tokenizer 训练
+        ├─ DiT / Block-causal Transformer 大规模预训(Diffusion / Shortcut Forcing)
+        ├─ 长程记忆模块(HPMC / MosaicMem)
+        └─ 物理 SFT(Phys4D 第二阶段)
+
+Stage 3  对齐 / 后训练(2026 关键差异点)
+        ├─ Inverse Dynamics 对齐(EVA)
+        ├─ 物理 DPO + 解耦判别器(ABot-PhysWorld)
+        ├─ Self-Corrective Rollout(HorizonDrive SRR)
+        ├─ 多视角 fidelity RL(Persistent Robot WM)
+        └─ 仿真 ground RL(Phys4D 第三阶段)
+
+Stage 4  与 VLA 联合训练 / 闭环
+        ├─ Cosmos Policy 风格(action 当 latent video frame)
+        ├─ World-VLA-Loop / VLAW 风格(失败回流共改进)
+        └─ STARRY 风格(action 与未来 latent 联合 denoise)
+
+Stage 5  评测 + 部署
+        ├─ WorldArena(CVPR 2026 Challenge 同协议)
+        ├─ dWorldEval 跨千任务自动评测
+        ├─ 真机 utility(把 WM 当 sim2real,policy 真涨多少)
+        └─ Cosmos Curator/Evaluator 数据飞轮服务态
+```
+
+---
+
+## 五、与 DM0 路线对接的具体建议
+
+如果你打算把这个 WM 跟 DM0 做整合,有 **3 种不同强度**的方案:
+
+| 方案 | 改动量 | 路径 | 出处 |
+|---|---|---|---|
+| **轻量** | 在 DM0 的 `prefix_out` 后多加一个"未来视频帧 latent 预测"head,通过 L_AR 监督(但输出是 video latent token) | 与 DM0 当前的 Embodied Spatial Scaffolding 一致 [embd_pt_sota_princpl.md] |
+| **中等** | 把 Cosmos Policy 的"action/state as latent video frames"思路套进 DM0 的 merged attention,共享 DiT | [huggingface.co/blog/nvidia/cosmos-policy-for-robot-control] |
+| **重度** | 训独立 14B 级 WM,做 VLAW / World-VLA-Loop 闭环,DM0 当 VLA、WM 当训练数据/评测引擎 | [arXiv 2602.12063;arXiv 2602.06508] |
+
+> 个人建议:**先做"中等"** —— Cosmos Policy 思路与 DM0 的"text-as-everything + merged attention"哲学最契合,且 NVIDIA 已开源参考实现,验证成本低。
+
+---
+
+## 六、容易踩的坑(2026 最新 postmortem 总结)
+
+1. **画质好不等于有用** [WorldArena 实测 14 个模型存在 perception-functionality gap, arXiv 2602.08971]。
+2. **不做物理对齐必然产生穿模 / 反重力** [ABot-PhysWorld 显式声明, arXiv 2603.23376]。
+3. **多步 rollout 必坍塌**,除非显式做 SRR 或多视角 RL [HorizonDrive arXiv 2605.11596;Persistent Robot WM arXiv 2603.25685]。
+4. **跨域 naive mixing 仍是 negative transfer** [Rethinking VLA Scaling, arXiv 2602.09722]。
+5. **不做"下游 utility"评测,WM 只能当 demo,不能当生产力** [dWorldEval 是首批提出 policy 级评测的工作, arXiv 2604.22152]。
+6. **训练-推理一致性容易丢**(尤其是动作条件投射方式) [找不到 2026 严格出处,工程经验]。
+
+---
+
+需要我接下来做哪些?
+
+- 把上面这些 SOTA **按"DM0 兼容性"打分**,给出"哪些可以直接借鉴/借哪些模块"的对比表;
+- 或者基于你现有算力 / 数据预算,给一份**专属的 6 阶段训练配方**(数据混合权重、超参、并行策略、评测节点);
+- 或者**精读** Cosmos Policy / World-VLA-Loop / STARRY 这几篇里你最关心的一篇,做带页码的笔记。
+
+告诉我你倾向哪个方向。
+
+---
+
+# 世界模型考虑点.忽略DM0和历史.V2
+
+**User**
+
+我要用超多的数据训练一个超大的能用于机器人领域,具身智能领域和VLA领域的世界模型. 列一下有些什么相关的, SOTA的2026年的论文, 文章或研究成果可以借鉴. 可上网搜索, 要把 DreamZero 及其相关文章也纳入搜索与分析范围. 然后回答一下如果我要做这种世界模型该怎么做? 要考虑那些方面和细节点?  回答的每个观点后面都加个括号, 后面注明该观点的出处, 出处可以是多个. 注意, 不要受DM0影响! 不要受任何前面问答的影响! 搜索与考虑的面和范围要更广些, 分析更深入更实用!
+
+---
+
+**Cursor**
+
+好的,我重新独立做一份调研。先搜 DreamZero 及其周边,再扩展到世界模型的更多 2026 维度。
+
+下面是一份**完全独立、不受先前对话和 DM0 影响**的 2026 具身世界模型训练深度指南。所有论点都标 2026 出处。
+
+---
+
+## 一、2026 思维范式的根本转变(决定能否成功的 8 条铁律)
+
+1. **VLA 路线在"未见动作 / 未见技能"上已经触顶**;World Action Model(WAM)在真机泛化上比 SOTA VLA 高 **2× 以上**(seen task progress 62.2% vs 27.4%) [DreamZero, arXiv 2602.15922]。
+2. **改善机器人能力 = 改善视频生成质量**——DreamZero 的核心结论是"policy 失败几乎全部源自视频预测错误,而不是动作预测错误" [DreamZero §5.1, arXiv 2602.15922]。
+3. **训练数据要追求"多样、非重复"而不是"密集重复演示"**——这与传统 VLA 数据哲学正相反 [DreamZero §4.1 / Q1 实验, arXiv 2602.15922;A Comprehensive Survey on World Models for Embodied AI, arXiv 2510.16732]。
+4. **像素重建 ≠ 决策有用**——WorldArena 在 14 个模型上实测 "perception-functionality gap":高画质模型在具身任务上反而可能输 [WorldArena, arXiv 2602.08971]。**重建型 VAE latent 在策略下游甚至输给 V-JEPA 2.1 / Web-DINO / SigLIP 2 这种语义 latent** [Reconstruction or Semantics?, arXiv 2605.06388]。
+5. **跨本体迁移可以"只用视频、无需动作标签"**——DreamZero 用 12 分钟人类视频或 20 分钟 YAM 视频就能 +42% [DreamZero §5.1 Q4, arXiv 2602.15922]。
+6. **新本体 30 分钟 play data 即可适配**——DreamZero 在 AgiBot 预训后,只用 30 分钟 YAM play data 就能保持 zero-shot 泛化 [DreamZero §5.1 Q5, arXiv 2602.15922]。
+7. **WM 已成为"数据引擎"而非单纯仿真器**——GigaWorld-0、Nimbus、InternDataEngine、Genie Sim 3.0 都把 WM 当作生成大规模训练数据的工具 [GigaWorld-0, arXiv 2511.19861;Nimbus, arXiv 2601.21449;InternDataEngine GitHub InternRobotics/InternDataEngine;Genie Sim 3.0, arXiv 2601.02078]。
+8. **WM 可以用 RL 后训练显著提涨下游 VLA 真机表现**——WoVR 把 LIBERO 从 39.95% → 69.2%(+29.3 pt),真机 61.7% → 91.7%(+30.0 pt) [WoVR, arXiv 2602.13977]。
+
+---
+
+## 二、世界模型的"形态选择"(选错形态比训不动更危险)
+
+2026 已经分化出 **6 大形态**,每种用途不同:
+
+| 形态 | 输入 → 输出 | 主要用途 | 代表 2026 工作 |
+|---|---|---|---|
+| **A. WAM(World Action Model,联合视频+动作)** | (o, l, q) → (video, action) 联合生成 | 直接当 zero-shot 策略 | DreamZero [arXiv 2602.15922]、GigaWorld-Policy [arXiv 2603.17240]、STARRY [arXiv 2604.26848]、Cosmos Policy [huggingface.co/blog/nvidia/cosmos-policy-for-robot-control] |
+| **B. 像素级视频生成 WM(Action-conditioned video DiT)** | (o, a, l) → 未来视频帧 | 数据引擎、sim2real、policy eval | Cosmos Predict 2.5 [research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5]、Genie 3 [deepmind.google/blog/genie-3]、Wan2.2 [github Wan-Video/Wan2.2]、ABot-PhysWorld [arXiv 2603.23376] |
+| **C. Latent / 语义 WM** | o_t → z_t → ẑ_{t+1} | Imagination RL、规划、特征学习 | V-JEPA 2 / 2.1 [ai.meta.com/vjepa;arXiv 2603.14482]、Dreamer V4 [emergentmind.com/papers/2509.24527]、VideoWorld 2 [arXiv 2602.10102]、DIAL [arXiv 2603.29844] |
+| **D. 3D / 4D / 高斯泼溅 WM** | (o, a) → 4D 点云/Gaussian/NeRF | 物理一致性、几何精确控制 | GWM (Gaussian World Model) [arXiv 2508.17600]、Phys4D [arXiv 2603.03485]、Kinema4D [arXiv 2603.16669]、Physically Embodied Gaussian Splatting [arXiv 2406.10788] |
+| **E. Discrete / Mask WM** | (o, a) → 语义 mask / 离散 token | 抗噪、加速、policy eval | Mask World Model [arXiv 2604.19683]、dWorldEval [arXiv 2604.22152] |
+| **F. Reflective / Closed-loop WM** | (o, l, action plan) → think-act-reflect | 长程任务规划 | SPIRAL [arXiv 2603.08403]、World-VLA-Loop [arXiv 2602.06508] |
+
+> **2026 共识级建议**:如果你目标是"用于机器人/VLA 领域的通用世界模型",**形态 A(WAM)是当下确定性最强的方向**——既能做 policy 又能做仿真,且在 DreamZero / GigaWorld-Policy / STARRY 上都已经超过纯 VLA SOTA [DreamZero, arXiv 2602.15922;GigaWorld-Policy, arXiv 2603.17240;STARRY 真机 42.5→70.8% vs π0.5, arXiv 2604.26848]。
+
+---
+
+## 三、训练超大具身世界模型必须考虑的全部维度
+
+每条都加 2026 出处。共 **20 大维度**。
+
+### 1. 任务 / 用途定义(决定整个项目)
+
+- **明确世界模型的"用途分类"**:Decision-Coupled vs General-Purpose [Survey, arXiv 2510.16732 三轴分类法]。
+- **明确"功能场景"**:policy learning / planning / 仿真 / 评估 / 数据生成 [World Model for Robot Learning Survey, arXiv 2605.00080]。
+- **明确"输出形态 + 视野"**:Cosmos Predict 2.5 = 30 秒预测 [research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5];Genie 3 = 实时 720p [deepmind.google/blog/genie-3];Infinite-World = 1000+ 帧 [arXiv 2602.02393];HorizonDrive = 分钟级 [arXiv 2605.11596];Context Forcing 把上下文做到 20 秒 [arXiv 2602.06028]。
+- **决定**条件输入维度:语言、动作、proprio、相机轨迹、历史多视角观测 [DreamZero 用 (visual context, language, proprio), arXiv 2602.15922 §3.1;Wan2.1-I2V-14B 用 image + text, deepwiki.com/Wan-Video/Wan2.1]。
+
+### 2. 数据规模与组合(2026 起步线极高)
+
+- **互联网视频 + 真机 + 仿真 + 第一人称人类视频** 四源混合是 2026 默认 [V-JEPA 2 用 1M+ hours 互联网视频, ai.meta.com/research/publications/v-jepa-2;Cosmos Predict 2.5 用 200M video clips, research.nvidia.com;GigaWorld-0 同时融视频+3D, arXiv 2511.19861]。
+- **真机数据数量级**:DreamZero 仅用 **500 hours teleoperation(AgiBot G1)+ DROID** 就达到 SOTA [DreamZero §4.1, arXiv 2602.15922];远小于 π0.5 / GR00T N1.6 的"几千小时" [DreamZero baselines, arXiv 2602.15922]。
+- **关键数据采集哲学**:**长 episode、多子任务、多技能、不重复**——DreamZero 每条 episode 平均 4.4 分钟、42 个子任务,跨 22 个真实环境(家、餐厅、超市、咖啡店、办公室) [DreamZero §4.1 Figure 6, arXiv 2602.15922]。
+- **跨本体只用视频(无动作)足够**:用其它机器人或人类视频做 video-only co-train,1:1 mix 10K steps 即可 +42% [DreamZero §5.1 Q4, arXiv 2602.15922]。
+- **物理标注**:ABot-PhysWorld 用 3M 条带"物理事件标注"的操作片段 [arXiv 2603.23376];Kinema4D 用 Robo4D-200k(20 万 episodes、4D 标注、URDF 推 4D 控制轨迹) [arXiv 2603.16669]。
+- **Action filtering 必做**:DreamZero 显式过滤 idle actions [DreamZero §4.1, arXiv 2602.15922]。
+
+### 3. 视频 Tokenizer / Latent 选择(常被低估)
+
+- **重建型 VAE 训练上更稳但下游策略上输给语义 latent**——V-JEPA 2.1 / Web-DINO / SigLIP 2 在 planning / policy / representation quality 全面优于 VAE [Reconstruction or Semantics?, arXiv 2605.06388]。
+- **Wan-VAE(3D 时空 VAE)** 是当前像素 WM 的事实工业标准 [Wan-Video/Wan2.1, deepwiki.com/Wan-Video/Wan2.1/9.2-model-architecture-details;Wan2.2 GitHub, github Wan-Video/Wan2.2]。
+- **Causal video tokenizer + masked autoencoding** 是 latent WM 主流(Dreamer V4) [Dreamer V4, emergentmind.com/papers/2509.24527]。
+- **Block-causal attention** 让 video / action token 在时间块内对齐而跨时间自回归 [LeWAM, GitHub ErykHalicki/LeWAM]。
+
+### 4. 模型架构(2026 主流四选一)
+
+| 架构 | 出处 |
+|---|---|
+| **DiT(Diffusion Transformer)+ Image-to-Video** —— 视觉质量最高 | [Cosmos Predict 2.5 = 2B/14B DiT, research.nvidia.com;DreamZero 14B Wan2.1-I2V backbone, arXiv 2602.15922;Wan2.1 = ~40-50 块 DiT, hidden 2048-4096+, 16-32 heads, deepwiki Wan2.1] |
+| **Autoregressive DiT + flow matching**(2026 新主流) | [DreamZero AR + flow matching, arXiv 2602.15922 §3.1] |
+| **Block-causal Transformer + causal tokenizer** —— 实时交互 | [Dreamer V4, emergentmind.com;Genie 3 实时 20-24 fps, deepmind.google/genie] |
+| **MoE / MoT video DiT** —— 容量大、推理省 | [Wan2.2 MoE, github Wan-Video/Wan2.2;LingBot-VA Mixture-of-Transformers, 同 Causal World Modeling, arXiv 2601.21998] |
+
+- **AR vs Bidirectional 决策**:DreamZero 实测 AR 给"更平滑机器人动作 + 更高视频-动作对齐",且 KV cache 让长上下文可行 [DreamZero §3.1, arXiv 2602.15922]。
+- **AR 视频 + 非 AR 动作**:DreamZero 显式让动作不做自回归(避免 closed-loop 错误传播),只让视频做 AR [DreamZero §3.1, arXiv 2602.15922]。
+- **多视角拼接 → 单帧**:不改 backbone,把所有视角 concat 进单帧,**最小侵入** [DreamZero §3.1, arXiv 2602.15922]。
+- **新增组件最少化**:DreamZero 只额外加 state encoder / action encoder / action decoder,backbone 全部冻结的部分仅 text encoder + image encoder + VAE [DreamZero §4.1 Training, arXiv 2602.15922]。
+- **MoE 与多尺寸**:Wan2.2 提供 5B 高效版(720p@24fps,24GB GPU 跑得动)+ 14B 大版本 [localaimaster.com/blog/wan-video-generation-guide]。
+
+### 5. 动作条件注入方式(决定下游可控性)
+
+- **Cross-attention adapter + zero-init 输出** 是把现成视频模型改成 WM 最稳的方式 [ActionConditioningAdapter on CogVideoX-5B, GitHub A-SHOJAEI/action-conditioned-video-worldmodel;LoRA rank 16 配套使用]。
+- **联合 denoise (video latent + action latent) 共享 timestep** 训练初期收敛更快 [DreamZero §3.1 Training Objective, arXiv 2602.15922]。
+- **解耦 noise schedule(Flash):video bias 高噪 + action 均匀** 让"少步推理"训-推一致 [DreamZero-Flash:Beta(7,1), 16→1 步,arXiv 2602.15922 §3.2.5]。
+- **Multi-Agent Condition Module**(多体协作):Agent Identity Embedding + Adaptive Action Weighting [MultiWorld, arXiv 2604.18564]。
+- **Action Cross-Attention block 内置每层** 而非只 prepend [Wan-style cross-attention 每层都有, deepwiki Wan2.1]。
+
+### 6. 训练目标 / Loss(2026 关键差异点)
+
+- **Flow Matching loss(主流)**:线性插值 + 速度预测 [DreamZero §3.1, arXiv 2602.15922 公式 (2)(3)];Cosmos Predict 2.5 同样 flow matching [research.nvidia.com]。
+- **联合 velocity 预测**:同一个 head 同时预测 video 和 action 的 velocity [DreamZero L(θ), arXiv 2602.15922 公式 (3)]。
+- **Teacher Forcing chunk-wise**:用干净的"前一 chunk"条件 noisy 当前 chunk [DreamZero §3.1, arXiv 2602.15922]。
+- **Diffusion Forcing / Self-Forcing 的局限**:无法建模真实 rollout 误差累积 [LIVE 综述, huggingface.co/papers/2602.03747]。
+- **Cycle-Consistency loss**(2026 新方向):前向 rollout 后反向重建初始状态,loss 在终态上,**消除 teacher 蒸馏需求** [LIVE, huggingface.co/papers/2602.03747]。
+- **Causal Forcing**(2026):用 AR teacher 做 ODE 初始化,弥合 bidirectional → causal 鸿沟 [Causal Forcing, arXiv 2602.02214]。
+- **Context Forcing**:用 long-context teacher 训 long-context student,**有效上下文 20 秒,2-10× 长于已有方法** [Context Forcing, arXiv 2602.06028]。
+- **Inverse Dynamics Reward**:用 IDM 当 reward 对齐生成视频和"可执行动作" [EVA, arXiv 2603.17808]。
+- **Physics DPO + 解耦判别器**:专门训"反 object penetration / 反重力" [ABot-PhysWorld, arXiv 2603.23376]。
+- **Multi-view fidelity reward**(防多步坍塌):Persistent Robot WM 用 RL 后训练 + 多视角真实度 reward,98% 偏好 [arXiv 2603.25685]。
+- **Mask / 语义 loss 替代 RGB loss**:LIBERO/RLBench 全胜 [Mask World Model, arXiv 2604.19683]。
+
+### 7. 长程一致性 / 记忆机制(WM 真正的瓶颈)
+
+- ⭐ **Hierarchical Pose-free Memory Compressor (HPMC)**:递归压缩历史 latent,1000+ 帧仍一致 [Infinite-World, arXiv 2602.02393]。
+- ⭐ **Self-Corrective Rollout (SRR)**:训练时强迫模型从"被预测污染"的历史里恢复未来,**FID -52% / FVD -37%** [HorizonDrive, arXiv 2605.11596]。
+- ⭐ **Hybrid spatial memory**:3D patch lift + 隐式条件混合,minute-level 导航与 AR rollout [MosaicMem, arXiv 2603.17117]。
+- ⭐ **Sliding Window Re-encoding**:稳定 AR 推理 [RoboAlign-R1, arXiv 2605.03821]。
+- ⭐ **KV cache 替换 GT 帧**:闭环时用真实观测替换预测帧进 KV cache,**消除 AR 视频生成固有的 compounding error** [DreamZero §3.1 Inference, arXiv 2602.15922]。
+
+### 8. 物理一致性(2026 难点 #1)
+
+- 主流 WM 都会出现 object penetration、anti-gravity、违反守恒 [ABot-PhysWorld 显式定义, arXiv 2603.23376]。
+- 解法 1:**物理对齐 DPO 后训练 + 解耦判别器** [ABot-PhysWorld, arXiv 2603.23376]。
+- 解法 2:**4D Gaussian / NeRF 几何先验** [GWM, arXiv 2508.17600;Phys4D, arXiv 2603.03485;Physically Embodied Gaussian Splatting 30Hz, arXiv 2406.10788]。
+- 解法 3:**仿真 ground RL** [Phys4D 第三阶段, arXiv 2603.03485]。
+- 解法 4:**URDF + IK 显式注入** [Kinema4D 把 URDF 推 4D 控制轨迹再投到 pointmap, arXiv 2603.16669]。
+- 解法 5:**逆动力学一致性约束** [EVA, arXiv 2603.17808]。
+
+### 9. 实时性 / 推理优化(决定能否上车)
+
+DreamZero 提供 **2026 最完整的工程范本**——从 5.7s/chunk 优化到 150ms/chunk,38× 加速 [DreamZero Table 1, arXiv 2602.15922]:
+
+- **CFG Parallelism**:把条件/无条件两次 forward 拆到 2 GPU,−47% per-step latency [arXiv 2602.15922]。
+- **DiT Caching**:利用 flow velocity 的方向一致性,cosine similarity 阈值复用 cache,16 → 4 步 [arXiv 2602.15922]。
+- **torch.compile + CUDA Graphs**:消除 CPU overhead [arXiv 2602.15922]。
+- **NVFP4 量化**(Blackwell):权重 + 激活,QKV/Softmax 保 FP8,非线性保 FP16 [arXiv 2602.15922]。
+- **cuDNN attention backend** + scheduler 移到 GPU 消 CPU-GPU 同步 [arXiv 2602.15922]。
+- **DreamZero-Flash**:解耦 noise schedule,16→1 步,350ms→150ms [arXiv 2602.15922]。
+- **Action Chunk Smoothing**:2× 上采样 + Savitzky-Golay 滤波 + 下采样 [arXiv 2602.15922]。
+- **Asynchronous Closed-Loop**:推理与执行并行,只需 200ms 即可保 30Hz 闭环 [DreamZero §3.2.2, arXiv 2602.15922]。
+
+> 14B 模型 + GB200 + Flash 后仍能跑 7Hz [DreamZero §3.2.6, arXiv 2602.15922]。
+
+### 10. 训练阶段课程
+
+- **3 阶段(物理范式)**:伪监督预训 → 物理 SFT(仿真) → 仿真 ground RL [Phys4D, arXiv 2603.03485]。
+- **2 阶段(latent 范式)**:训 WM → "在 imagination 内"训 policy [Dreamer V4, emergentmind.com/papers/2509.24527]。
+- **3 阶段(WAM 范式,DreamZero)**:Wan2.1-I2V backbone → Joint video-action 预训 100K steps × global batch 128 → DreamZero-Flash 后训 [DreamZero §4.1, arXiv 2602.15922]。
+- **5 阶段(Cosmos 范式)**:Curator 数据筛选 → 训 Cosmos Predict → Cosmos Reason 加 physics → Cosmos Transfer 做 sim2real → Cosmos Policy 做后训练 [nvidia.com/cosmos]。
+
+### 11. 与 VLA 的耦合方式
+
+- **方式 A:WAM 直接当策略**(DreamZero) — 联合预测视频+动作,跳过纯 VLA [arXiv 2602.15922]。
+- **方式 B:WM 后训练 VLA** — WoVR 把 LIBERO 39.95→69.2%,真机 61.7→91.7% [arXiv 2602.13977]。
+- **方式 C:闭环共改进** — World-VLA-Loop:VLA 失败 rollout 反馈精炼 WM,**真机 +36.7%** [arXiv 2602.06508];VLAW:**+39.2% 绝对** [arXiv 2602.12063]。
+- **方式 D:Reflective / Hierarchical** — SPIRAL 用 PlanAgent + CriticAgent 做 think-act-reflect [arXiv 2603.08403]。
+- **方式 E:统一 latent video frame** — Cosmos Policy 把 action/state 当 latent video frames 一起进 DiT [huggingface.co/blog/nvidia/cosmos-policy-for-robot-control]。
+
+### 12. World Model 当 RL "想象环境"
+
+- **Dreamer V4** 在 Minecraft 完全 offline 拿钻石,**100× labeled data 节省** [emergentmind.com/papers/2509.24527]。
+- **WoVR** 用 WM 做 sim,后训 VLA,LIBERO +29.3pt [arXiv 2602.13977]。
+- 注意:像素 WM 必须 ≥ 100Hz 出虚拟帧才有 RL 性价比 [Interactive World Simulator 在 RTX 4090 单卡跑 15fps × 10+ 分钟, arXiv 2603.08546]。
+
+### 13. RL / Reward 后训练 WM 自身
+
+- **RoboAlign-R1**:多模态 teacher judge(6 维)→ 蒸馏出 student reward → RL 后训练,**+10.1% 综合 / +7.5% 操作准确度 / +4.6% 指令遵循** [arXiv 2605.03821]。
+- **RLVR-World**:可验证奖励 RL,显著提升视频 WM [NeurIPS 2025, proceedings.neurips.cc]。
+- **RLIR (RL with Inverse Rewards)**:用 IDM 反推动作可验证性,GRPO 后训练,5-10% 涨 action-following [openreview.pdf ad1bca0...]。
+- **Persistent Robot WM**:多步 rollout 上做 RL,**98% 偏好对比** [arXiv 2603.25685]。
+
+### 14. 多视角 / 多模态扩展
+
+- **MultiWorld**:多代理 + 多视角 + Global State Encoder [arXiv 2604.18564]。
+- **Wan2.2-S2V-14B**:加入音频驱动 [github Wan-Video/Wan2.2;huggingface Wan-AI/Wan2.2-S2V-14B]。
+- **触觉**:DreamZero 在 future work 把触觉/力反馈点名为"WAMs may align actions with other predictive modalities"明确未来扩展 [arXiv 2602.15922 §2.2]。
+
+### 15. 数据飞轮 / WM-as-Data-Engine(2026 最大商业价值)
+
+- ⭐ **GigaWorld-0**:WM 当 data engine,**纯生成数据训出来的策略不需任何真实交互就能在真机表现** [arXiv 2511.19861]。
+- **Nimbus**:4 层异步架构(轨迹规划 / 渲染 / 存储分离),**端到端吞吐 2-3× 提升** [arXiv 2601.21449]。
+- **InternDataEngine**:统一物理仿真 + 语义任务生成 + 高吞吐调度,2026.03 发布 [GitHub InternRobotics/InternDataEngine]。
+- **Genie Sim 3.0**(智元):LLM 驱动 3D 环境生成 + 5 task suites + **10,000+ 小时合成数据 + 200+ 任务** [arXiv 2601.02078;agibot.com/article/231/detail/55.html]。
+- **Cosmos Curator + Dataset Search + Evaluator**:NVIDIA 官方数据飞轮三件套 [nvidia.com/cosmos]。
+- **Interactive World Simulator**:**单卡 RTX 4090 跑 10+ 分钟 / 15 fps**,生成数据训的策略与真机数据等效 [arXiv 2603.08546]。
+
+### 16. 评测体系(2026 必上的 4 件套)
+
+- ⭐ **WorldArena**(CVPR 2026 Challenge,清华 fib-lab) — 16 metrics / 6 子维度 + EWMScore + 3 类(像素 / 具身功能 / 人评) [arXiv 2602.08971;world-arena.ai;cvpr2026challenge.world-arena.ai;github tsinghua-fib-lab/WorldArena]。
+- ⭐ **RoboArena** — 真机 DROID 双盲两两 + 7 机构众包 [proceedings.mlr.press/v305/atreya25a]。
+- ⭐ **Genie Sim 3.0**(智元) — 5 task suites,与真机配对验证 [arXiv 2601.02078]。
+- ⭐ **PolaRiS** — Real-to-Sim,把真实视频扫描转可交互仿真,"与真机相关性高于已有 sim" [arXiv 2512.16881;github arhanjain/PolaRiS]。
+- **dWorldEval** — discrete diffusion + sparse keyframe + progress token,跨千任务自动 policy eval [arXiv 2604.22152]。
+- **关键评测原则**:"unseen environment + unseen objects 才是 default,不是 nice-to-have" [DreamZero §4.1 Evaluation Protocol, arXiv 2602.15922]。
+- **任务粒度定义**:DreamZero 明确"motion + object 类型组合"决定 seen/unseen [DreamZero, arXiv 2602.15922]。
+
+### 17. 算力 / 规模(2026 真实数据点)
+
+- **DreamZero**:14B,batch 128 × 100K steps × 2 套(AgiBot + DROID) [arXiv 2602.15922 §4.1]。
+- **Cosmos Predict 2.5**:2B / 14B 双尺寸,200M 视频片段 [research.nvidia.com]。
+- **Wan2.1-I2V-14B**:训练在"billions of images and videos" [huggingface.co/docs/diffusers/en/api/pipelines/wan]。
+- **Wan2.2-14B**:训练数据比 Wan2.1 多 65.6% 图 / 83.2% 视频 [github Wan-Video/Wan2.2]。
+- **Open-Sora 2.0**:11B,**总训练成本 \$200K**,与 HunyuanVideo 同级 [arXiv 2503.09642]。
+- **Dreamer V4**:110M 在 4090 (8GB) 实时 [github machines-in-motion/dreamer-v4]。
+- **V-JEPA 2**:1M+ hours 互联网视频 [ai.meta.com/research/publications/v-jepa-2]。
+- **关键洞察**:"larger pretrained video diffusion models produce higher-quality video predictions, which directly translates to superior downstream action execution" [DreamZero, arXiv 2602.15922]。
+
+### 18. 训练稳定性 / 工程
+
+- **共享 timestep 在训练初期更快收敛** [DreamZero §3.1 Training Objective vs Zhu et al. 2025/Kim et al. 2026, arXiv 2602.15922]。
+- **不要用 LoRA**(至少在 Wan2.1-I2V backbone 上):DreamZero 实测 LoRA suboptimal,**只能全量更新 DiT 块** [DreamZero §4.1, arXiv 2602.15922]。
+- **冻结 text/image encoder + VAE**,只更新 DiT + state/action encoder/decoder [DreamZero, arXiv 2602.15922]。
+- **Trajectory-level 更新 + attention masking** 让当前 noisy chunk 只 attend 干净历史 chunk [DreamZero §3.1 公式 (3) + Figure 14, arXiv 2602.15922]。
+
+### 19. 安全 / 合规
+
+- **Cosmos NVIDIA Open Model License** [research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5]。
+- **Genie 3 限 18+ 美国 Ultra 订阅**(显示 Google 评估了滥用风险) [deepmind.google/genie]。
+- **生成视频水印 / C2PA provenance** —— 找不到 2026 严格出处,行业实践通识。
+
+### 20. 综述参考
+
+- ⭐ **A Comprehensive Survey on World Models for Embodied AI** [arXiv 2510.16732] — 三轴分类法。
+- ⭐ **World Model for Robot Learning: A Comprehensive Survey** [arXiv 2605.00080]。
+- **From Perception to Action: Spatial AI Agents and World Models** [arXiv 2602.01644]。
+- **Embodied AI from LLMs to World Models** [清华 mn.cs.tsinghua.edu.cn/xinwang]。
+
+---
+
+## 四、2026 必读 SOTA 清单(纯具身世界模型,按主题归类)
+
+### A. WAM(World Action Model)— 2026 主流
+
+| 模型 | 出处 | 关键亮点 |
+|---|---|---|
+| ⭐ **DreamZero** | arXiv 2602.15922 + dreamzero0.github.io + github dreamzero0/dreamzero | 14B Wan2.1-I2V backbone,7Hz 闭环,38× 加速,RoboArena #1,MolmoSpaces #1,seen 62.2% / unseen 39.5% |
+| ⭐ **GigaWorld-Policy** | arXiv 2603.17240 | Action-centered WAM,RoboTwin 2.0 比 π0.5 +95%,推理快 9× |
+| ⭐ **STARRY** | arXiv 2604.26848 | RoboTwin 双臂 93.82%,真机 42.5→70.8% vs π0.5 |
+| **GR00T N1.6 / N2 / WAM** | NVIDIA blog | DreamZero 主要 baseline |
+| **LeWAM** | github ErykHalicki/LeWAM | 开源 WAM 参考实现 |
+| **Cosmos Policy** | huggingface.co/blog/nvidia/cosmos-policy-for-robot-control | NVIDIA 官方 WAM,action 当 latent video frame |
+
+### B. WM × VLA 闭环 / 共改进
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **WoVR** | arXiv 2602.13977 | LIBERO 39.95→69.2%,真机 61.7→91.7% |
+| **World-VLA-Loop** | arXiv 2602.06508 | 真机 +36.7% |
+| **VLAW** | arXiv 2602.12063 | 绝对 +39.2% |
+| **DriveWorld-VLA** | arXiv 2602.06521 | 自动驾驶 |
+| **DIAL** | arXiv 2603.29844 | intent / action 解耦 |
+| **SPIRAL** | arXiv 2603.08403 | think-act-reflect 闭环 |
+| **CoLA-World** | arXiv 2510.26433 | LAM + WM 协同进化 |
+
+### C. 通用视频 WM 基座(可作为 backbone)
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **Wan2.1-I2V-14B-480P** | github Wan-Video/Wan2.1 + deepwiki Wan2.1 | DreamZero 实际 backbone,DiT + Wan-VAE |
+| ⭐ **Wan2.2** | github Wan-Video/Wan2.2 | MoE 架构,5B 高效 + 14B 高质,Wan2.2-S2V-14B 加音频 |
+| ⭐ **Cosmos Predict 2.5** | research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5 | 2B/14B,200M videos,30s 预测 |
+| **Cosmos Transfer 2.5** | nvidia.com/cosmos | sim2real photoreal |
+| **Cosmos Reason** | nvidia.com/cosmos | physics-aware VLM |
+| **Genie 3** | deepmind.google/blog/genie-3 | 720p 实时 20-24 fps |
+| **Open-Sora 2.0** | arXiv 2503.09642 | 11B,$200K |
+| **HunyuanVideo / MovieGen** | (业界 baseline,公开资料未直接搜到 2026 更新) | 找不到 2026 出处 |
+
+### D. Latent / Semantic WM
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **V-JEPA 2** | ai.meta.com + arXiv 2506.09985 | 1M+ hours,Franka 上 zero-shot pick-and-place |
+| ⭐ **V-JEPA 2.1** | arXiv 2603.14482 | 2026.03,dense feature,real-robot grasp +20% |
+| ⭐ **Dreamer V4** | emergentmind.com/papers/2509.24527 | block-causal Transformer + Shortcut Forcing,**Minecraft 钻石全 offline** |
+| **VideoWorld 2** | arXiv 2602.10102 | dLDM 解耦动作动力学与视觉外观,+70% 长程 |
+| **Reconstruction or Semantics?** | arXiv 2605.06388 | 实证语义 latent > VAE latent |
+
+### E. 物理一致性 / 4D / 高斯
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **GWM (Gaussian World Model)** | arXiv 2508.17600 | 3D Gaussian 预测下未来,Latent DiT + 3D VAE |
+| ⭐ **Physically Embodied Gaussian Splatting** | arXiv 2406.10788 | dual Gaussian-Particle,30Hz 实时,带物理纠正 |
+| ⭐ **ABot-PhysWorld** | arXiv 2603.23376 | 14B DiT + 物理 DPO + 解耦判别器,3M 物理标注 |
+| **Kinema4D** | arXiv 2603.16669 | URDF + Robo4D-200k(20 万 episodes 4D 标注) |
+| **Phys4D** | arXiv 2603.03485 | 3 阶段(伪监督 + 物理 SFT + 仿真 RL) |
+| **Mask World Model** | arXiv 2604.19683 | 语义 mask 替 RGB |
+| **Causal World Modeling** | arXiv 2601.21998 | 因果建模 + Mixture-of-Transformers |
+
+### F. 长程一致性 / 训练 forcing 范式
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **LIVE** | huggingface.co/papers/2602.03747 | Cycle-consistency 消除 teacher 蒸馏需求 |
+| ⭐ **Causal Forcing** | arXiv 2602.02214 | AR teacher ODE 初始化,跨 bidirectional → causal |
+| ⭐ **Context Forcing** | arXiv 2602.06028 | 长上下文 student,**有效 20s,2-10×** |
+| **Vid2World** | arXiv 2505.14357 | 把视频 diffusion 改造成交互式 WM |
+| **Infinite-World** | arXiv 2602.02393 | HPMC,1000+ 帧 |
+| **HorizonDrive** | arXiv 2605.11596 | SRR,FID -52% / FVD -37%,分钟级 |
+| **MosaicMem** | arXiv 2603.17117 | 3D patch + 隐式 hybrid memory |
+| **Persistent Robot WM** | arXiv 2603.25685 | RL 后训练 + 多视角 fidelity reward,98% 偏好 |
+
+### G. RL / Reward 后训练 WM
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| ⭐ **RoboAlign-R1** | arXiv 2605.03821 | 多模态 teacher judge,**+10.1% / +7.5% / +4.6%** |
+| ⭐ **RLVR-World** | NeurIPS 2025 | 可验证奖励 RL |
+| **EVA** | arXiv 2603.17808 | inverse dynamics reward |
+| **RLIR** | openreview ad1bca0... | GRPO + IDM,+5-10% action-following |
+
+### H. 数据引擎 / 飞轮
+
+| 资源 | 出处 |
+|---|---|
+| ⭐ **GigaWorld-0** | arXiv 2511.19861 + giga-world-0.github.io |
+| ⭐ **Genie Sim 3.0**(智元) | arXiv 2601.02078 + agibot.com/article/231/detail/55.html |
+| ⭐ **InternDataEngine** | github InternRobotics/InternDataEngine |
+| **Nimbus** | arXiv 2601.21449 |
+| **Interactive World Simulator** | arXiv 2603.08546 |
+| **NVIDIA Cosmos Curator/Search/Evaluator** | nvidia.com/cosmos |
+
+### I. 评测 / Benchmark
+
+| 资源 | 出处 |
+|---|---|
+| ⭐ **WorldArena**(CVPR 2026 Challenge) | arXiv 2602.08971 + cvpr2026challenge.world-arena.ai + github tsinghua-fib-lab/WorldArena |
+| ⭐ **RoboArena** | proceedings.mlr.press/v305/atreya25a |
+| ⭐ **Genie Sim 3.0** | arXiv 2601.02078 |
+| ⭐ **PolaRiS** | arXiv 2512.16881 + github arhanjain/PolaRiS |
+| **dWorldEval** | arXiv 2604.22152 |
+
+### J. 多视角 / 多智能体 / 创新架构
+
+| 模型 | 出处 | 亮点 |
+|---|---|---|
+| **MultiWorld** | arXiv 2604.18564 | multi-agent + multi-view |
+| **GigaWorld-Policy** | arXiv 2603.17240 | action-centered causal sequence |
+
+### K. 综述
+
+| 资源 | 出处 |
+|---|---|
+| **A Comprehensive Survey on World Models for Embodied AI** | arXiv 2510.16732 |
+| **World Model for Robot Learning Survey** | arXiv 2605.00080 |
+| **From Perception to Action: Spatial AI Agents and World Models** | arXiv 2602.01644 |
+
+---
+
+## 五、2026 推荐训练路线(基于以上 SOTA)
+
+```text
+─────────────────────────── Stage 0 ───────────────────────────
+形态选择 + 用途定义
+   ├─ 主要做策略?       → WAM (DreamZero / GigaWorld-Policy / STARRY)
+   ├─ 数据飞轮?         → 像素 DiT (Cosmos Predict 2.5 / GigaWorld-0)
+   ├─ Imagination RL?   → Latent (Dreamer V4 / V-JEPA 2.1)
+   ├─ 精细物理?         → 4D / Gaussian (GWM / Phys4D / Kinema4D)
+   └─ 多智能体协作?     → MultiWorld / 自定义
+
+─────────────────────────── Stage 1 ───────────────────────────
+基座选择(2026 共识:不要从零开始)
+   优先级:
+   • Wan2.2 / Wan2.1-I2V-14B(开源,DreamZero 验证可行)
+   • Cosmos Predict 2.5(NVIDIA 全栈)
+   • Dreamer V4(轻量 latent)
+   • V-JEPA 2.1(语义 latent)
+关键决策:
+   • 全量更新 DiT,不要 LoRA(DreamZero 验证)
+   • 冻结 text encoder + image encoder + VAE
+
+─────────────────────────── Stage 2 ───────────────────────────
+数据建设
+   • 互联网视频 10⁸+ 片段(用 Cosmos Curator 或自建)
+   • 真机机器人:DROID + AgiBot + 自采;500h 起步,优先"长 episode + 多子任务 + 不重复"
+   • 第一人称人类视频:Ego4D / EgoExo4D
+   • 仿真数据:Genie Sim 3.0(10k h)+ RoboCasa + Isaac Lab
+   • 物理标注 + 4D 标注:Robo4D-200k 风格
+
+─────────────────────────── Stage 3 ───────────────────────────
+WAM 主体训练
+   • Joint video-action flow matching
+   • 共享 timestep(初期更快收敛)
+   • Teacher Forcing chunk-wise
+   • Block-causal attention,AR 视频 + 非 AR 动作
+   • 多视角 concat 进单帧,backbone 不动
+   • Trajectory-level update + attention masking
+   • 100K steps × global batch 128(DreamZero 数字)
+
+─────────────────────────── Stage 4 ───────────────────────────
+对齐 / 后训练(2026 关键)
+   • DreamZero-Flash:解耦 noise schedule,16→1 步推理
+   • Inverse Dynamics 对齐(EVA)
+   • 物理 DPO(ABot-PhysWorld)
+   • Self-Corrective Rollout(HorizonDrive)
+   • 多视角 fidelity RL(Persistent Robot WM)
+   • 多模态 reward 对齐(RoboAlign-R1)
+
+─────────────────────────── Stage 5 ───────────────────────────
+长程 / 记忆 增强
+   • 加 HPMC(Infinite-World)或 MosaicMem(3D + 隐式 hybrid)
+   • Context Forcing 推到 20 秒 effective context
+   • Cycle-Consistency loss(LIVE)
+
+─────────────────────────── Stage 6 ───────────────────────────
+推理优化 + 部署(DreamZero 范本)
+   ① CFG Parallelism(双 GPU 拆条件/无条件)→ -47% latency
+   ② DiT Caching(velocity cosine 阈值)→ 16→4 步
+   ③ torch.compile + CUDA Graphs
+   ④ NVFP4 量化(Blackwell)
+   ⑤ DreamZero-Flash → 1 步,150ms / chunk
+   ⑥ Asynchronous Closed-Loop(200ms 内即可保 30Hz 闭环)
+   ⑦ Action Chunk 后处理:2× upsample + Savitzky-Golay 滤波
+
+─────────────────────────── Stage 7 ───────────────────────────
+评测 + 飞轮
+   • WorldArena(CVPR 2026 Challenge 协议)
+   • RoboArena 真机 leaderboard
+   • Genie Sim 3.0 + PolaRiS 配对验证
+   • dWorldEval 跨千任务自动 policy eval
+   • 用 WM 当 data engine 反哺训练(GigaWorld-0 / Nimbus)
+```
+
+---
+
+## 六、容易踩的坑(基于 2026 公开 postmortem)
+
+1. **画质好 ≠ 决策有用**——14 个 SOTA WM 都有 perception-functionality gap [WorldArena, arXiv 2602.08971]。
+2. **不做物理对齐必然产生穿模 / 反重力** [ABot-PhysWorld, arXiv 2603.23376]。
+3. **AR 多步 rollout 必坍塌**,除非显式做 SRR / cycle / RL [HorizonDrive, arXiv 2605.11596;Persistent Robot WM, arXiv 2603.25685;LIVE, huggingface.co/papers/2602.03747]。
+4. **盲目追求重复演示数据反而害事**——WAM 偏好"多样、非重复"长 episode [DreamZero §4.1, arXiv 2602.15922]。
+5. **VAE latent 训出来 PSNR 高但下游策略低**——必须切语义 latent(V-JEPA 2.1 / SigLIP 2 / Web-DINO) [Reconstruction or Semantics?, arXiv 2605.06388]。
+6. **LoRA 在视频 backbone 上 suboptimal**——Wan2.1-I2V 上必须全量更新 DiT [DreamZero §4.1, arXiv 2602.15922]。
+7. **不解耦 video / action noise schedule,少步推理必崩** [DreamZero-Flash 训-推 mismatch 分析, arXiv 2602.15922 §3.2.5]。
+8. **AR 视频 + AR 动作两者都自回归会爆错误传播**——只让视频 AR、动作不 AR [DreamZero §3.1, arXiv 2602.15922]。
+9. **不替换 KV cache 中的预测帧**会让 closed-loop 发散——必须用 GT 观测替换 [DreamZero §3.1 Inference, arXiv 2602.15922]。
+10. **不做 CFG Parallelism 直接两次 forward**会浪费一半算力 [DreamZero, arXiv 2602.15922]。
+
+---
+
+## 七、给"2026 实战"的 5 条最重要建议
+
+1. **基座站在巨人肩上**:用 **Wan2.2 14B** 或 **Cosmos Predict 2.5 14B** 起步,**不要从零训** [github Wan-Video/Wan2.2;research.nvidia.com/labs/cosmos-lab/cosmos-predict2.5;DreamZero 实证 14B > 5B, arXiv 2602.15922]。
+2. **数据"长 + 多样 + 不重复"** > 数量;500 小时真机 + 海量互联网视频 + 无标签人类视频已经够 [DreamZero 用 500h AgiBot 即超 SOTA VLA, arXiv 2602.15922;V-JEPA 2 用 1M+ 互联网视频 + <62h 机器人, ai.meta.com]。
+3. **闭环必做 KV cache GT 替换 + Asynchronous Execution**,这是 14B WM 能 7Hz 跑的关键 [DreamZero §3.1/§3.2.2, arXiv 2602.15922]。
+4. **必做 Flash-style decoupled noise schedule** 才能把 diffusion 步数从 16 压到 1,**380ms→150ms 是部署红线** [DreamZero §3.2.5, arXiv 2602.15922]。
+5. **用 WorldArena + RoboArena + Genie Sim 3.0 + PolaRiS 四件套评测**,不要只看像素 metric——任何一个跑分高但下游低的都是"功能性陷阱" [arXiv 2602.08971;proceedings.mlr.press/v305/atreya25a;arXiv 2601.02078;arXiv 2512.16881]。
+
+---
+
+如果你需要,我可以接着做以下任意一项:
+
+- 把 **DreamZero 论文**做一份**带页码的精读笔记**(架构图 / 公式 / 表 1 加速;数据收集 SOP;实验细节);
+- 给你一份**针对你算力预算和数据规模**的**专属配方**(Wan2.2 vs Cosmos vs V-JEPA 2.1 该选哪个,各阶段 batch / steps / 评测节点);
+- 或对比 **DreamZero / GigaWorld-Policy / STARRY / Cosmos Policy / Helix 02** 五大主流 WAM 路线,出一张**模块级差异表**。
 
