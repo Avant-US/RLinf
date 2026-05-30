@@ -7,6 +7,8 @@
 
 ## 目录
 
+**第一部分（训练管线总览）**
+
 1. [总览：RLinf 与 DreamZero 的分工](#1-总览rlinf-与-dreamzero-的分工)
 2. [启动与分布式调度](#2-启动与分布式调度)
 3. [配置体系与 WAN2.1 / WAN2.2 差异](#3-配置体系与-wan21--wan22-差异)
@@ -17,6 +19,16 @@
 8. [Checkpoint、恢复与评测闭环](#8-checkpoint恢复与评测闭环)
 9. [工程要点与排错清单](#9-工程要点与排错清单)
 10. [关键文件索引](#10-关键文件索引)
+
+**第二部分（整合、数据与监督信号）**
+
+11. [RLinf 整合第三方模型的设计](#11-rlinf-整合第三方模型的设计)
+12. [RLinf 与 DreamZero 的整合边界](#12-rlinf-与-dreamzero-的整合边界)
+13. [训练数据格式：从 LeRobot 到 GPU Batch](#13-训练数据格式从-lerobot-到-gpu-batch)
+14. [预处理分工：RLinf vs DreamZero](#14-预处理分工rlinf-vs-dreamzero)
+15. [Label 与 Target：监督信号与损失中的用法](#15-label-与-target监督信号与损失中的用法)
+16. [微调时的数据流动与逐步转换](#16-微调时的数据流动与逐步转换)
+17. [端到端整合调用序列图](#17-端到端整合调用序列图)
 
 ---
 
@@ -630,4 +642,606 @@ flowchart TB
 
 ---
 
-*文档结束。若需将 SFT 权重转为 Hugging Face 格式或对接 LIBERO 评测，请参阅官方 RST 的 Checkpoint conversion 与 VLA evaluation 章节。*
+# 第二部分：RLinf × DreamZero 整合与数据深度解析
+
+> 本章聚焦：**RLinf 如何挂载外部 VLA**、**两边各自改数据**、**训练 batch 里谁是 condition、谁是 target**，以及 **一条样本从 parquet/mp4 到 loss 的逐步变形**。代码以 `D:\SRC\RL\RLinf` 与 `D:\SRC\Robot\dreamzero` 为准。
+
+---
+
+## 11. RLinf 整合第三方模型的设计
+
+DreamZero 不是把 groot 代码 vendoring 进 RLinf，而是典型的 **「注册表 + 薄适配层 + 运行时补丁 + 专用 Worker/Data」** 模式。这与 OpenPI、GR00T 等 embodied 模型在同一套骨架上扩展。
+
+### 11.1 四层整合模型
+
+```mermaid
+flowchart TB
+  subgraph L1 [L1_配置与校验]
+    Hydra[actor.model YAML]
+    Val[validate_cfg / validate_dreamzero_sft_model_cfg]
+    Enum[SupportedModel.dreamzero]
+  end
+  subgraph L2 [L2_构建与替换]
+    Reg[register_model + get_model]
+    Patch[Patcher 运行时替换/包装]
+    Adpt[DreamZeroPolicy 适配器]
+  end
+  subgraph L3 [L3_训练运行时]
+    Worker[FSDPVlaSftWorker]
+    FSDP[FSDPModelManager]
+    Fwd[ForwardType.SFT]
+  end
+  subgraph L4 [L4_数据与外部依赖]
+    Data[DreamZeroLeRobotDataset]
+    Ext[groot 包 PYTHONPATH]
+  end
+  Hydra --> Val --> Enum
+  Enum --> Reg --> Patch --> Adpt
+  Worker --> Fwd --> Adpt
+  Worker --> Data
+  Adpt --> Ext
+  Reg --> FSDP
+```
+
+| 层次 | 机制 | DreamZero 上的体现 |
+|------|------|-------------------|
+| **L1 配置** | Hydra YAML + `validate_cfg` | `model_type: dreamzero`；`dreamzero_5b` preset 用 `_target_` 指向 groot 类；`metadata_json_path`、`embodiment_tag` 等 RLinf 扩展字段 |
+| **L2 构建** | `register_model` → `get_model(cfg)` | [`rlinf/models/__init__.py`](../../rlinf/models/__init__.py) 注册 `_build_dreamzero`；[`dreamzero/__init__.py`](../../rlinf/models/embodiment/dreamzero/__init__.py) 里 `Patcher` + 实例化 `DreamZeroPolicy` |
+| **L3 训练** | 通用 `FSDPSftWorker` + 子类钩子 | `build_dataloader` / `get_train_model_output` 专用于 DreamZero；`forward_type=SFT` 走 `sft_forward` |
+| **L4 数据/依赖** | 不修改 groot 训练脚本，外挂数据管线 | RLinf 自研 `DreamZeroLeRobotDataset`；`DREAMZERO_PATH` 使 `import groot...` 可用 |
+
+### 11.2 模型注册表（`register_model`）
+
+RLinf 用 **字符串 `model_type` → 构建函数** 解耦 Runner/Worker 与具体模型：
+
+```207:215:rlinf/models/__init__.py
+def get_model(cfg: DictConfig):
+    model_type = str(cfg.model_type)
+    model_builder = _MODEL_REGISTRY.get(model_type)
+    if model_builder is None:
+        return None
+    torch_dtype = torch_dtype_from_precision(cfg.precision)
+    model = model_builder(cfg, torch_dtype)
+```
+
+DreamZero 注册为：
+
+```185:190:rlinf/models/__init__.py
+    register_model(
+        SupportedModel.DREAMZERO.value,
+        _build_dreamzero,
+        category="embodied",
+        force=True,
+    )
+```
+
+**设计意图**：新增第三方 VLA 时，通常只需 (1) `SupportedModel` 枚举 (2) `rlinf/models/embodiment/<name>/get_model.py` (3) 可选 `FSDPVlaSftWorker` 分支或专用 dataloader——**不必改** `SFTRunner` 或 FSDP 核心。
+
+### 11.3 `FSDPSftWorker.model_provider_func` 挂钩
+
+```90:94:rlinf/workers/sft/fsdp_sft_worker.py
+    def model_provider_func(self):
+        model = get_model(self.cfg.actor.model)
+        if model is not None:
+            return model
+        return super().model_provider_func()
+```
+
+`setup_model_and_optimizer()` 始终通过该函数拿 **nn.Module**，再 `wrap_model` 为 FSDP。第三方模型与 HuggingFace 自研模型走同一套优化器/梯度缩放路径。
+
+### 11.4 外部包依赖：`PYTHONPATH` 而非子模块拷贝
+
+[`run_vla_sft.sh`](../../examples/sft/run_vla_sft.sh)：
+
+```bash
+export DREAMZERO_PATH=${DREAMZERO_PATH:-"/path/to/DreamZero"}
+export PYTHONPATH=${DREAMZERO_PATH}:$PYTHONPATH
+```
+
+Hydra preset 里 `action_head_cfg._target_` 等直接写 **groot 全限定类名**（如 `groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead`），由 `hydra.utils.instantiate` 在 worker 进程内构造。  
+**RLinf 不重新实现 WAN**，只实现：**数据入口、补丁、Policy 壳、分布式训练**。
+
+### 11.5 `Patcher`：无 fork 修改上游
+
+[`rlinf/utils/patcher.py`](../../rlinf/utils/patcher.py) 在 import 链上 **替换** 指定符号，例如：
+
+- `WanVideoVAE38` → RLinf 批处理 VAE
+- `CausalWanModel._forward_train` → 修复 micro-batch + checkpoint 行为
+- 若干 attention 子函数 → `torch.compile`
+
+这是整合 **不可改或不宜 fork 的上游仓库** 时的常见做法：保持 `groot` 版本可升级，把 RLinf 特有行为集中在 `rlinf/models/embodiment/dreamzero/patch/`。
+
+### 11.6 `ForwardType` 与 `BasePolicy`：统一训练/RL 接口
+
+```19:21:rlinf/models/embodiment/base_policy.py
+class ForwardType(Enum):
+    DEFAULT = "default"
+    SFT = "sft"
+```
+
+- **PPO/GRPO rollout**：`ForwardType.DEFAULT` → `default_forward` / `predict_action_batch`
+- **SFT**：`ForwardType.SFT` → `DreamZeroPolicy.sft_forward` → groot `VLA.forward`
+
+同一 `Worker` 类可通过 `forward_type` 切换任务，无需为 DreamZero 单独写一套 Runner（SFT 仍用 `SFTRunner`，embodied RL 用 `EmbodiedRunner` 等）。
+
+### 11.7 配置合并：RLinf 字段 + checkpoint `config.json`
+
+[`validate_dreamzero_sft_model_cfg`](../../rlinf/models/embodiment/dreamzero/dreamzero_config.py) 在 `model_path` 存在时把 checkpoint 的 `config.json` **合并进** Hydra `actor.model`（YAML 优先，路径类字段空则保留 checkpoint）。  
+这样 **续训** 时架构与官方权重一致，同时允许 RLinf 覆盖 `metadata_json_path`、`train_data_paths` 等训练侧字段。
+
+### 11.8 与「纯 groot 训练」的对比
+
+| 维度 | 原生 DreamZero (`groot/vla/experiment`) | RLinf 整合 |
+|------|----------------------------------------|------------|
+| 启动 | groot Hydra + DeepSpeed 等 | `train_vla_sft.py` + Ray + FSDP2 |
+| 数据 | `lerobot_sharded` 等 groot 数据集 | `DreamZeroLeRobotDataset` + 同一套 `ComposedModalityTransform` |
+| 分布式 | experiment 脚本配置 | `Cluster` + `FSDPVlaSftWorker` |
+| 模型代码 | 纯 groot | groot + RLinf `Patcher` + `DreamZeroPolicy` |
+
+**结论**：RLinf 把 DreamZero 当作 **可插拔的 embodied `model_type`**，复用通用 SFT 训练环，用 **数据层 + 补丁层** 对齐 LeRobot 与工程需求。
+
+---
+
+## 12. RLinf 与 DreamZero 的整合边界
+
+```mermaid
+flowchart LR
+  subgraph rlinf_own [RLinf_自有代码]
+    DS[Dataset_采样]
+    EM[embodiment_registry]
+    COL[Collator_prompt]
+    RUN[SFTRunner_FSDP]
+    PTCH[patch_VAE_DiT]
+  end
+  subgraph groot_own [groot_DreamZero_自有代码]
+    VLA[VLA_WANPolicyHead]
+    FM[FlowMatching_loss]
+    WAN[WAN_DiT_VAE_T5_CLIP]
+    DT[DreamTransform_core]
+  end
+  subgraph shared [共享契约]
+    CT[ComposedModalityTransform]
+    MD[metadata.json_schema]
+    Keys[batch_dict_keys]
+  end
+  DS --> CT
+  CT --> DT
+  DT --> Keys
+  Keys --> VLA
+  RUN --> VLA
+  PTCH --> WAN
+  VLA --> FM
+```
+
+**整合契约** = Collator 输出、且 `VLA.prepare_input` 能消费的 **扁平 dict / BatchFeature**，键名与 dtype 由 groot `DreamTransform` + `WANPolicyHead.forward` 约定。
+
+| 职责 | 归属 | 说明 |
+|------|------|------|
+| LeRobot 索引、multi_anchor 时间采样 | **RLinf** | [`dreamzero.py`](../../rlinf/data/datasets/dreamzero/dreamzero.py)、[`sampling_strategy.py`](../../rlinf/data/datasets/dreamzero/sampling_strategy.py) |
+| embodiment 注册、`libero_sim`/`oxe_droid` transform 链 | **RLinf** 包装，**groot** 原语 | RLinf 的 `libero_sim.py` 组装 groot `Video*`/`StateAction*`/`ConcatTransform` + RLinf `DreamTransform` 子类 |
+| q99 归一化统计 | **metadata.json**（RLinf toolkit 生成） | `StateActionTransform.set_metadata` |
+| 多视角拼接、action pad、embodiment_id | **groot** `DreamTransform` | RLinf 子类仅覆盖 `_prepare_video` 的 concat 策略 |
+| T5 prompt、batch tokenize | **Collator**（RLinf 类，逻辑来自 groot collate 模板） | `DreamZeroCollator` + `format_training_prompt` |
+| 损失与 WAN 前向 | **groot** | `WANPolicyHead.forward` |
+| 分布式 checkpoint | **RLinf** FSDP | 保存 `actor/` 分片 + `data.pt` |
+
+---
+
+## 13. 训练数据格式：从 LeRobot 到 GPU Batch
+
+### 13.1 磁盘：LeRobot v2/v3 布局
+
+官方要求 `meta/`、`data/`、可选 `videos/`（见 [sft_dreamzero RST](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/sft_dreamzero.html)）。  
+`DreamZeroLeRobotDataset` 读取：
+
+- `meta/info.json`：fps、feature  schema、`video_path` 模板
+- `meta/modality.json`（可选）：`state.*` / `action.*` 切片
+- `meta/tasks.jsonl`：任务文本
+- `data/chunk-*/file-*.parquet`：帧索引、状态、动作、语言字段
+- `videos/.../*.mp4`：lazy 模式下按时间戳解码
+
+### 13.2 阶段 A：`Dataset._build_modality_dict` 输出（尚未进 transform）
+
+在 `__getitem__` 内，对 **单条时间样本** 构造 groot 风格的 **模态字典**（键名与 transform 链一致）：
+
+| 键示例 | 来源 | dtype/形状（示意） |
+|--------|------|-------------------|
+| `video.image` | mp4/parquet 解码 + 时间索引 | `uint8`, `[T_v, H, W, C]` |
+| `video.wrist_image` | 同上 | 同上 |
+| `state.state` | parquet 列切片 | `float32`, `[T_s, D_s]` |
+| `action.actions` | parquet | `float32`, `[T_a, D_a]` |
+| `annotation.task` 等 | language_keys | 字符串 |
+
+**RLinf 在此阶段还可能做**（在 transform 之前）：
+
+- `multi_anchor`：按语言边界选多个 anchor，拼长序列（见 §16）
+- `relative_action`：按 chunk 用 state 锚点减动作（[`_subtract_relative_action`](../../rlinf/data/datasets/dreamzero/dreamzero.py)），与 groot `lerobot_sharded` 一致
+
+### 13.3 阶段 B：`ComposedModalityTransform` 之后（单样本）
+
+以 LIBERO 为例，链顺序见 [`libero_sim._build_composed_transform`](../../rlinf/data/datasets/dreamzero/data_transforms/libero_sim.py)：
+
+1. `VideoToTensor` → `VideoCrop` → `VideoResize(256)` → `VideoColorJitter` → `VideoToNumpy`
+2. `StateActionToTensor` + `StateActionTransform(normalization_modes=q99)`
+3. `ConcatTransform` → 合并为 `video` / `state` / `action` 大 tensor
+4. **`DreamTransform.apply_single`** → 训练用字典
+
+`DreamTransform` 输出（groot，RLinf SFT 走 `apply_single` 路径）核心字段：
+
+| 键 | 含义 |
+|----|------|
+| `images` | 多视角拼成单路视频 `uint8`，形状约 `[1, T, C, H, W]` |
+| `state` | pad 到 `max_state_dim`（如 64） |
+| `state_mask` | 有效维 mask |
+| `action` | pad 到 `max_action_dim`（如 32），长度 `n_macro_chunks × action_horizon` |
+| `action_mask` | 真实 DOF 为 True，pad 为 False |
+| `has_real_action` | 是否计算 action loss（机器人数据为 True） |
+| `embodiment_id` | 标量，选 WAN action projector |
+| `text` | 原始指令（Collator 前） |
+| `text_negative` | CFG 用负 prompt（训练常保留） |
+
+### 13.4 阶段 C：`DreamZeroCollator` 之后（GPU batch）
+
+| 键 | 变化 |
+|----|------|
+| `images` | `np.stack` → `[B, T, H, W, C]` 或等价 |
+| `action`, `state`, masks | `[B, ...]` |
+| `text` | 变为 `format_training_prompt` 后的字符串再 **UMT5 tokenize** |
+| `text`（tensor） | `input_ids` `[B, L]` |
+| `text_attention_mask` | `[B, L]` |
+
+此 dict **原样** 作为 `VLA.forward(inputs)` 的 `inputs`（经 `prepare_input` 搬到 GPU 并 cast）。
+
+### 13.5 数据格式类图（逻辑 schema）
+
+```mermaid
+classDiagram
+  class LeRobotDisk {
+    +parquet rows
+    +mp4 frames
+    +meta/info.json
+  }
+  class ModalityDict {
+    +video.*
+    +state.*
+    +action.*
+    +language
+  }
+  class TransformChain {
+    +Video*
+    +StateActionTransform
+    +ConcatTransform
+    +DreamTransform
+  }
+  class TrainSample {
+    +images
+    +action
+    +state
+    +action_mask
+    +embodiment_id
+    +text
+  }
+  class GpuBatch {
+    +images B,T,H,W,C
+    +text input_ids
+    +action B,Ta,Dmax
+  }
+  LeRobotDisk --> ModalityDict : Dataset读取
+  ModalityDict --> TransformChain
+  TransformChain --> TrainSample
+  TrainSample --> GpuBatch : Collator
+```
+
+---
+
+## 14. 预处理分工：RLinf vs DreamZero
+
+### 14.1 对照表
+
+| 步骤 | 执行位置 | 做什么 | 为何放在这一侧 |
+|------|----------|--------|----------------|
+| Episode/帧索引、分布式采样 | RLinf `DreamZeroLeRobotDataset` | `DistributedSampler`、epoch | 与 FSDP rank 绑定，groot experiment 不负责 |
+| multi_anchor / fixed_window | RLinf `sampling_strategy` | 决定取哪些帧 | 紧耦合 LeRobot lazy mp4；官方 RST 要求 `lazy_load` |
+| parquet/mp4 解码 | RLinf `dreamzero.py` | `_materialize_parquet_sample` | 统一 LIBERO/DROID 路径 |
+| relative_action（可选） | RLinf dataset | 按 chunk 减 state | 与采样窗口一致，避免 transform 内再查原始 parquet |
+| Video 增广、resize 256 | groot `Video*` transforms | 颜色、裁剪 | 与 Groot 训练配方一致 |
+| q99 归一化 state/action | groot `StateActionTransform` | 用 `metadata.json` | 统计量来自 RLinf `generate_dreamzero_metadata.py` |
+| 多视角水平拼接 | RLinf `DreamTransform._prepare_video` | 调 registry `concat_multiview_video` | embodiment 布局在 RLinf 注册（LIBERO 左外右腕） |
+| Action/state padding | groot `DreamTransform._prepare_action/_prepare_state` | 固定 `max_*_dim` | WAN head 输入维固定 |
+| 训练 prompt 模板 | RLinf `format_training_prompt` + Collator | 多视角文字描述 | 与拼接布局一致，避免 groot 硬编码仅 DROID |
+| UMT5 tokenize | Collator（groot `HuggingfaceTokenizer`） | `text` → `input_ids` | 必须在 batch 维做 |
+| 视频 [-1,1]、VAE latent | groot `WANPolicyHead` | 训练 forward 内 | 需 GPU、与 DiT 同设备 |
+| Flow noise、target | groot `FlowMatchScheduler` | 训练时随机 | 非数据集静态字段 |
+
+### 14.2 预处理流水线图
+
+```mermaid
+flowchart TB
+  subgraph R [RLinf_数据侧]
+    R1[LeRobot读盘]
+    R2[时间采样 multi_anchor]
+    R3[构建 modality dict]
+    R4[可选 relative_action]
+    R5[collate_ready_sample]
+    R6[DreamZeroCollator + prompt]
+  end
+  subgraph G [groot_变换与模型侧]
+    G1[Video StateAction Concat]
+    G2[DreamTransform pad mask id]
+    G3[VAE T5 CLIP encode]
+    G4[add_noise + DiT]
+  end
+  R1 --> R2 --> R3 --> G1
+  G1 --> G2 --> R5 --> R6
+  R6 --> G3 --> G4
+```
+
+**要点**：RLinf 负责 **「哪一段轨迹进模型」**；groot 负责 **「进模型前长什么样」** 以及 **「进模型后如何变成 loss」**。metadata 是两边桥梁：RLinf 生成，groot transform 消费。
+
+---
+
+## 15. Label 与 Target：监督信号与损失中的用法
+
+### 15.1 先澄清：这不是「分类 label」式 SFT
+
+DreamZero SFT **没有** token 级的 `labels` 张量（不像因果 LM 的 `input_ids`/`labels` 错位）。  
+监督形式是 **条件生成式扩散 / Flow Matching**：
+
+- **条件（conditioning）**：语言 `text`、首帧/CLIP、`state`、可选 `clean_x`（教师 latent）
+- **被预测量**：在 **随机噪声水平** 下的 **video latent** 与 **action** 的噪声残差
+- **目标（target）**：由 scheduler 从 **干净演示数据** 与 **采样噪声** 解析得到
+
+### 15.2 三类「监督数据」
+
+| 类型 | 字段 | 是否「label」 | 在训练中的角色 |
+|------|------|---------------|----------------|
+| **演示视频** | 经 transform 的 `images` → VAE `latents` | 是 **生成目标的一部分** | 干净 latent 用于构造 `training_target`；加噪后送入 DiT |
+| **演示动作** | `action`（q99 归一化、pad 后） | 是 **动作分支目标** | 同上，对应 `action_noise_pred` vs `training_target_action` |
+| **语言指令** | `text` → T5 `prompt_embs` | **不是 label**，是条件 | 类似 classifier-free guidance 的文本侧条件 |
+
+此外还有 **结构掩码**（不是语义 label，而是指示哪些维参与 loss）：
+
+| 掩码 | 含义 |
+|------|------|
+| `action_mask` | 真实机器人 DOF 为 True，pad 维为 False |
+| `has_real_action` | 样本是否算机器人动作 loss（SFT 机器人数据恒为 True） |
+| `state_mask` | state pad 维 |
+
+### 15.3 Flow Matching 的 target 公式（groot）
+
+[`FlowMatchScheduler.training_target`](file:///D:/SRC/Robot/dreamzero/groot/vla/model/dreamzero/modules/flow_match_scheduler.py)：
+
+```python
+def training_target(self, sample, noise, timestep):
+    target = noise - sample
+    return target
+```
+
+即模型预测的是 **从当前样本指向噪声的方向**（与 `add_noise` 线性插值配套）；`WANPolicyHead` 里：
+
+```python
+training_target = scheduler.training_target(latents, noise, timestep)
+training_target_action = scheduler.training_target(actions, noise_action, timestep_action)
+# MSE(pred, training_target) 加权
+```
+
+**旁征博引**：这与 Rectified Flow / Flow Matching 文献中「回归向量场」一致；DreamZero 把 **世界模型（视频 latent）** 与 **策略（action）** 绑在同一 Causal DiT 里联合回归，因此日志里分 `dynamics_loss` 与 `action_loss`。
+
+### 15.4 训练 forward 中 target 的使用（逐步）
+
+```mermaid
+sequenceDiagram
+  participant B as Batch演示数据
+  participant H as WANPolicyHead
+  participant S as FlowMatchScheduler
+  participant D as CausalWanModel
+
+  B->>H: images action state text
+  H->>H: latents = VAE(images) 无梯度
+  H->>S: sample noise, timestep
+  S->>H: noisy_latents, training_target
+  S->>H: noisy_actions, training_target_action
+  H->>D: forward noisy + clean_x=latents
+  D-->>H: video_noise_pred, action_noise_pred
+  H->>H: MSE(pred, target) * masks * training_weight(t)
+```
+
+要点：
+
+1. **干净 `latents` / `actions`**：来自数据集演示（专家轨迹），是 **监督源头**。
+2. **`noise` / `timestep`**：每 step 随机，定义 **哪个扩散难度** 上拟合。
+3. **`clean_x=latents.transpose`**：教师 forcing，`_forward_train` 内拼接 clean/noisy 路径（见 RLinf patch 与 groot DiT）。
+4. **`action_mask` × `has_real_action`**：只在有效维、有效样本上累计 `action_loss`。
+5. **`training_weight(timestep)`**：强调某些噪声区间（scheduler 预计算 `linear_timesteps_weights`）。
+
+### 15.5 与经典监督学习的映射
+
+| 经典监督 | DreamZero SFT |
+|----------|----------------|
+| \(x\) 输入 | `text`、部分视频条件、`state`、`noisy_*` |
+| \(y\) label | 无离散 label；**连续 `training_target`** |
+| 损失 | \(\|\epsilon_\theta(x_t, t) - ( \epsilon - x_0 )\|^2\) 型 MSE（分 video/action） |
+
+**推理时**不再使用 `training_target`：改为多步 denoise（`lazy_joint_video_action_causal`），以 **条件** 生成 `action_pred`。
+
+### 15.6 LIBERO SFT 上「什么是 label」的一句话
+
+> **Label = 同一段演示里的未来视频 latent + 同步动作序列**；模型学习在给定语言与状态下，预测 Flow Matching 意义下的 **去噪方向**；语言本身不作为预测目标。
+
+---
+
+## 16. 微调时的数据流动与逐步转换
+
+### 16.1 单样本时间线（multi_anchor + LIBERO）
+
+设 `max_chunk_size=4`，`action_horizon=16`，则动作长度 \(4 \times 16 = 64\) 步；视频帧数常为 \(8 \times 4 + 1 = 33\)。
+
+```mermaid
+gantt
+  title 单条训练样本时间语义示意
+  dateFormat X
+  axisFormat %s
+  section 语言段
+  同一instruction :a1, 0, 100
+  section 宏观anchor
+  anchor0 :m0, 0, 25
+  anchor1 :m1, 25, 50
+  anchor2 :m2, 50, 75
+  anchor3 :m3, 75, 100
+  section 每anchor动作
+  16步动作 :crit, 0, 25
+```
+
+**逐步转换表**：
+
+| 步 | 位置 | 输入 | 输出 |
+|----|------|------|------|
+| 1 | `Dataset.__getitem__(idx)` | 全局帧索引 | 选定 episode + `frame_in_ep` + temporal indices |
+| 2 | `_load_raw_sample` | 索引 | parquet 行 + 解码视频帧数组 |
+| 3 | `_build_modality_dict` | 原始列 | `video.*` `state.*` `action.*` 字典 |
+| 4 | `data_transform(raw)` | 模态 dict | `DreamTransform` 输出 + numpy |
+| 5 | `collate_ready_sample` | dict | 纯 numpy、无 batch 维 |
+| 6 | `DreamZeroCollator` | list of samples | `torch` batch + tokenized `text` |
+| 7 | `to(device)` | CPU batch | GPU `BatchFeature` |
+| 8 | `WANPolicyHead` | `images` uint8 | `latents`、加噪、`noise_pred` |
+| 9 | `backward` | `loss` | 参数梯度 |
+
+### 16.2 张量形状演变（LIBERO + WAN2.2，概念）
+
+| 步 | 变量 | 形状（示意） |
+|----|------|----------------|
+| 磁盘动作 | 原始 `action.actions` | `[64, 7]` |
+| Concat 后 | `action` | `[64, 7]` |
+| DreamTransform | `action` padded | `[64, 32]`，`action_mask[:, :7]=True` |
+| Collator | `action` | `[B, 64, 32]` |
+| WANHead 内 | `actions` 校验 | 值域 \([-1,1]\) |
+| Loss | `action_noise_pred` | 与 `training_target_action` 对齐 |
+
+视频：`[B,T,H,W,C]` → `[B,C,T,H',W']`（resize 160×320）→ VAE → `[B, T', C_z, H_z, W_z]`，`C_z=48`（WAN2.2）。
+
+### 16.3 数据流总图（含 target 生成）
+
+```mermaid
+flowchart TB
+  subgraph demo [演示数据_监督源]
+    Vdemo[视频帧]
+    Ademo[动作轨迹]
+    Ldemo[语言]
+  end
+  subgraph rlinf_pipe [RLinf管道]
+    Sample[采样窗口]
+    Trans[Transform+Collate]
+  end
+  subgraph cond [条件分支]
+    T5[T5 prompt_embs]
+    CLIP[CLIP+VAE首帧]
+    St[state]
+  end
+  subgraph tgt [目标分支]
+    Lat[干净 latents]
+    Act[干净 action]
+    Noise[随机 noise]
+    TT[training_target = noise - sample]
+  end
+  subgraph pred [预测]
+    DiT[CausalWanModel]
+    L[MSE loss]
+  end
+  Vdemo --> Sample
+  Ademo --> Sample
+  Ldemo --> Sample
+  Sample --> Trans
+  Trans --> Lat
+  Trans --> Act
+  Trans --> T5
+  Trans --> St
+  Vdemo --> Lat
+  Lat --> Noise
+  Act --> Noise
+  Noise --> TT
+  Lat --> DiT
+  Noise --> DiT
+  T5 --> DiT
+  CLIP --> DiT
+  St --> DiT
+  DiT --> L
+  TT --> L
+```
+
+---
+
+## 17. 端到端整合调用序列图
+
+从 shell 到参数更新，**RLinf 与 groot 交错**如下：
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant SH as run_vla_sft.sh
+  participant TR as train_vla_sft.py
+  participant RN as SFTRunner
+  participant W as FSDPVlaSftWorker
+  participant DL as DreamZeroLeRobotDataset
+  participant TX as ComposedModalityTransform
+  participant CO as DreamZeroCollator
+  participant P as DreamZeroPolicy
+  participant V as VLA_groot
+  participant WH as WANPolicyHead
+  participant FSDP as FSDP2
+
+  SH->>TR: PYTHONPATH含dreamzero
+  TR->>W: create_group.launch
+  RN->>W: init_worker
+  W->>W: get_model Patcher.apply
+  W->>FSDP: wrap_model optimizer
+
+  loop each global_step
+    RN->>W: run_training
+    loop grad_accum
+      W->>DL: next batch
+      DL->>DL: _build_modality_dict
+      DL->>TX: data_transform
+      Note over TX: groot Video StateAction<br/>RLinf DreamTransform
+      TX->>CO: collate_ready_sample
+      CO->>W: tokenized batch
+      W->>P: ForwardType.SFT
+      P->>V: forward inputs
+      V->>WH: backbone Identity + action_head
+      Note over WH: VAE T5 CLIP encode<br/>noise + training_target<br/>DiT forward MSE
+      WH-->>P: loss dynamics action
+      P-->>W: dict loss
+      W->>FSDP: backward
+    end
+    W->>FSDP: optimizer_step
+    W-->>RN: train metrics
+  end
+```
+
+### 17.1 关键「边界调用」代码锚点
+
+| # | 调用 | 仓库 | 文件 |
+|---|------|------|------|
+| 1 | `build_dreamzero_sft_dataloader` | RLinf | `rlinf/data/datasets/dreamzero/dreamzero.py` |
+| 2 | `build_dreamzero_composed_transform` | RLinf | `data_transforms/__init__.py` |
+| 3 | `DreamTransform.apply_single` | groot | `transform/dreamzero_cotrain.py` |
+| 4 | `DreamZeroCollator.collate_batch` | RLinf | `dreamzero.py` |
+| 5 | `model(forward_type=SFT)` | RLinf | `fsdp_vla_sft_worker.py` |
+| 6 | `sft_forward` → `super().forward` | RLinf → groot | `dreamzero_policy.py` → `base_vla.py` |
+| 7 | `WANPolicyHead.forward` | groot | `wan_flow_matching_action_tf.py` |
+| 8 | `loss.backward` / `optimizer_step` | RLinf | `fsdp_sft_worker.py` / `fsdp_model_manager.py` |
+
+---
+
+## 第二部分小结
+
+| 问题 | 简短回答 |
+|------|----------|
+| RLinf 如何整合 DreamZero？ | `register_model` + `get_model` + `Patcher` + `FSDPVlaSftWorker` + 专用 Dataset/Collator；groot 经 `PYTHONPATH` 注入 |
+| 训练数据长什么样？ | LeRobot → 模态 dict → transform → `{images, action, state, masks, text}` → Collator 加 `input_ids` |
+| 谁做预处理？ | **时间采样与读盘**在 RLinf；**归一化、增广、pad、tokenize 模板**在 groot/RLinf 协作；**VAE/加噪/loss** 仅在 groot 训练 forward |
+| 什么是 label/target？ | **演示视频 latent + 动作**；target 为 Flow Matching 的 `noise - sample`；**text 是条件不是 label** |
+| 数据如何流动？ | 见 §16 流程图与 §17 序列图 |
+
+---
+
+*全文完。第一部分为训练管线与 WAN 架构；第二部分为整合设计、数据格式与监督信号。评测与 checkpoint 转换请参阅官方 [DreamZero SFT](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/sft_dreamzero.html) 文档。*
