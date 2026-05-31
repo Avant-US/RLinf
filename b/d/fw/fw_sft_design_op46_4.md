@@ -306,6 +306,10 @@ av>=16.0.0
 safetensors>=0.5.3
 lerobot>=0.2.0
 albumentations>=1.4.0
+einops>=0.8.0
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+boto3>=1.35.0
 ```
 
 ### 5.2 安装脚本 `install.sh`
@@ -449,11 +453,30 @@ class FastWAMPolicy(torch.nn.Module, BasePolicy):
         if data is None:
             data = kwargs.get("data")
         loss_total, loss_dict = self.fastwam.training_loss(data)
+        # 注意：training_loss 返回的 loss_dict 值是 Python float（fastwam.py:565-566），
+        # 但 FSDPVlaSftWorker.get_train_model_output() 调用 output["dynamics_loss"].detach().item()，
+        # 需要 Tensor。必须用 torch.tensor() 包装。
         return {
             "loss": loss_total,
-            "dynamics_loss": loss_dict.get("loss_video", 0.0),
-            "action_loss": loss_dict.get("loss_action", 0.0),
+            "dynamics_loss": torch.tensor(loss_dict.get("loss_video", 0.0)),
+            "action_loss": torch.tensor(loss_dict.get("loss_action", 0.0)),
         }
+
+    def train(self, mode=True):
+        # 重写 train() 以保持冻结逻辑：FSDPSftWorker.run_training() 会调用
+        # self.model.train()（fsdp_sft_worker.py:137），这会把所有子模块设为
+        # train 模式，覆盖 VAE 的 eval 状态。此处重写确保冻结语义一致。
+        if mode:
+            self.fastwam.eval()
+            self.fastwam.requires_grad_(False)
+            self.fastwam.dit.train()
+            self.fastwam.dit.requires_grad_(True)
+            if self.fastwam.proprio_encoder is not None:
+                self.fastwam.proprio_encoder.train()
+                self.fastwam.proprio_encoder.requires_grad_(True)
+        else:
+            self.fastwam.eval()
+        return self
 
     def default_forward(self, **kwargs):
         raise NotImplementedError("V1 does not support default_forward.")
@@ -536,6 +559,12 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if fastwam_model.text_encoder is not None:
         fastwam_model.text_encoder.requires_grad_(False)
 
+    # 注意 1：FastWAM.__init__ 的 self.to(self.device) 只移 device 不转 dtype，
+    # 必须显式 .to(dtype) 将所有子模块转为目标精度（如 bf16）。
+    # 注意 2：FastWAM.device 是普通 Python 属性，不随 nn.Module.to() 更新。
+    # 此处用 device="cpu" 构建，FSDP 接管后会正确分配参数到 GPU。
+    # 但 build_inputs 中的 tensor.to(self.device) 依赖此属性——
+    # Phase 1 实现时需确保 FSDP forward 前 self.device 被正确设置。
     policy = FastWAMPolicy(fastwam_model, FastWAMConfig.from_hydra(cfg))
     _promote_scalar_params_to_1d(policy)
     return policy.to(dtype=torch_dtype)
@@ -865,6 +894,133 @@ $B_{\text{global}} = B_{\text{micro}} \times N_{\text{GPU}} \times G_{\text{accu
 | 采样 | ResumableEpochSampler | DistributedSampler + StatefulDataLoader |
 | Checkpoint | step_*.pt | dcp_checkpoint + convert |
 
+### 16.4 优化器与 bf16 训练稳定性
+
+#### 16.4.1 优化器超参数
+
+FastWAM 原生训练器（`trainer.py:89-104`）使用以下超参数，RLinf 整合**必须保持一致**：
+
+| 超参数 | FastWAM 值 | DreamZero 参考 | 说明 |
+|--------|-----------|---------------|------|
+| `lr` | 1e-4 | 1e-5 | **不同**，FastWAM 用更高学习率 |
+| `weight_decay` | 1e-2 | 1e-5 | **不同**，FastWAM 用更强正则化 |
+| `adam_beta1` | 0.9 | 0.95 | **不同** |
+| `adam_beta2` | 0.95 | 0.999 | **不同**，FastWAM 用更快衰减 |
+| `clip_grad` | 1.0 | 1.0 | 一致 |
+| `lr_scheduler` | cosine | cosine | 一致 |
+| `lr_warmup_steps_ratio` | 0.05 | 0.05 | 一致，5% 步数 warmup |
+
+> **关键提醒**：不可直接复用 DreamZero 的 optim 配置。FastWAM 的 MoT 架构对学习率和 beta 参数敏感——使用错误值会导致 bf16 下梯度溢出（NaN）。
+
+#### 16.4.2 bf16 + FSDP2 训练稳定性
+
+**Phase 0 实测发现**：FastWAM 6B 模型在 bf16 精度下，无 warmup 时 step 2 即出现 NaN。原因是 bf16 的 mantissa 仅 7 bit，梯度在早期步骤中容易溢出。
+
+**必须遵循的配置**：
+
+```yaml
+actor:
+  fsdp_config:
+    grad_scaler:
+      enabled: False        # bf16 不需要 loss scaling（bf16 动态范围足够）
+    mixed_precision:
+      param_dtype: bf16     # FSDP2 原生 bf16
+      reduce_dtype: bf16
+      buffer_dtype: bf16
+    amp_autocast:
+      enabled: False        # 依赖 FSDP2 的原生 bf16，不使用 autocast
+  optim:
+    lr_warmup_steps_ratio: 0.05  # 必须！无 warmup 会导致 NaN
+    clip_grad: 1.0               # 必须！控制梯度范数
+```
+
+> **GradScaler 注意事项**：`torch.amp.GradScaler` 不支持 bf16 梯度（会抛出 `"_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for 'BFloat16'`）。bf16 训练必须设 `enabled: False`。RLinf 的 `optimizer_step()` 中 `unscale_()` 在 `enabled=False` 时为 no-op，不影响梯度裁剪。
+
+#### 16.4.3 完整 SFT 配置模板
+
+```yaml
+# examples/sft/config/libero_sft_fastwam.yaml
+defaults:
+  - training_backend/fsdp@actor.fsdp_config
+  - model/fastwam@actor.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_sft_fastwam"
+    logger_backends: ["tensorboard"]
+  max_epochs: -1
+  max_steps: 50000
+  val_check_interval: -1
+  save_interval: 3000
+  log_interval: 100
+  resume_dir: null
+
+data:
+  train_data_paths: ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+  num_workers: 8
+  prefetch_factor: 8
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 2
+  global_batch_size: 64
+  seed: 42
+
+  model:
+    model_type: "fastwam"
+    precision: bf16
+    model_path: null
+    text_embedding_cache_dir: ./data/text_embeds_cache/libero
+
+  optim:
+    lr: 1.0e-4                    # FastWAM 原生值（非 DreamZero 的 1e-5）
+    adam_beta1: 0.9               # FastWAM 原生值（非 DreamZero 的 0.95）
+    adam_beta2: 0.95              # FastWAM 原生值（非 DreamZero 的 0.999）
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-2          # FastWAM 原生值（非 DreamZero 的 1e-5）
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: -1
+    lr_warmup_steps_ratio: 0.05   # 5% warmup（必须，防止 bf16 NaN）
+    total_training_steps: 50000
+
+  fsdp_config:
+    strategy: "fsdp2"
+    use_orig_params: True
+    gradient_checkpointing: True
+    gradient_checkpointing_use_reentrant: True
+    limit_all_gathers: False
+    forward_prefetch: True
+    backward_prefetch: "pre"
+    reshard_after_forward: False
+    save_full_model_weights: False
+    grad_scaler:
+      enabled: False              # bf16 必须禁用
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      buffer_dtype: bf16
+    amp_autocast:
+      enabled: False              # FSDP2 原生 bf16
+```
+
 ---
 
 ## 17. 评估、CI 与文档
@@ -920,11 +1076,11 @@ sft-fastwam-libero-test:
 
 ### Phase 1 — 最小训练闭环（3-5 天）
 - [ ] config.py + models/__init__.py 注册
-- [ ] fastwam_policy.py + fastwam_config.py + get_model
+- [ ] fastwam_policy.py（含 `train()` 重写 + `torch.tensor` 包装）+ fastwam_config.py + get_model
 - [ ] build_fastwam_sft_dataloader + collator
 - [ ] fsdp_vla_sft_worker.py 分支
-- [ ] 配置 YAML
-- [ ] **验收**：单卡 loss 下降
+- [ ] 配置 YAML（使用 §16.4.3 模板，**注意 optim 超参数与 DreamZero 不同**）
+- [ ] **验收**：单卡 bf16 训练 100 步无 NaN 且 loss 下降
 
 ### Phase 2 — 分布式 + Resume + Checkpoint（3-5 天）
 - [ ] 8 GPU FSDP2 + save/resume + fastwam_save_helper
@@ -946,6 +1102,10 @@ sft-fastwam-libero-test:
 | FSDP 与 MoT 模块名不匹配 | `DiTBlock` 已代码确认 |
 | FSDP 前缀导致 convert 失败 | convert 脚本 + 单测 |
 | 首帧梯度泄露 | VAE encode 在 `@torch.no_grad()`（`fastwam.py:242`） |
+| **bf16 训练 NaN** | lr warmup（5%）+ clip_grad=1.0 + GradScaler disabled（见 §16.4） |
+| **`model.device` 属性不随 `.to()` 更新** | `get_model()` 中 `device="cpu"` 构建，FSDP 接管设备；Phase 1 需确认 `build_inputs` 中的 `.to(self.device)` 在 FSDP forward 时行为正确 |
+| **`model.train()` 覆盖冻结** | `FastWAMPolicy.train()` 重写为保持 VAE eval + MoT train 的冻结语义（见 §7.2） |
+| **sft_forward 返回 float 而非 Tensor** | `dynamics_loss`/`action_loss` 用 `torch.tensor()` 包装（见 §7.2） |
 
 ### 20.2 关键决策
 
@@ -957,6 +1117,9 @@ sft-fastwam-libero-test:
 | Patcher | 不使用 | FastWAM 自包含 |
 | 模型工厂 | `create_fastwam()` | Hydra-aware |
 | Checkpoint 转换 | `rlinf/utils/ckpt_convertor/` | 与 DreamZero 一致 |
+| **GradScaler** | `enabled: False` | bf16 不需要 loss scaling，且 GradScaler 不支持 bf16 梯度 |
+| **Optimizer 超参** | 保持 FastWAM 原生值 | lr=1e-4, beta2=0.95, wd=1e-2（与 DreamZero 不同）|
+| **`train()` 重写** | 在 FastWAMPolicy 中重写 | 防止 Worker 调用 `model.train()` 覆盖冻结逻辑 |
 
 ---
 

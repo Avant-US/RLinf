@@ -156,14 +156,15 @@ flowchart TB
 
 | 参数 | 真实值 | 测试值 | 说明 |
 |------|--------|--------|------|
-| `hidden_dim` (video) | 3072 | 64 | DiT 隐藏维度 |
-| `hidden_dim` (action) | 1024 | 64 | 两个 Expert 须相同 `num_heads × attn_head_dim` |
-| `ffn_dim` (video) | 14336 | 128 | FFN 中间维度 |
-| `ffn_dim` (action) | 4096 | 128 | |
+| `hidden_dim` (video) | 3072 | 128 | DiT 隐藏维度 |
+| `hidden_dim` (action) | 1024 | 128 | 两个 Expert 须相同 `num_heads × attn_head_dim` |
+| `ffn_dim` (video) | 14336 | 256 | FFN 中间维度 |
+| `ffn_dim` (action) | 4096 | 256 | |
 | `num_heads` | 24 | 4 | 注意力头数 |
-| `attn_head_dim` | 128 | 16 | 每头维度 |
+| `attn_head_dim` | 128 | 32 | 每头维度（须确保 3D RoPE 维度对齐）|
 | `num_layers` | 30 | 2 | DiT 层数 |
 | `text_dim` | 4096 | 64 | T5 嵌入维度 |
+| `freq_dim` | 256 | 256 | 频率维度（保持与真实值一致）|
 | `in_dim` / `out_dim` | 48 | 16 | VAE latent 通道数 |
 | `patch_size` | (1,2,2) | (1,2,2) | 保持不变 |
 | `action_dim` | 7 | 7 | 动作维度 |
@@ -176,8 +177,8 @@ flowchart TB
 |------|--------|--------|------|
 | `batch_size` | 2 | 2 | |
 | `num_frames` (T) | 9 (33→抽稀) | 5 | T%4==1 |
-| `H` | 224 | 32 | H%16==0 |
-| `W` | 448 | 32 | W%16==0 |
+| `H` | 224 | 64 | H%16==0（须确保 3D RoPE 维度对齐）|
+| `W` | 448 | 64 | W%16==0（须确保 3D RoPE 维度对齐）|
 | `action_horizon` | 32 | 4 | 整除 (T-1)=4 |
 
 #### 3.1.3 MockVAE 实现
@@ -217,11 +218,11 @@ class MockVAE(nn.Module):
 - `Conv3d` 权重固定（`requires_grad_(False)`）：相同输入 → 相同输出
 - 输出 shape：`[B, z_dim, latent_T, latent_H, latent_W]`
 
-对于测试值 `T=5, H=32, W=32`：
+对于测试值 `T=5, H=64, W=64`：
 - `latent_T = (5-1)//4 + 1 = 2`
-- `latent_H = 32//8 = 4`
-- `latent_W = 32//8 = 4`
-- 输出：`[2, 16, 2, 4, 4]`
+- `latent_H = 64//8 = 8`
+- `latent_W = 64//8 = 8`
+- 输出：`[2, 16, 2, 8, 8]`
 
 #### 3.1.4 完整 conftest.py 核心逻辑
 
@@ -311,18 +312,19 @@ class FastWAMPolicy(nn.Module, BasePolicy):
 # Fixture 函数
 # ═══════════════════════════════════════════════════
 MINI_VIDEO_DIT_CFG = dict(
-    dim=64, in_dim=16, ffn_dim=128, out_dim=16,
-    text_dim=64, freq_dim=64, eps=1e-6,
-    patch_size=(1, 2, 2), num_heads=4, attn_head_dim=16,
-    num_layers=2,
+    hidden_dim=128, in_dim=16, ffn_dim=256, out_dim=16,
+    text_dim=64, freq_dim=256, eps=1e-6,
+    patch_size=(1, 2, 2), num_heads=4, attn_head_dim=32,
+    num_layers=2, has_image_input=False,
+    seperated_timestep=True,
     fuse_vae_embedding_in_latents=True,
     video_attention_mask_mode="first_frame_causal",
 )
 
 MINI_ACTION_DIT_CFG = dict(
-    dim=64, action_dim=7, ffn_dim=128,
-    text_dim=64, freq_dim=64, eps=1e-6,
-    num_heads=4, attn_head_dim=16, num_layers=2,
+    hidden_dim=128, action_dim=7, ffn_dim=256,
+    text_dim=64, freq_dim=256, eps=1e-6,
+    num_heads=4, attn_head_dim=32, num_layers=2,
 )
 
 
@@ -369,7 +371,7 @@ def mini_policy(mini_fastwam):
 def synthetic_batch():
     """生成合成 batch 数据。"""
     torch.manual_seed(99)
-    B, T, H, W = 2, 5, 32, 32
+    B, T, H, W = 2, 5, 64, 64
     return {
         "video":          torch.randn(B, 3, T, H, W),
         "context":        torch.randn(B, 8, 64),
@@ -386,7 +388,7 @@ def synthetic_batch():
 ```mermaid
 flowchart TB
     subgraph Input ["输入 Batch"]
-        V["video [2, 3, 5, 32, 32]"]
+        V["video [2, 3, 5, 64, 64]"]
         A["action [2, 4, 7]"]
         C["context [2, 8, 64]"]
         CM["context_mask [2, 8] bool"]
@@ -395,28 +397,28 @@ flowchart TB
         IIP["image_is_pad [2, 5] bool"]
     end
     subgraph VAE ["MockVAE encode (no_grad)"]
-        L["input_latents [2, 16, 2, 4, 4]"]
+        L["input_latents [2, 16, 2, 8, 8]"]
     end
     subgraph ProprioEnc ["proprio_encoder"]
         PE["proprio[:,0,:] → Linear(14,64) → [2, 1, 64]"]
         CC["context_cat [2, 9, 64]"]
     end
     subgraph Noise ["噪声采样"]
-        NV["noise_video [2, 16, 2, 4, 4]"]
+        NV["noise_video [2, 16, 2, 8, 8]"]
         NA["noise_action [2, 4, 7]"]
         TV["timestep_video [2]"]
         TA["timestep_action [2]"]
     end
     subgraph PreDiT ["Pre-DiT"]
-        VT["video_tokens [2, N_v, 64]"]
-        AT["action_tokens [2, 4, 64]"]
+        VT["video_tokens [2, N_v, 128]"]
+        AT["action_tokens [2, 4, 128]"]
     end
     subgraph MoT ["MoT Forward (2 layers)"]
-        VO["tokens_out.video [2, N_v, 64]"]
-        AO["tokens_out.action [2, 4, 64]"]
+        VO["tokens_out.video [2, N_v, 128]"]
+        AO["tokens_out.action [2, 4, 128]"]
     end
     subgraph PostDiT ["Post-DiT"]
-        PV["pred_video [2, 16, 1, 4, 4]"]
+        PV["pred_video [2, 16, 1, 8, 8]"]
         PA["pred_action [2, 4, 7]"]
     end
     subgraph Loss ["Loss 计算"]
@@ -442,7 +444,7 @@ flowchart TB
     LA --> LT
 ```
 
-> **注**：当 `fuse_vae_embedding_in_latents=True` 时，首帧 latent 保持干净（不加噪），`pred_video` 裁剪为 `[:, :, 1:]`，故 shape 从 `[2, 16, 2, 4, 4]` 变为 `[2, 16, 1, 4, 4]`。
+> **注**：当 `fuse_vae_embedding_in_latents=True` 时，首帧 latent 保持干净（不加噪），`pred_video` 裁剪为 `[:, :, 1:]`，故 shape 从 `[2, 16, 2, 8, 8]` 变为 `[2, 16, 1, 8, 8]`。
 
 ---
 
@@ -487,7 +489,7 @@ def test_collate_fn_stacks_correctly():
     for i in range(4):
         torch.manual_seed(100 + i)
         samples.append({
-            "video":         torch.randn(3, 5, 32, 32),
+            "video":         torch.randn(3, 5, 64, 64),
             "context":       torch.randn(8, 64),
             "context_mask":  torch.ones(8, dtype=torch.bool),
             "action":        torch.randn(4, 7),
@@ -501,7 +503,7 @@ def test_collate_fn_stacks_correctly():
     batch = fastwam_collate_fn(samples)
 
     # 验证 Tensor 键: stack 后应有 batch 维度
-    assert batch["video"].shape == (4, 3, 5, 32, 32)
+    assert batch["video"].shape == (4, 3, 5, 64, 64)
     assert batch["context"].shape == (4, 8, 64)
     assert batch["action"].shape == (4, 4, 7)
     assert batch["context_mask"].shape == (4, 8)
@@ -514,7 +516,7 @@ def test_collate_fn_stacks_correctly():
 
     # 验证数值一致（torch.stack 是 bit-exact 的）
     torch.manual_seed(100)
-    expected_video_0 = torch.randn(3, 5, 32, 32)
+    expected_video_0 = torch.randn(3, 5, 64, 64)
     assert torch.equal(batch["video"][0], expected_video_0)
 ```
 
@@ -1606,7 +1608,7 @@ def test_multi_step_weight_update(mini_fastwam, synthetic_batch):
     for i in range(num_steps):
         torch.manual_seed(200 + i)
         batches.append({
-            "video":         torch.randn(2, 3, 5, 32, 32),
+            "video":         torch.randn(2, 3, 5, 64, 64),
             "context":       torch.randn(2, 8, 64),
             "context_mask":  torch.ones(2, 8, dtype=torch.bool),
             "action":        torch.randn(2, 4, 7),
@@ -2012,8 +2014,8 @@ graph TB
 # 输入约束检查（来自 build_inputs 的验证逻辑）
 # 这些约束来自 fastwam.py:286-311
 assert T % 4 == 1                      # T=5 ✓
-assert H % 16 == 0                     # H=32 ✓
-assert W % 16 == 0                     # W=32 ✓
+assert H % 16 == 0                     # H=64 ✓
+assert W % 16 == 0                     # W=64 ✓
 assert T > 1                           # T=5 ✓
 assert action_horizon % (T - 1) == 0   # 4 % 4 == 0 ✓
 ```
