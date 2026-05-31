@@ -3,7 +3,7 @@
 > **文档性质**：工程设计与实现指导（Design Spec v3 — 基于 DreamZero 整合全面对标后的增补版）  
 > **前版**：[fw_sft_design_op46_1_1.md](./fw_sft_design_op46_1_1.md)（v2.1 代码校验版）  
 > **方法论**：逐一对标 DreamZero 在 RLinf 中的 **所有整合触点**（~50 个文件），识别 v2.1 的遗漏与设计缺陷，补齐并改良  
-> **代码基线**：RLinf `d:\SRC\RL\RLinf` · FastWAM `d:\SRC\Robot\FastWAM` · DreamZero `d:\SRC\Robot\dreamzero`  
+> **代码基线**：RLinf `/home/luogang/S/RL/RLinf` · FastWAM `/home/luogang/S/Rb/FastWAM` · DreamZero `/home/luogang/S/Rb/dreamzero`  
 > **日期**：2026-05-31
 
 ---
