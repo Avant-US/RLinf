@@ -99,6 +99,7 @@ SupportedModel.LINGBOTVLA = SupportedModel.register("lingbotvla", force=True)
 SupportedModel.RESNET_REWARD = SupportedModel.register("resnet", force=True)
 SupportedModel.CFG_MODEL = SupportedModel.register("cfg_model", force=True)
 SupportedModel.VALUE_MODEL = SupportedModel.register("value_model", force=True)
+SupportedModel.FASTWAM = SupportedModel.register("fastwam", force=True)
 
 SupportedModel.QWEN2_5_VL_SFT = SupportedModel.register("qwen2.5_vl", force=True)
 SupportedModel.QWEN3_VL_SFT = SupportedModel.register("qwen3_vl", force=True)
@@ -122,6 +123,7 @@ EMBODIED_MODEL = set(
         SupportedModel.RESNET_REWARD,
         SupportedModel.CFG_MODEL,
         SupportedModel.VALUE_MODEL,
+        SupportedModel.FASTWAM,
     }
 )
 
@@ -1088,6 +1090,15 @@ def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
             )
 
             cfg.actor.model = validate_dreamzero_sft_model_cfg(cfg.actor.model)
+        elif (
+            model_type is not None
+            and SupportedModel(model_type) == SupportedModel.FASTWAM
+        ):
+            from rlinf.models.embodiment.fastwam.fastwam_config import (
+                validate_fastwam_sft_model_cfg,
+            )
+
+            cfg.actor.model = validate_fastwam_sft_model_cfg(cfg.actor.model)
 
     return cfg
 

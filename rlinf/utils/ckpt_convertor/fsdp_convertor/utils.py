@@ -61,12 +61,32 @@ def torch_dtype_to_hf_str(dtype: torch.dtype) -> str:
     return mapping[dtype]
 
 
+def fastwam_save_helper(model_state_dict, model_config, save_path, **kwargs):
+    mot_sd, pe_sd = {}, {}
+    for k, v in model_state_dict.items():
+        if k.startswith("fastwam.mot."):
+            mot_sd[k.replace("fastwam.mot.", "")] = v
+        elif k.startswith("fastwam.proprio_encoder."):
+            pe_sd[k.replace("fastwam.proprio_encoder.", "")] = v
+
+    payload = {
+        "mot": mot_sd,
+        "step": kwargs.get("step", 0),
+        "torch_dtype": "torch.bfloat16",
+    }
+    if pe_sd:
+        payload["proprio_encoder"] = pe_sd
+
+    torch.save(payload, os.path.join(save_path, "fastwam_native.pt"))
+
+
 def get_model_save_helper(model_type: str):
     model_type = SupportedModel(model_type)
 
     _MODEL_SAVE_HELPER_REGISTRY = {
         SupportedModel.OPENVLA_OFT: openvla_oft_save_helper,
         SupportedModel.DREAMZERO: dreamzero_save_helper,
+        SupportedModel.FASTWAM: fastwam_save_helper,
     }
 
     if model_type in _MODEL_SAVE_HELPER_REGISTRY:
