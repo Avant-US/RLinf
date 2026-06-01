@@ -1017,11 +1017,14 @@ bash examples/sft/run_fastwam_sft.sh libero_sft_fastwam \
 或者用一句话启动
 ```bash
 # 启动ray集群
-# export CUDA_VISIBLE_DEVICES=4,5,6,7 && source /mnt/localssd/rlinf_venv/bin/activate && ray start --head --num-gpus=4 --port=6399 2>&1 | tail -5
+# export CUDA_VISIBLE_DEVICES=4,5,6,7 && source /mnt/localssd/rlinf_venv/bin/activate && ray start --verbose --disable-usage-stats --head --port=6399 --num-gpus=4 2>&1 | tail -5
+export CUDA_VISIBLE_DEVICES=4,5,6,7 && source /mnt/r/VENV/rlinf_venv/bin/activate && ray start --verbose --disable-usage-stats --head --port=6399 --num-gpus=4
 
 # export CUDA_VISIBLE_DEVICES=4,5,6,7 && source /mnt/localssd/rlinf_venv/bin/activate && export FASTWAM_ROOT=/home/luogang/S/Rb/FastWAM && export FASTWAM_PATH=${FASTWAM_ROOT}/src && export DIFFSYNTH_MODEL_BASE_PATH=/mnt/localssd/share/fastwam_checkpoints && export CUDA_HOME=/usr/local/cuda-12.8 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export RAY_ADDRESS=127.0.0.1:6399 && bash examples/sft/run_fastwam_sft.sh libero_sft_fastwam runner.max_steps=50 runner.save_interval=20 runner.log_interval=5 actor.micro_batch_size=1 actor.global_batch_size=4 2>&1 | tail -20
 
-source /mnt/localssd/rlinf_venv/bin/activate && export RLinf_LOG_LEVEL="DEBUG" && export FASTWAM_ROOT=/home/luogang/S/Rb/FastWAM && export FASTWAM_PATH=${FASTWAM_ROOT}/src && export DIFFSYNTH_MODEL_BASE_PATH=/mnt/localssd/share/fastwam_checkpoints && export CUDA_HOME=/usr/local/cuda-12.8 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export RAY_ADDRESS=127.0.0.1:6399 && bash examples/sft/run_fastwam_sft.sh libero_sft_fastwam runner.max_steps=50 runner.save_interval=20 runner.log_interval=5 actor.micro_batch_size=1 actor.global_batch_size=8 hydra.verbose=true 2>&1 | tail -20
+
+
+export CUDA_VISIBLE_DEVICES=4,5,6,7 && source /mnt/r/VENV/rlinf_venv/bin/activate && export HYDRA_FULL_ERROR=1 && export RLinf_LOG_LEVEL="DEBUG" && export FASTWAM_ROOT=/home/Luogang/SRC/Robot/FastWAM && export FASTWAM_PATH=${FASTWAM_ROOT}/src && export DIFFSYNTH_MODEL_BASE_PATH=/mnt/r/CKPT/VLA/FW && export DIFFSYNTH_SKIP_DOWNLOAD="true" && export CUDA_HOME=/usr/local/cuda-12.8 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export RAY_ADDRESS=127.0.0.1:6399 && bash examples/sft/run_fastwam_sft.sh libero_sft_fastwam runner.max_steps=50 runner.save_interval=20 runner.log_interval=5 actor.micro_batch_size=1 actor.global_batch_size=4 hydra.verbose=true 2>&1 | tail -20
 ```
 
 #### 9.2.3 启动训练（正式训练：5 万步）

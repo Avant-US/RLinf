@@ -13,7 +13,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: all
+    actor: 4-7
 
 runner:
   task_type: sft
@@ -106,8 +106,8 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "no_shard"
-    use_orig_params: false
+    sharding_strategy: "no_shard" #@# 暂时只能 fsdp1+no_shard+use_orig_params, 否则由于FastWAM的模型代码与FSDP的不兼容而报错
+    use_orig_params: true
     gradient_checkpointing: true
     gradient_checkpointing_use_reentrant: true
     limit_all_gathers: false

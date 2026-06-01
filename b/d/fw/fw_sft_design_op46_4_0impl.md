@@ -648,7 +648,28 @@ print('ActionDiT 骨干权重生成成功')
 ```
 
 #### 7.2.2 前置：预计算 T5 文本嵌入缓存
+下载数据
+```bash
+export FASTWAM_ROOT=/home/Luogang/SRC/Robot/FastWAM
+cd "$FASTWAM_ROOT"
 
+mkdir -p data/libero_mujoco3.3.2
+cd data/libero_mujoco3.3.2
+
+# 方式 1：只下 spatial（够跑 libero_sft_fastwam）
+hf download --repo-type dataset yuanty/LIBERO-fastwam libero_spatial_no_noops_lerobot.tar.gz --local-dir .
+
+# 方式 2：下全部 4 个（与 README 一致）
+hf download --repo-type dataset yuanty/LIBERO-fastwam --local-dir .
+
+# 解压
+for f in *.tar.gz; do tar -xzf "$f"; done
+
+# 检查
+ls libero_spatial_no_noops_lerobot/
+# 期望：parquet、videos 等 LeRobot 目录内容
+```
+执行T5 embedding命令
 ```bash
 cd ${FASTWAM_ROOT}
 
@@ -1578,6 +1599,7 @@ export PYTHONPATH=${FASTWAM_PATH}:$PYTHONPATH
    ```bash
    rm -rf /home/luogang/S/Rb/FastWAM/checkpoints
    ln -sfn /mnt/r/share/fastwam_checkpoints /home/luogang/S/Rb/FastWAM/checkpoints
+   ln -sfn /mnt/r/CKPT/VLA/FW/ /home/Luogang/SRC/Robot/FastWAM/checkpoints
    ```
 3. 设置 `DIFFSYNTH_MODEL_BASE_PATH=/mnt/r/share/fastwam_checkpoints`
 4. 重新运行，模型下载到 r（4.6TB 可用），成功生成 2.0GB ActionDiT 骨干
