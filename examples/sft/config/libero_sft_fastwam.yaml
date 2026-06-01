@@ -105,8 +105,9 @@ actor:
     total_training_steps: 50000
 
   fsdp_config:
-    strategy: "fsdp2"
-    use_orig_params: true
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: false
     gradient_checkpointing: true
     gradient_checkpointing_use_reentrant: true
     limit_all_gathers: false
