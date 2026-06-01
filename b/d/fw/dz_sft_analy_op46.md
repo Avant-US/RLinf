@@ -1678,6 +1678,303 @@ train_vla_sft.py::main()
 
 ---
 
+---
+
+## 附录 C：DreamZero 自定义 Mask 机制深度分析
+
+> **核心结论**：DreamZero 在 SFT 训练的 forward 过程中**不使用显式的 mask 张量**。它通过**选择性 K/V 拼接**（selective K/V concatenation）实现等效的注意力掩码——每个 query token 只能"看到"被拼接到其 K/V context 中的 token。显式的 `BlockMask` 对象仅在推理（inference）路径中使用。
+
+### C.1 训练 vs 推理：两种完全不同的掩码策略
+
+| 维度 | SFT 训练 (`is_tf=True`) | 推理（`kv_cache is not None`） |
+|------|-------------------------|-------------------------------|
+| **掩码实现** | 隐式：选择性 K/V 拼接 | 显式：`BlockMask` 张量 |
+| **入口方法** | `CausalWanModel._forward_train()` | `CausalWanModel._forward_inference()` |
+| **注意力函数** | `self.attn(q, k_context, v_context)` | `flex_attention(q, k, v, block_mask=mask)` |
+| **mask 对象** | 无 | `BlockMask` from `torch.nn.attention.flex_attention` |
+| **代码文件** | `wan_video_dit_action_casual_chunk.py:786-976` | `wan_video_dit_action_casual_chunk.py:1434-1594` |
+
+### C.2 训练路径：隐式 Mask 的实现方式
+
+在 SFT 训练中，`CausalWanSelfAttention.forward()`（`wan_video_dit_action_casual_chunk.py:786`）将 token 序列拆分为四类，然后对每类分别调用不同的处理方法。每个方法通过**手工构建 K/V context**来控制"谁能看谁"：
+
+```
+序列结构: [clean_image tokens] [noisy_image tokens] [noisy_action tokens] [noisy_state tokens]
+```
+
+#### 拆分逻辑（`forward()` lines 905-922）：
+
+```python
+# 代码来自 dreamzero/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
+
+# Clean 部分（教师信号，无噪声）
+clean_image_q = roped_query[:, :clean_image_seq_len]
+clean_image_k = roped_key[:, :clean_image_seq_len]
+clean_image_v = v[:, :clean_image_seq_len]
+
+# Noisy 部分（加噪后的预测目标）
+noisy_image_q = roped_query[:, half_seq_len:half_seq_len + noisy_image_seq_len]
+noisy_action_q = roped_query[:, half_seq_len + noisy_image_seq_len:... + action_horizon]
+noisy_state_q  = roped_query[:, half_seq_len + noisy_image_seq_len + action_horizon:]
+# ... k, v 同理
+```
+
+#### 四个处理方法的调用（lines 924-953）：
+
+```python
+# ========== 处理 CLEAN 图像 tokens ==========
+clean_image_outputs = self._process_clean_image_only(
+    clean_image_q, clean_image_k, clean_image_v, clean_frames)
+
+# ========== 处理 NOISY 图像 tokens ==========
+noisy_image_outputs = self._process_noisy_image_blocks(
+    noisy_image_q, noisy_image_k, noisy_image_v,
+    clean_image_k, clean_image_v,                          # ← clean 作为 context
+    noisy_action_k, noisy_action_v, noisy_state_k, noisy_state_v,
+    noisy_frames, action_horizon, state_horizon)
+
+# ========== 处理 NOISY 动作 tokens ==========
+noisy_action_outputs = self._process_noisy_action_blocks(
+    noisy_action_q, noisy_action_k, noisy_action_v,
+    clean_image_k, clean_image_v,                          # ← clean 作为 context
+    noisy_image_k, noisy_image_v,                          # ← noisy image 作为 context
+    noisy_state_k, noisy_state_v,
+    noisy_frames, action_horizon, state_horizon)
+
+# ========== 处理 NOISY 状态 tokens ==========
+noisy_state_outputs = self._process_state_blocks(
+    noisy_state_q, noisy_state_k, noisy_state_v, state_horizon)
+
+# 拼接输出
+x = torch.cat([clean_image_outputs, noisy_image_outputs,
+               noisy_action_outputs, noisy_state_outputs], dim=1)
+```
+
+### C.3 四个处理方法的 K/V Context 构建（核心"隐式 Mask"）
+
+#### C.3.1 `_process_clean_image_only()`（line 555）
+
+**注意力规则**：clean 图像 block $i$ 可以看到首帧 + blocks $[0, i]$（因果注意力）。
+
+```python
+# dreamzero/.../wan_video_dit_action_casual_chunk.py:555-624
+
+# 首帧：只做自注意力
+output[:, :self.frame_seqlen] = self.attn(
+    clean_image_q[:, :self.frame_seqlen],
+    clean_image_k[:, :self.frame_seqlen],    # K = 仅自己
+    clean_image_v[:, :self.frame_seqlen])     # V = 仅自己
+
+# 后续 blocks：因果注意力（可看首帧 + 所有之前的 blocks + 自己）
+if self.local_attn_size == -1:
+    # 优化路径：单次 causal attention 调用
+    output[:, self.frame_seqlen:] = self.causal_attn(
+        blocks_q, blocks_k, blocks_v)        # causal_attn 内部有因果掩码
+else:
+    # 滑窗路径：逐 block 拼接 context
+    k_context = torch.cat([
+        clean_image_k[:, :self.frame_seqlen],               # 首帧
+        clean_image_k[:, image_kv_start:block_end]           # 局部窗口内的 blocks
+    ], dim=1)
+```
+
+> **隐式 Mask 体现**：`k_context` 只包含首帧和窗口内 blocks 的 K/V，block $i$ 无法看到后续 blocks 的信息。
+
+#### C.3.2 `_process_noisy_image_blocks()`（line 661）
+
+**注意力规则**：noisy 图像 block $i$ 可以看到：clean 首帧 + clean blocks $[0, i)$ + 自己的 noisy block + 对应的 noisy action block $i$ + 对应的 noisy state block $i$。
+
+```python
+# dreamzero/.../wan_video_dit_action_casual_chunk.py:709-723
+
+# 核心：手工拼接 K/V context（这就是"隐式 mask"）
+k_context = torch.cat([
+    clean_image_k[:, :clean_end],                    # clean 首帧 + clean blocks [0, i)
+    noisy_image_k[:, noisy_start:noisy_end],         # 当前 noisy image block i
+    noisy_action_k[:, action_start:action_end],      # 对应的 noisy action block i
+    noisy_state_k[:, state_start:state_end]           # 对应的 noisy state block i
+], dim=1)
+v_context = torch.cat([
+    clean_image_v[:, :clean_end],
+    noisy_image_v[:, noisy_start:noisy_end],
+    noisy_action_v[:, action_start:action_end],
+    noisy_state_v[:, state_start:state_end]
+], dim=1)
+
+output[:, noisy_start:noisy_end] = self.attn(q_block, k_context, v_context)
+```
+
+> **隐式 Mask 体现**：noisy image block $i$ 的 K/V context 不包含 block $i+1, i+2, ...$ 的任何信息——因果性通过 `clean_end = frame_seqlen + i * block_size` 控制。
+
+#### C.3.3 `_process_noisy_action_blocks()`（line 727）
+
+**注意力规则**：noisy action block $i$ 可以看到：clean 首帧 + clean blocks $[0, i)$ + noisy image block $i$ + 自己的 noisy action block $i$ + 对应的 noisy state block $i$。
+
+```python
+# dreamzero/.../wan_video_dit_action_casual_chunk.py:768-782
+
+k_context = torch.cat([
+    clean_image_k[:, :clean_end],                    # clean 首帧 + clean blocks [0, i)
+    noisy_image_k[:, noisy_img_start:noisy_img_end], # 当前 noisy image block i
+    noisy_action_k[:, action_start:action_end],      # 当前 noisy action block i（自己）
+    noisy_state_k[:, state_start:state_end]           # 当前 noisy state block i
+], dim=1)
+# ... v_context 同理
+output[:, action_start:action_end] = self.attn(q_block, k_context, v_context)
+```
+
+> **隐式 Mask 体现**：action block $i$ 看不到 action block $j \neq i$ 的信息——每个 action block 只与自己对应的 image/state block 交互。
+
+#### C.3.4 `_process_state_blocks()`（line 626）
+
+**注意力规则**：state block $i$ 只做自注意力（不看 image 和 action）。
+
+```python
+# dreamzero/.../wan_video_dit_action_casual_chunk.py:649-657
+
+for block_idx in range(num_blocks):
+    state_block_start = block_idx * self.num_state_per_block
+    state_block_end = state_block_start + self.num_state_per_block
+    output[:, state_block_start:state_block_end] = self.attn(
+        state_q[:, state_block_start:state_block_end],
+        state_k[:, state_block_start:state_block_end],   # K = 仅自己
+        state_v[:, state_block_start:state_block_end])    # V = 仅自己
+```
+
+> **隐式 Mask 体现**：K/V 只包含当前 state block 自身的 token——完全的 block-diagonal 自注意力。
+
+### C.4 训练中的注意力模式可视化
+
+将上述四种方法的 K/V 拼接规则合并，得到训练时的等效注意力矩阵：
+
+```
+Token 布局: [clean_img₀][clean_img₁...ₙ] [noisy_img₀][noisy_img₁...ₙ] [noisy_act₀...ₙ] [noisy_state₀...ₙ]
+
+Q ↓ / K →    clean_img₀  clean_img_i  noisy_img_i  noisy_act_i  noisy_state_i  其他block
+─────────────────────────────────────────────────────────────────────────────────────
+clean_img₀      ✓           ✗            ✗            ✗              ✗            ✗
+clean_img_i     ✓        causal(0..i)    ✗            ✗              ✗            ✗
+noisy_img_i     ✓        clean(0..i-1)   ✓(自己)      ✓(block_i)     ✓(block_i)   ✗
+noisy_act_i     ✓        clean(0..i-1)   ✓(block_i)   ✓(自己)        ✓(block_i)   ✗
+noisy_state_i   ✗           ✗            ✗            ✗              ✓(自己)       ✗
+```
+
+### C.5 推理路径：显式 BlockMask
+
+**仅在推理（`_forward_inference`）中使用**。位于 `_prepare_blockwise_causal_attn_mask()`（line 1434）。
+
+```python
+# dreamzero/.../wan_video_dit_action_casual_chunk.py:1434-1564
+
+from torch.nn.attention.flex_attention import create_block_mask, BlockMask
+
+@staticmethod
+def _prepare_blockwise_causal_attn_mask(
+    device, num_frames=21, frame_seqlen=1560, num_frame_per_block=1,
+    local_attn_size=-1, action_horizon=1, state_horizon=1,
+    num_action_per_block=30, num_state_per_block=1
+) -> BlockMask:
+    """
+    Token 布局: [first_image] [image_blocks] [action_blocks] [state_blocks]
+    """
+    # ... 计算各段的 start/end 位置 (lines 1454-1487) ...
+
+    # 预计算每个 token 的 block index (lines 1490-1514)
+    block_indices = torch.zeros(total_padded_length, device=device, dtype=torch.long)
+    block_indices[first_image_start:first_image_end] = -1  # 首帧特殊标记
+
+    # 定义注意力函数闭包 (lines 1516-1557)
+    def attention_mask(b, h, q_idx, kv_idx):
+        q_block = block_indices[q_idx]
+        kv_block = block_indices[kv_idx]
+        # ... 规则：image block i 能看 block ≤ i 的 image + 对应 action/state ...
+        return allowed
+
+    # 创建 BlockMask (lines 1559-1564)
+    block_mask = create_block_mask(
+        attention_mask,
+        B=None, H=None,
+        Q_LEN=total_padded_length, KV_LEN=total_padded_length,
+        _compile=False, device=device
+    )
+    return block_mask
+```
+
+> **该方法 `_prepare_blockwise_causal_attn_mask` 不在 SFT forward 调用链中**。它仅被 `_forward_inference()` 路径调用，`_forward_train()` 路径不调用它。
+
+### C.6 Forward 调用链中 mask 的流转
+
+```mermaid
+flowchart TB
+    subgraph SFT ["SFT 训练路径（mask 的位置）"]
+        A["DreamZeroPolicy.sft_forward(data)"]
+        B["VLA.forward(data)"]
+        C["WANPolicyHead.forward(backbone_out, action_in)"]
+        D["CausalWanModel._forward_train(x, ...)"]
+        E["CausalWanSelfAttention.forward(x, ..., is_tf=True)"]
+        F1["_process_clean_image_only()\n隐式mask: causal K/V concat"]
+        F2["_process_noisy_image_blocks()\n隐式mask: selective K/V concat"]
+        F3["_process_noisy_action_blocks()\n隐式mask: selective K/V concat"]
+        F4["_process_state_blocks()\n隐式mask: block-diagonal self-attn"]
+        G["concat → 输出"]
+        A --> B --> C --> D --> E
+        E --> F1 & F2 & F3 & F4
+        F1 & F2 & F3 & F4 --> G
+    end
+    
+    subgraph Infer ["推理路径（显式 mask）"]
+        H["_forward_inference()"]
+        I["_prepare_blockwise_causal_attn_mask()\n→ BlockMask"]
+        J["flex_attention(q, k, v, block_mask=mask)"]
+        H --> I --> J
+    end
+    
+    style F1 fill:#1a3d1a,color:#fff
+    style F2 fill:#1a3d1a,color:#fff
+    style F3 fill:#1a3d1a,color:#fff
+    style F4 fill:#1a3d1a,color:#fff
+    style I fill:#4a3000,color:#fff
+```
+
+### C.7 RLinf Patch 对 Mask 的影响
+
+RLinf 在 `rlinf/models/embodiment/dreamzero/patch/wan_causal_model_forward_train.py` 中 patch 了 `CausalWanModel._forward_train()`，但**不涉及 mask 逻辑**。Patch 仅修改了梯度检查点的 `use_reentrant` 参数：
+
+```python
+# rlinf/.../patch/wan_causal_model_forward_train.py (line ~147)
+# 原版（DreamZero）：
+x = torch.utils.checkpoint.checkpoint(
+    create_custom_forward(block), x, **kwargs,
+    use_reentrant=False)    # 支持 kwargs
+
+# RLinf patch 版：
+x, _ = torch.utils.checkpoint.checkpoint(
+    block, x, e0, freqs, ...,
+    use_reentrant=True)     # 仅支持位置参数，解决 FSDP2 兼容性问题
+```
+
+**注意力模式完全不变**——四个 `_process_*` 方法的 K/V 拼接逻辑未被 patch 修改。
+
+### C.8 为什么训练时用隐式 mask 而非显式 mask？
+
+1. **性能**：显式 `BlockMask` 需要 `flex_attention`（PyTorch 2.5+），而 `self.attn()` 直接调用 Flash Attention 2/3，延迟更低
+2. **内存**：显式 mask 需要存储 $O(N^2)$ 的 bool 张量（或其 block 压缩版），而隐式拼接仅需存储拼接后的 K/V（通常远小于 $N^2$）
+3. **灵活性**：teacher forcing 的 clean/noisy 拆分在每层都不同（clean 帧数可变），动态构建 K/V context 比预计算静态 mask 更灵活
+4. **梯度检查点兼容性**：`BlockMask` 对象不易与 `torch.utils.checkpoint.checkpoint(use_reentrant=True)` 搭配，而 tensor slicing/cat 天然兼容
+
+### C.9 总结
+
+| 问题 | 答案 |
+|------|------|
+| DreamZero 在哪里创建自定义 mask？ | **训练时不创建显式 mask**。推理时在 `_prepare_blockwise_causal_attn_mask()`（line 1434）创建 `BlockMask` |
+| 自定义 mask 在 SFT forward 调用链中吗？ | **不在**。SFT forward 调用 `_forward_train()` → `CausalWanSelfAttention.forward(is_tf=True)` → 四个 `_process_*` 方法，全部使用隐式 K/V 拼接 |
+| 隐式 mask 的实现在哪？ | `CausalWanSelfAttention` 的四个方法：`_process_clean_image_only`(line 555)、`_process_noisy_image_blocks`(line 661)、`_process_noisy_action_blocks`(line 727)、`_process_state_blocks`(line 626) |
+| RLinf 的 patch 是否修改了 mask？ | **否**。RLinf patch 仅修改 `_forward_train` 中的 `use_reentrant` 参数，不涉及注意力逻辑 |
+
+> **所有代码引用均基于 `d:\SRC\Robot\dreamzero\groot\vla\model\dreamzero\modules\wan_video_dit_action_casual_chunk.py`，行号已与本地代码校验一致。**
+
+---
+
 > **文档结束**  
 > 本文档基于 RLinf 代码库的深入分析，覆盖了 DreamZero SFT 训练的完整技术栈。  
 > 如有疑问或需要更新，请参考附录 B 中列出的源代码文件。
