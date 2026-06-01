@@ -29,7 +29,7 @@
 
 Phase 0 的目标是搭建 FastWAM 整合所需的**安装与环境基础设施**。完成后：
 
-- RLinf 与 FastWAM 共存于同一个 uv 虚拟环境 `rlinf_venv`（位于 `/mnt/localssd/`）
+- RLinf 与 FastWAM 共存于同一个 uv 虚拟环境 `rlinf_venv`（位于 `/mnt/r/`）
 - 两个项目均以**开发模式（可编辑模式）**安装，源码修改即时生效
 - RLinf 的安装脚本支持 `--model fastwam`
 - 两个项目各自的短训练 demo 可正常运行
@@ -39,7 +39,7 @@ Phase 0 的目标是搭建 FastWAM 整合所需的**安装与环境基础设施*
 | 约束 | 值 |
 |------|-----|
 | 虚拟环境名称 | `rlinf_venv` |
-| 虚拟环境路径 | `/mnt/localssd/rlinf_venv` |
+| 虚拟环境路径 | `/mnt/r/rlinf_venv` |
 | 环境管理工具 | uv |
 | 安装模式 | 开发模式（`uv pip install -e .`） |
 | RLinf 源码 | `/home/luogang/S/RL/RLinf` |
@@ -86,7 +86,7 @@ RLinf 和 FastWAM 的 `pyproject.toml` 存在版本冲突，安装到同一环�
 | GPU | 1× NVIDIA GPU (16GB+) | 8× H100/A100 |
 | GPU 显存 | 16GB（单卡 demo） | 80GB（全量训练） |
 | 系统内存 | 32GB | 128GB+ |
-| 磁盘 `/mnt/localssd/` | 10GB 可用 | 50GB+（含数据集） |
+| 磁盘 `/mnt/r/` | 10GB 可用 | 50GB+（含数据集） |
 
 ### 2.2 软件要求
 
@@ -101,7 +101,7 @@ RLinf 和 FastWAM 的 `pyproject.toml` 存在版本冲突，安装到同一环�
 
 ```bash
 # 虚拟环境
-export VENV_DIR="/mnt/localssd/rlinf_venv"
+export VENV_DIR="/mnt/r/rlinf_venv"
 
 # 项目路径
 export RLINF_PATH="/home/luogang/S/RL/RLinf"
@@ -118,16 +118,16 @@ export DIFFSYNTH_MODEL_BASE_PATH="${FASTWAM_ROOT}/checkpoints"
 
 ### 3.1 目标
 
-创建 `/mnt/localssd/rlinf_venv`，安装 PyTorch 和 RLinf（开发模式 + embodied 依赖）。
+创建 `/mnt/r/rlinf_venv`，安装 PyTorch 和 RLinf（开发模式 + embodied 依赖）。
 
 ### 3.2 操作流程
 
 ```bash
 # ── 1. 创建 uv 虚拟环境 ──
-uv venv /mnt/localssd/rlinf_venv --python 3.10
+uv venv /mnt/r/rlinf_venv --python 3.10
 
 # ── 2. 激活 ──
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 
 # ── 3. 安装 PyTorch 2.7.1+cu128（统一版本，满足 FastWAM 强需求）──
 uv pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 \
@@ -151,7 +151,7 @@ uv pip install -e ${RLINF_PATH} --no-deps
 ### 3.3 安装验证
 
 ```bash
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 
 # 验证 torch 版本
 python -c "import torch; print(f'torch={torch.__version__}, CUDA={torch.cuda.is_available()}')"
@@ -171,7 +171,7 @@ print('RLinf 核心模块 import 成功')
 
 | # | 检查项 | 通过标准 |
 |---|--------|----------|
-| A1 | 虚拟环境创建 | `/mnt/localssd/rlinf_venv/bin/activate` 存在 |
+| A1 | 虚拟环境创建 | `/mnt/r/rlinf_venv/bin/activate` 存在 |
 | A2 | torch 版本 | `torch.__version__` == `2.7.1+cu128` |
 | A3 | CUDA 可用 | `torch.cuda.is_available()` == True |
 | A4 | RLinf import | `from rlinf.config import SupportedModel` 无异常 |
@@ -188,7 +188,7 @@ print('RLinf 核心模块 import 成功')
 ### 4.2 操作流程
 
 ```bash
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 
 # ── 1. 安装 FastWAM 特有依赖（不在 RLinf 中的部分）──
 uv pip install \
@@ -214,7 +214,7 @@ uv pip install -e ${FASTWAM_ROOT} --no-deps
 ### 4.3 安装验证
 
 ```bash
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 
 # 验证 FastWAM 核心模块
 python -c "
@@ -625,7 +625,7 @@ print("\n=== FastWAM CPU 冒烟测试全部通过 ===")
 #### 7.2.1 前置：预生成 ActionDiT 骨干权重
 
 ```bash
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 cd ${FASTWAM_ROOT}
 mkdir -p checkpoints
 
@@ -665,7 +665,7 @@ ls -la data/text_embeds_cache/libero/
 
 ```bash
 cd ${FASTWAM_ROOT}
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 
 # 首次运行需设 pretrained_norm_stats=null
 bash scripts/train_zero1.sh 1 \
@@ -690,7 +690,7 @@ bash scripts/train_zero1.sh 1 \
 由于 Phase 0 尚未实现 FastWAM 的 config 注册和 Policy 类（这些是 Phase 1 的内容），RLinf 的 SFT 训练管线暂时无法端到端运行 FastWAM。此处验证 RLinf 的 **SFT Worker 基础设施可加载**：
 
 ```bash
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 cd ${RLINF_PATH}
 
 # 验证 SFT 训练入口可加载
@@ -775,7 +775,7 @@ flowchart TB
 
 | 步骤 | # | 检查项 | 命令 | 通过标准 | 优先级 |
 |------|---|--------|------|----------|--------|
-| 0.1 | A1 | venv 创建 | `test -f /mnt/localssd/rlinf_venv/bin/activate` | 文件存在 | P0 |
+| 0.1 | A1 | venv 创建 | `test -f /mnt/r/rlinf_venv/bin/activate` | 文件存在 | P0 |
 | 0.1 | A2 | torch 版本 | `python -c "import torch; print(torch.__version__)"` | `2.7.1+cu128` | P0 |
 | 0.1 | A3 | CUDA 可用 | `python -c "import torch; print(torch.cuda.is_available())"` | `True` | P0 |
 | 0.1 | A4 | RLinf import | `python -c "from rlinf.config import SupportedModel"` | 无异常 | P0 |
@@ -819,7 +819,7 @@ flowchart TB
 | **模型下载失败** | 网络超时 | `export HF_ENDPOINT=https://hf-mirror.com`（国内镜像） |
 | **LIBERO 数据缺失** | `FileNotFoundError` | 跳过 E1-E3（P1 优先级），只运行 CPU 冒烟测试 |
 | **torchcodec 冲突** | import 报版本不匹配 | 安装 `torchcodec==0.5`（FastWAM 需求，向后兼容） |
-| **`/mnt/localssd/` 不存在** | `mkdir` 失败 | `sudo mkdir -p /mnt/localssd && sudo chown $(whoami) /mnt/localssd` |
+| **`/mnt/r/` 不存在** | `mkdir` 失败 | `sudo mkdir -p /mnt/r && sudo chown $(whoami) /mnt/r` |
 
 ### 9.2 依赖版本对照
 
@@ -875,7 +875,7 @@ flowchart TB
 #!/usr/bin/env bash
 set -euo pipefail
 
-VENV_DIR="${VENV_DIR:-/mnt/localssd/rlinf_venv}"
+VENV_DIR="${VENV_DIR:-/mnt/r/rlinf_venv}"
 RLINF_PATH="${RLINF_PATH:-/home/luogang/S/RL/RLinf}"
 FASTWAM_ROOT="${FASTWAM_ROOT:-/home/luogang/S/Rb/FastWAM}"
 FASTWAM_PATH="${FASTWAM_ROOT}/src"
@@ -954,7 +954,7 @@ exit ${FAIL}
 
 ---
 
-*本文档为 RLinf 整合 FastWAM SFT 的 Phase 0 基础设施完整实施与验收方案。RLinf 和 FastWAM 共享同一个位于 `/mnt/localssd/rlinf_venv` 的 uv 虚拟环境，均以开发模式安装。*
+*本文档为 RLinf 整合 FastWAM SFT 的 Phase 0 基础设施完整实施与验收方案。RLinf 和 FastWAM 共享同一个位于 `/mnt/r/rlinf_venv` 的 uv 虚拟环境，均以开发模式安装。*
 
 ---
 
@@ -973,10 +973,10 @@ exit ${FAIL}
 
 **错误**：
 ```
-error: Failed to initialize cache at `/mnt/localssd/uv_cache`: Permission denied (os error 13)
+error: Failed to initialize cache at `/mnt/r/.cache`: Permission denied (os error 13)
 ```
 
-**原因**：`/mnt/localssd/uv_cache` 目录由其他用户创建，当前用户无写权限。
+**原因**：`/mnt/r/.cache` 目录由其他用户创建，当前用户无写权限。
 
 **修复**：所有 uv 命令前加 `UV_CACHE_DIR=/tmp/uv_cache_luogang`。
 
@@ -1074,7 +1074,7 @@ RuntimeError: The size of tensor a (8) must match the size of tensor b (7) at no
 ### B.3 最终验证结果
 
 ```
-环境:  /mnt/localssd/rlinf_venv
+环境:  /mnt/r/rlinf_venv
 torch: 2.7.1+cu128, CUDA=True
 rlinf: 0.3.0 (editable @ /home/luogang/S/RL/RLinf)
 fastwam: 0.1.0 (editable @ /home/luogang/S/Rb/FastWAM)
@@ -1130,10 +1130,10 @@ batch = {
 export UV_CACHE_DIR=/tmp/uv_cache_$(whoami)
 
 # 1. 创建 venv
-uv venv /mnt/localssd/rlinf_venv --python 3.10
+uv venv /mnt/r/rlinf_venv --python 3.10
 
 # 2. 激活
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 
 # 3. 安装 torch（必须 cd 出 RLinf 目录或用 --index-strategy）
 cd /tmp
@@ -1152,7 +1152,7 @@ uv pip install -e /home/luogang/S/RL/RLinf --no-deps
 **步骤 0.2 修正后的完整安装命令**：
 
 ```bash
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 export UV_CACHE_DIR=/tmp/uv_cache_$(whoami)
 
 # 1. FastWAM 依赖
@@ -1182,13 +1182,13 @@ python -c "import torch; assert '2.7.1' in torch.__version__, torch.__version__;
 
 ### C.1 实施背景
 
-用户已为 `uv_cache` 和 `hf_cache` 目录授权。基于附录 B 的经验教训，使用 B.5 修正后的安装步骤从头执行。
+用户已为 `.cache` 和 `hfhome` 目录授权。基于附录 B 的经验教训，使用 B.5 修正后的安装步骤从头执行。
 
 ### C.2 执行步骤与结果
 
 ```
-1. rm -rf /mnt/localssd/rlinf_venv                     ✓ 清理旧环境
-2. uv venv /mnt/localssd/rlinf_venv --python 3.10      ✓ 创建新 venv（无缓存权限问题）
+1. rm -rf /mnt/r/rlinf_venv                     ✓ 清理旧环境
+2. uv venv /mnt/r/rlinf_venv --python 3.10      ✓ 创建新 venv（无缓存权限问题）
 3. cd /tmp && uv pip install torch==2.7.1+cu128 ...     ✓ torch 安装成功
    --index-strategy unsafe-best-match
 4. uv pip install transformers peft timm ...             ✓ RLinf embodied deps
@@ -1263,7 +1263,7 @@ ModuleNotFoundError: No module named 'boto3'
 ### C.5 最终验证结果
 
 ```
-环境:  /mnt/localssd/rlinf_venv (fresh install)
+环境:  /mnt/r/rlinf_venv (fresh install)
 torch: 2.7.1+cu128, CUDA=True
 torchvision: 0.22.1+cu128
 torchcodec: 0.5
@@ -1320,7 +1320,7 @@ sudo apt-get install -y cuda-toolkit-12-8
 # Cuda compilation tools, release 12.8, V12.8.93
 
 # 5. 安装 flash-attn
-source /mnt/localssd/rlinf_venv/bin/activate
+source /mnt/r/rlinf_venv/bin/activate
 CUDA_HOME=/usr/local/cuda-12.8 uv pip install flash-attn --no-build-isolation
 # flash-attn==2.8.3 安装成功（编译耗时约 9 秒，使用了 uv 缓存的预编译结果）
 ```
@@ -1574,21 +1574,21 @@ export PYTHONPATH=${FASTWAM_PATH}:$PYTHONPATH
 
 **修复**：
 1. 清理失败的下载：`rm -rf checkpoints/Wan-AI checkpoints/DiffSynth-Studio`
-2. 将 checkpoints 目录替换为 localssd 的符号链接：
+2. 将 checkpoints 目录替换为 r 的符号链接：
    ```bash
    rm -rf /home/luogang/S/Rb/FastWAM/checkpoints
-   ln -sfn /mnt/localssd/share/fastwam_checkpoints /home/luogang/S/Rb/FastWAM/checkpoints
+   ln -sfn /mnt/r/share/fastwam_checkpoints /home/luogang/S/Rb/FastWAM/checkpoints
    ```
-3. 设置 `DIFFSYNTH_MODEL_BASE_PATH=/mnt/localssd/share/fastwam_checkpoints`
-4. 重新运行，模型下载到 localssd（4.6TB 可用），成功生成 2.0GB ActionDiT 骨干
+3. 设置 `DIFFSYNTH_MODEL_BASE_PATH=/mnt/r/share/fastwam_checkpoints`
+4. 重新运行，模型下载到 r（4.6TB 可用），成功生成 2.0GB ActionDiT 骨干
 
 #### E2: T5 文本嵌入缓存
 
 使用 `libero_spatial_no_noops_lerobot` 子集（从 HuggingFace `yuanty/LIBERO-fastwam` 下载），成功生成 10 个 prompt 的 T5 缓存。
 
-数据目录也通过符号链接指向 localssd：
+数据目录也通过符号链接指向 r：
 ```bash
-ln -sfn /mnt/localssd/share/fastwam_data/libero_mujoco3.3.2 /home/luogang/S/Rb/FastWAM/data/libero_mujoco3.3.2
+ln -sfn /mnt/r/share/fastwam_data/libero_mujoco3.3.2 /home/luogang/S/Rb/FastWAM/data/libero_mujoco3.3.2
 ```
 
 #### E3: 5 步训练 Demo
@@ -1662,8 +1662,159 @@ ALL PHASE 0 CHECKS: PASS
 **Phase 0 已完全完成。** 所有 P0 和 P1 检查项全部通过。可进入 Phase 1。
 
 存储路径说明：
-- 虚拟环境：`/mnt/localssd/rlinf_venv`
-- 模型权重：`/mnt/localssd/share/fastwam_checkpoints`（通过符号链接 `FastWAM/checkpoints` → localssd）
-- 训练数据：`/mnt/localssd/share/fastwam_data`（通过符号链接 `FastWAM/data/libero_mujoco3.3.2` → localssd）
+- 虚拟环境：`/mnt/r/rlinf_venv`
+- 模型权重：`/mnt/r/share/fastwam_checkpoints`（通过符号链接 `FastWAM/checkpoints` → r）
+- 训练数据：`/mnt/r/share/fastwam_data`（通过符号链接 `FastWAM/data/libero_mujoco3.3.2` → r）
 - T5 缓存：`FastWAM/data/text_embeds_cache/libero/`
-- 训练输出：`/mnt/localssd/share/fastwam_runs/`
+- 训练输出：`/mnt/r/share/fastwam_runs/`
+
+---
+
+## 附录 G：install.sh 安装记录（2026-06-01，`/mnt/r/VENV/rlinf_venv`）
+
+### G.1 目标与命令
+
+在 **新路径** `/mnt/r/VENV/rlinf_venv` 中，用 `requirements/install.sh` 安装 RLinf（可编辑）+ FastWAM 依赖栈，再手动可编辑安装 FastWAM 本体。
+
+```bash
+export UV_CACHE_DIR=/tmp/uv_cache_$(whoami)
+export UV_TORCH_BACKEND=cu128
+export FASTWAM_ROOT=/home/Luogang/SRC/Robot/FastWAM
+export FASTWAM_PATH=${FASTWAM_ROOT}/src
+export CUDA_HOME=/usr/local/cuda-12.8
+
+cd /home/Luogang/SRC/RL/RLinf
+bash requirements/install.sh embodied \
+  --model fastwam \
+  --venv /mnt/r/VENV/rlinf_venv \
+  --python 3.10 \
+  --torch 2.7.1 \
+  --install-rlinf \
+  --no-root
+
+source /mnt/r/VENV/rlinf_venv/bin/activate
+uv pip install -e "${FASTWAM_ROOT}" --no-deps
+uv pip install boto3 numpy==1.26.4 rich wandb pyarrow
+
+cd /tmp
+uv pip install \
+  torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchcodec==0.5 \
+  --index-strategy unsafe-best-match \
+  --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+说明：`--no-root` 跳过 `sys_deps.sh`（需 sudo）；FastWAM 包 **不在** `install_fastwam_model()` 内，必须单独 `uv pip install -e`。
+
+### G.2 遇到的问题与修复
+
+#### 问题 G1：`sys_deps.sh` 需要 sudo
+
+**现象**：首次未加 `--no-root` 时，在 `install_common_embodied_deps` 阶段退出：
+
+```
+This script requires sudo privileges. Please run as a user with sudo access.
+```
+
+**修复**：重跑时加 `--no-root`（系统依赖已满足时可安全跳过）。
+
+**验证**：`install.sh` 完整退出码 0，fast-attn 预编译 wheel 安装成功。
+
+#### 问题 G2：torch 为 `2.7.1+cu126` 而非 `2.7.1+cu128`
+
+**现象**：`install.sh --torch 2.7.1` + `UV_TORCH_BACKEND=cu128` 后，`torch.__version__` 为 `2.7.1+cu126`（PyPI/uv 默认 CUDA 12.6 构建）。
+
+**修复**：在 `/tmp` 目录（避免 RLinf `pyproject.toml` override 干扰）重钉：
+
+```bash
+uv pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchcodec==0.5 \
+  --index-strategy unsafe-best-match \
+  --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+**验证**：`torch.__version__ == 2.7.1+cu128`，`torch.cuda.is_available() == True`。
+
+#### 问题 G3：`install.sh` 不安装 FastWAM 可编辑包
+
+**现象**：仅跑 `install.sh` 时 `import fastwam` 失败。
+
+**修复**：`uv pip install -e ${FASTWAM_ROOT} --no-deps`。
+
+**验证**：
+
+- `__editable__.fastwam-0.1.0.pth` → `/home/Luogang/SRC/Robot/FastWAM/src`
+- `fastwam.__file__` → `.../FastWAM/src/fastwam/__init__.py`
+
+#### 问题 G4：`pip show` 不显示 “Editable project location”
+
+**现象**：`pip show rlinf|fastwam` 无 `Editable` 行（uv 使用 PEP 660 `__editable__.*.pth`）。
+
+**判定**：以源码路径为准即可：
+
+- `rlinf.__file__` → `/home/Luogang/SRC/RL/RLinf/rlinf/__init__.py`
+- `fastwam.__file__` → `/home/Luogang/SRC/Robot/FastWAM/src/fastwam/__init__.py`
+
+#### 问题 G5：验收脚本 `ForwardType` 导入路径
+
+**现象**：`from rlinf.config import ForwardType` 报 `ImportError`。
+
+**修复**：应使用 `from rlinf.models.embodiment.base_policy import ForwardType`。
+
+### G.3 最终验收结果（2026-06-01）
+
+```
+========================================
+INSTALL /mnt/r/VENV/rlinf_venv — FINAL CHECK
+========================================
+
+A1 venv:           PASS  (/mnt/r/VENV/rlinf_venv/bin/activate)
+A2 torch:          PASS  (2.7.1+cu128)
+A3 CUDA:           PASS
+A4 RLinf import:   PASS
+A5 RLinf editable: PASS  (rlinf.__file__ under RLinf repo)
+B1 FastWAM import: PASS
+B2 FastWAM editable: PASS  (fastwam.__file__ under FastWAM/src)
+B3 coexist:        PASS  (SupportedModel.FASTWAM + fastwam in one process)
+B4 flash-attn:     PASS  (2.7.4.post1, prebuilt cu12 torch2.7 wheel)
+C1 fastwam.txt:    PASS
+C3 SUPPORTED_MODELS: PASS
+C4 install_fastwam_model: PASS (count=2)
+
+ALL P0 INSTALL CHECKS: PASS
+========================================
+```
+
+### G.4 环境与路径约定（更新）
+
+| 变量 | 值 |
+|------|-----|
+| `VENV_DIR` | `/mnt/r/VENV/rlinf_venv` |
+| `RLINF_PATH` | `/home/Luogang/SRC/RL/RLinf` |
+| `FASTWAM_ROOT` | `/home/Luogang/SRC/Robot/FastWAM` |
+| `FASTWAM_PATH` | `${FASTWAM_ROOT}/src` |
+
+激活：
+
+```bash
+source /mnt/r/VENV/rlinf_venv/bin/activate
+```
+
+### G.5 install.sh 改良（2026-06-01 后续）
+
+`requirements/install.sh` 已在一站式流程中集成 FastWAM 安装：
+
+- `_install_fastwam_model_finish()`：在 `fastwam.txt` + `flash-attn` 之后调用
+- `install_fastwam_torch_cu128()`：在 `/tmp` 下重钉 `torch` / `torchvision` / `torchcodec` 的 **cu128** 轮子
+- `install_fastwam_editable_package()`：读取 `FASTWAM_ROOT`，或自动探测 `${RLinf_repo}/../../Robot/FastWAM`，执行 `uv pip install -e ... --no-deps`，并向 venv `activate` 写入 `FASTWAM_PATH`
+
+**推荐一条命令**（无需再手动 `uv pip install -e` / 重钉 torch）：
+
+```bash
+export FASTWAM_ROOT=/home/Luogang/SRC/Robot/FastWAM   # 可选，未设置则自动探测
+export UV_TORCH_BACKEND=cu128
+cd /home/Luogang/SRC/RL/RLinf
+bash requirements/install.sh embodied --model fastwam \
+  --venv /mnt/r/VENV/rlinf_venv --python 3.10 --torch 2.7.1 \
+  --install-rlinf --no-root
+```
+
+`fastwam.txt` 已补充 `numpy`、`pyarrow`、`wandb`、`rich`、`gitpython`、`jsonlines` 等（见该文件注释）。

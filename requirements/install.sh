@@ -1305,27 +1305,92 @@ install_dreamzero_model() {
     esac
 }
 
+# Pin torch/torchvision/torchcodec to FastWAM's CUDA 12.8 wheels (outside the RLinf repo so
+# uv does not read pyproject.toml override-dependencies during resolution).
+install_fastwam_torch_cu128() {
+    local torch_base="${TORCH_VERSION:-2.7.1}"
+    local torch_major torch_minor torch_patch tv_minor torchvision_base
+    IFS='.' read -r torch_major torch_minor torch_patch <<< "$torch_base"
+    if [ "$torch_major" != "2" ] || [ -z "$torch_minor" ] || [ -z "$torch_patch" ]; then
+        echo "[install.sh] install_fastwam_torch_cu128: --torch must be 2.Y.Z (got '${torch_base}')." >&2
+        exit 1
+    fi
+    tv_minor=$((torch_minor + 15))
+    torchvision_base="0.${tv_minor}.${torch_patch}"
+
+    local cuda_index="https://download.pytorch.org/whl/cu128"
+    if [ "$USE_MIRRORS" -eq 1 ]; then
+        cuda_index="https://mirrors.nju.edu.cn/pytorch/whl/cu128"
+    fi
+
+    echo "[install.sh] Pinning FastWAM torch stack: torch==${torch_base}+cu128, torchvision==${torchvision_base}+cu128, torchcodec==0.5+cu128"
+    (
+        cd /tmp || exit 1
+        uv pip install \
+            "torch==${torch_base}+cu128" \
+            "torchvision==${torchvision_base}+cu128" \
+            "torchcodec==0.5+cu128" \
+            --index-strategy unsafe-best-match \
+            --extra-index-url "${cuda_index}"
+    )
+}
+
+# Resolve FASTWAM_ROOT (env, or ../../Robot/FastWAM relative to the RLinf repo) and install editable.
+install_fastwam_editable_package() {
+    local fastwam_root="${FASTWAM_ROOT:-}"
+    local rlinf_root
+    rlinf_root="$(dirname "$SCRIPT_DIR")"
+
+    if [ -z "$fastwam_root" ]; then
+        local candidate="${rlinf_root}/../../Robot/FastWAM"
+        if [ -f "${candidate}/pyproject.toml" ]; then
+            fastwam_root="$(realpath "${candidate}")"
+        fi
+    fi
+
+    if [ -z "$fastwam_root" ] || [ ! -f "${fastwam_root}/pyproject.toml" ]; then
+        echo "[install.sh] FASTWAM_ROOT is unset and FastWAM was not found at ${rlinf_root}/../../Robot/FastWAM." >&2
+        echo "[install.sh] Export FASTWAM_ROOT=/path/to/FastWAM and re-run, or: uv pip install -e /path/to/FastWAM --no-deps" >&2
+        return 0
+    fi
+
+    fastwam_root="$(realpath "$fastwam_root")"
+    echo "[install.sh] Installing fastwam editable from ${fastwam_root}"
+    uv pip install -e "${fastwam_root}" --no-deps
+
+    if ! grep -q 'FASTWAM_ROOT=' "$VENV_DIR/bin/activate" 2>/dev/null; then
+        {
+            echo "export FASTWAM_ROOT=\"${fastwam_root}\""
+            echo "export FASTWAM_PATH=\"${fastwam_root}/src\""
+        } >> "$VENV_DIR/bin/activate"
+    fi
+}
+
+_install_fastwam_model_finish() {
+    uv pip install -r "$SCRIPT_DIR/embodied/models/fastwam.txt"
+    install_flash_attn
+    install_fastwam_torch_cu128
+    install_fastwam_editable_package
+}
+
 install_fastwam_model() {
     case "$ENV_NAME" in
         libero)
             create_and_sync_venv
             install_common_embodied_deps
             install_libero_env
-            uv pip install -r $SCRIPT_DIR/embodied/models/fastwam.txt
-            install_flash_attn
+            _install_fastwam_model_finish
             ;;
         robotwin)
             create_and_sync_venv
             install_common_embodied_deps
             install_robotwin_env
-            uv pip install -r $SCRIPT_DIR/embodied/models/fastwam.txt
-            install_flash_attn
+            _install_fastwam_model_finish
             ;;
         "")
             create_and_sync_venv
             install_common_embodied_deps
-            uv pip install -r $SCRIPT_DIR/embodied/models/fastwam.txt
-            install_flash_attn
+            _install_fastwam_model_finish
             ;;
         *)
             echo "Environment '$ENV_NAME' is not supported for FastWAM model." >&2
