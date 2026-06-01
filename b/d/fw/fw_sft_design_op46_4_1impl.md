@@ -2038,3 +2038,178 @@ use_orig_params: true
 | `RLinf/.../fastwam_policy.py` | `_no_split_modules`、`sft_forward` 设备同步 |
 | `RLinf/.../hybrid_engines/fsdp/utils.py` | `get_fsdp_wrap_policy`、`disable` |
 | `RLinf/examples/sft/config/libero_sft_fastwam.yaml` | `fsdp_config` 当前生产配置 |
+
+---
+
+## G.10 E10 专项：FSDP2 DTensor 混合操作 — 代码级根因与稳妥修复方案（2026-05）
+
+本节在 **不修改代码** 的前提下，基于当前仓库快照对 [G.8 E10](#e10-fsdp2-dtensor-混合操作错误) 与 [G.9](#g9-fastwam-motvideoaction-expert-共享fsdp-嵌套包裹与排障总结2026-06-会话) 做统一归纳，给出可落地的修复路线。**与上文 E10 旧段落（噪声/mask 为主因）冲突时，以本节为准。**
+
+### G.10.1 当前代码快照（联调基准）
+
+| 组件 | 路径 | 现状（撰写时） |
+|------|------|----------------|
+| RLinf wrap 标记 | [`fastwam_policy.py`](../../../rlinf/models/embodiment/fastwam/fastwam_policy.py) | `_no_split_modules = ["DiTBlock"]` → FSDP1 走 `transformer_auto_wrap_policy`；FSDP2 走 `apply_fsdp2_to_model` 按类名匹配 **每个** `DiTBlock` |
+| SFT 配置 | [`libero_sft_fastwam.yaml`](../../../examples/sft/config/libero_sft_fastwam.yaml) | `strategy: fsdp`（FSDP1）、`sharding_strategy: no_shard`、`use_orig_params: true`；注释写明暂因 FastWAM 与 FSDP 不兼容 |
+| MoT 实现 | [`FastWAM/.../mot.py`](../../../../Robot/FastWAM/src/fastwam/models/wan22/mot.py) | 仍使用 **`nn.ModuleDict(mixtures)`**（与 G.9 所述 `_ExpertMixtures` **尚未合入本机 FastWAM 树** 时，双路径注册风险仍在） |
+| 训练入口 | [`fastwam.py` `training_loss`](../../../../Robot/FastWAM/src/fastwam/models/wan22/fastwam.py) | `pre_dit` → `self.mot(...)`（约 504 行）→ `post_dit` |
+| DreamZero 先例 | [`dreamzero_policy.py`](../../../rlinf/models/embodiment/dreamzero/dreamzero_policy.py) | `_no_split_modules` 含 **`CausalWanModel`**，注释写明避免 FSDP2 + gradient checkpointing 的 bug |
+
+### G.10.2 错误复述与栈语义
+
+```text
+RuntimeError: aten.add.Tensor: got mixed torch.Tensor and DTensor,
+need to convert all torch.Tensor to DTensor before calling distributed operators!
+```
+
+- **用户可见栈顶**：`fastwam.training_loss` → `self.mot(...)`。
+- **高概率首炸点**（FSDP2 + per-`DiTBlock` wrap）：[`mot.py` 第 63–64 行](../../../../Robot/FastWAM/src/fastwam/models/wan22/mot.py) `_split_modulation`：
+
+```python
+base_mod = block.modulation.to(dtype=t_mod.dtype, device=t_mod.device)
+shift_msa, ..., gate_mlp = (base_mod + t_mod).chunk(6, dim=chunk_dim)  # aten.add
+```
+
+  - `block.modulation`：已被 `fully_shard(DiTBlock)` 的参数 → **DTensor**（FSDP2）或 **分片 FlatParam 视图**（FSDP1 per-block，见 G.9.4，报错形式不同）。
+  - `t_mod`：来自 `video_expert.pre_dit` / `action_expert.pre_dit` 的普通 **Tensor**。
+
+- **后续同类风险点**（同一机制，未必是第一次报错）：
+  - `GateModule.forward`：`x + gate * residual`（[`mot.py` ~110](../../../../Robot/FastWAM/src/fastwam/models/wan22/mot.py)）；
+  - `block.self_attn.q/k/v(attn_input)`：Linear 权重为 DTensor、输入为 Tensor；
+  - `block.gate` / `block.ffn` / `block.cross_attn` 在 `_apply_expert_post_block` 内。
+
+### G.10.3 根因：一条机制，两种后端表现
+
+**核心矛盾**：MoT 为实现 **跨 video/action 的混合注意力**，**不调用** [`DiTBlock.forward`](../../../../Robot/FastWAM/src/fastwam/models/wan22/wan_video_dit.py)，而是在 `MoT.forward` 里按层、按 expert **手工调用** `DiTBlock` 的子模块（`modulation`、`norm1`、`self_attn`、`gate`、`ffn` 等），再在外部 `torch.cat` + `flash_attention` + 切分 post。
+
+标准 Wan 路径在 **`DiTBlock.forward` 内部**完成 `modulation + t_mod` 与 self-attn；FSDP（无论 v1/v2）设计假设是：**通过被 wrap 模块的 `forward` 进入时**，才对该单元参数做 unshard / all-gather，使参与 aten 的为**完整、同类型**张量。
+
+```mermaid
+sequenceDiagram
+    participant TL as training_loss
+    participant Pre as video_expert.pre_dit
+    participant MoT as MoT.forward
+    participant Block as expert.blocks_i
+    participant FSDP as FSDP_wrap
+
+    TL->>Pre: pre_dit
+    Note over Pre: t_mod, tokens 为 Tensor
+    TL->>MoT: mot(...)
+    Note over MoT: 未进入 DiTBlock.forward
+    MoT->>Block: 直接读 modulation / 调 q,k,v
+    Note over Block,FSDP: 参数仍为 DTensor 或分片视图
+    MoT->>MoT: base_mod + t_mod
+    MoT-->>TL: RuntimeError mixed Tensor/DTensor
+```
+
+**与旧 E10 分析的差异**：
+
+| 旧说法 | 修正 |
+|--------|------|
+| 主因是 `randn_like`、scheduler、`attention_mask` 等普通 Tensor | 这些多在 **进入 MoT 之前** 与未分片子图交互；**首要矛盾** 是 MoT 在 **FSDP 上下文外** 访问已分片的 **`block.modulation` 与 Linear 权重** |
+| DreamZero 不受影响因为「不建 mask」 | 更关键：DreamZero 扩散主干在 **`CausalWanModel.forward`** 内闭环，且 RLinf 以 **`CausalWanModel` 为 FSDP unit**，避免父模块拆子模块 + 子模块已分片 |
+| `reshard_after_forward` / `device=cuda` 可根治 | 不改变「未走子模块 forward 即读参数」；**无效或仅缓解 OOM** |
+
+**FSDP1（当前 yaml）与 FSDP2（曾触发 E10）对照**：
+
+| 配置 | 现象 | 机制 |
+|------|------|------|
+| FSDP1 + `no_shard` + `use_orig_params: true` | **当前可跑通短训**（见 G.9.7） | 不按层分片；`modulation` 为完整 Tensor；仍有 ModuleDict 双路径时需避免重复 wrap |
+| FSDP1 + `full_shard` / `shard_grad_op` + `["DiTBlock"]` | `size 0 vs 3072` 等（G.9.4） | 分片视图 + forward 外读 `modulation` |
+| FSDP2 + `["DiTBlock"]` | **E10 DTensor mixed op** | `fully_shard` → DTensor + 同上 forward 外访问 |
+| FSDP2 + `["MoT"]`（拟议） | 预期与 DreamZero 同类修复 | 整段 `MoT.forward` 处于单一 `fully_shard` 上下文，内部读 block 参数时 unshard |
+
+### G.10.4 方案评估（稳定性排序）
+
+| 优先级 | 方案 | 改动面 | 稳定性 | 多卡显存 | 说明 |
+|--------|------|--------|--------|----------|------|
+| **P0 生产兜底** | FSDP1 + `no_shard` + `use_orig_params: true` | 仅 yaml（**已采用**） | 高 | 差（近似 DDP 复制全参） | 与 [`libero_sft_fastwam.yaml`](../../../examples/sft/config/libero_sft_fastwam.yaml) 一致；先保证正确性 |
+| **P1 多卡 FSDP1** | FSDP1 + `full_shard` + **取消 per-`DiTBlock` auto-wrap** | yaml + RLinf policy | 中高 | 好 | 须 `wrap_policy.disable: true` 或 `_no_split_modules: []` 且关闭 transformer wrap；**不能**保留 `["DiTBlock"]` + `full_shard`（G.9.4） |
+| **P2 FSDP2 主修复** | FSDP2 + `_no_split_modules = ["MoT"]` **仅此一项**，勿并列 `"DiTBlock"` | RLinf policy + yaml | 高（对齐 DreamZero） | 中（单次 forward unshard 整个 MoT，峰值高于 per-block） | `strategy: fsdp2`，建议 `use_orig_params: true`、bf16 mixed_precision（对齐 DreamZero 5B/14B） |
+| **P3 架构** | MoT 改为只通过 `DiTBlock` 的 FSDP-safe API（如 `build_attention_io` 进 `forward`） | FastWAM 大改 | 最高（长期） | 可恢复 per-block 分片 | 工作量大；适合要极致省显存且坚持 MoT 算法 |
+| **P4 补丁** | `mot.py` 边界 `tensor.to_local()` / RLinf `to_local_if_dtensor` | FastWAM | 中 | 保持 per-block FSDP2 | 易漏点；checkpoint + `flash_attention` 需回归 |
+| **不推荐** | `ignored_module_classes` 仅 VAE | yaml | 低 | — | **不触及** MoT 内 DiTBlock |
+| **不推荐** | 中间量 `DTensor.from_local` | FastWAM | 低 | — | Placement 脆弱 |
+| **不推荐** | `torch.compile` suppress / `no_grad` 绕过 | — | 低 | — | 不解决分布式算子类型检查 |
+
+**关于 G.9 的 `_ExpertMixtures`**：消除 `ModuleDict` 双路径是 **FSDP 初始化阶段** `AssertionError` 的修复，**不能单独解决** E10 / G.9.4 的 modulation 问题；应与 P1/P2 的 wrap 策略 **一起** 规划。
+
+### G.10.5 推荐落地路径（仅方案，实施时另开 PR）
+
+```mermaid
+flowchart TD
+    start[当前: fsdp + no_shard] --> L0[L0 无FSDP 数值对齐]
+    L0 --> smoke[保持 no_shard 冒烟 backward]
+    smoke --> p1[P1: full_shard 根级单wrap]
+    p1 -->|OOM| gc[gradient_checkpointing / 降batch]
+    p1 --> p2[P2: fsdp2 + MoT wrap]
+    p2 -->|仍失败| p4[P4: mot to_local 补丁]
+    p2 --> done[生产配置冻结]
+```
+
+**阶段 0 — 正确性（无 FSDP）**  
+按 [`fw_sft_design_op46_1_1tstcp.md`](fw_sft_design_op46_1_1tstcp.md) L0：固定 batch，对比原生 FastWAM 与 `FastWAMPolicy.sft_forward` 的 loss / 梯度。
+
+**阶段 1 — 维持现状（yaml）**  
+```yaml
+actor.fsdp_config:
+  strategy: fsdp
+  sharding_strategy: no_shard
+  use_orig_params: true
+```
+
+**阶段 2 — 多卡省显存（FSDP1，仍不改 MoT 算法）**  
+```yaml
+actor.fsdp_config:
+  strategy: fsdp
+  sharding_strategy: full_shard   # 或 shard_grad_op
+  use_orig_params: true
+  wrap_policy:
+    disable: true                 # 或 policy 侧 _no_split_modules: []
+```
+并确认 **不要** 对 60 个 `DiTBlock` 分别 auto-wrap。
+
+**阶段 3 — FSDP2（与 DreamZero 对齐）**  
+1. RLinf：`_no_split_modules = ["MoT"]`（**删除** `"DiTBlock"`）。  
+2. yaml：`strategy: fsdp2`，`use_orig_params: true`，`mixed_precision` bf16，`gradient_checkpointing: true`（与 `mot_checkpoint_mixed_attn` 协同）。  
+3. FastWAM：优先合入 G.9.3 的 `_ExpertMixtures`（若尚未合入），避免 FSDP2 初始化双路径 wrap。  
+4. 验证：`global_batch_size % (micro_batch_size * world_size) == 0`（见 E11）。
+
+**拟议 yaml 片段（FSDP2，供后续 PR 参考）**：
+
+```yaml
+actor.fsdp_config:
+  strategy: fsdp2
+  use_orig_params: true
+  reshard_after_forward: false
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: true
+  mixed_precision:
+    param_dtype: bf16
+    reduce_dtype: bf16
+    buffer_dtype: bf16
+```
+
+### G.10.6 `pre_dit` / `post_dit` 边界说明
+
+`training_loss` 在 MoT **之外** 调用 `video_expert.pre_dit` / `post_dit`（含 `patch_embedding`、`Head` 等）。P2 仅 wrap **`MoT`** 时：
+
+- **MoT 内** `expert.blocks[*]` 路径：随 `MoT.forward` unshard，**解决 E10**。
+- **pre_dit/post_dit**：若其参数也需分片，可二阶段增加 `"WanVideoDiT"` / `"ActionDiT"` 到 `_no_split_modules`（FSDP2）或根级 FSDP1；需注意 **方法调用**（`pre_dit()` 而非 `forward()`）是否仍绕过 unshard——当前可训练主体在 `model.dit`（MoT 子树），**仅 MoT 通常足够**。
+
+### G.10.7 对 G.8 E10 旧「下一步」的修订
+
+| 原方案 | 修订结论 |
+|--------|----------|
+| A 切换 FSDP1 | **保留为 P0/P1**，但须配合 **no_shard 或根级单 wrap**，而非 `DiTBlock` + `full_shard` |
+| B 中间量转 DTensor | 降为 **P4 备选**，优先 **P2 MoT wrap** |
+| C ignored VAE | **辅助**，非 E10 主修复 |
+| D compile suppress | **不推荐** |
+
+**一句话结论**：E10 不是「FastWAM 噪声/mask 不会用 DTensor」，而是 **「MoT 手工 forward + 按 DiTBlock 分片」** 与 FSDP 参数生命周期不兼容；**最稳妥** 的短期组合是 **继续 FSDP1 `no_shard` 保正确性**，中期 **FSDP1 根级 `full_shard`** 或 **FSDP2 + 仅 wrap `MoT`**，长期 **MoT/DiTBlock 架构 FSDP-safe 化** 以恢复按层分片。
+
+### G.10.8 实施后建议更新的文档位点
+
+- 修订上文 [E10](#e10-fsdp2-dtensor-混合操作错误) 根因与推荐顺序，指向本节。  
+- [G.9.8](#g98-未解决问题与后续方向) 第 2 条「FSDP2 + DTensor」在 P2 验证通过后改为「已解决（MoT wrap）」并注明 yaml。  
+- 若合入 `_ExpertMixtures`，同步 G.9.3 与「当前代码快照」表。
