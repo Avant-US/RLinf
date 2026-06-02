@@ -4,7 +4,11 @@ from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 
 
 class FastWAMPolicy(torch.nn.Module, BasePolicy):
-    _no_split_modules = ["DiTBlock"]
+    # MoT reads block.modulation outside DiTBlock.forward(); per-block FSDP
+    # wrapping would expose sharded/empty params. Keep this None so
+    # get_fsdp_wrap_policy returns no auto_wrap_policy (single root FSDP).
+    #@# So change `_no_split_modules = ["DiTBlock"]` into below line
+    _no_split_modules = None
 
     def __init__(self, fastwam_model, config):
         torch.nn.Module.__init__(self)
@@ -36,8 +40,17 @@ class FastWAMPolicy(torch.nn.Module, BasePolicy):
         if mode:
             self.fastwam.eval()
             self.fastwam.requires_grad_(False)
+
             self.fastwam.dit.train()
             self.fastwam.dit.requires_grad_(True)
+            #@# 如果想用 _ExpertMixtures 解决多次引用 video_expert 和 action_expert 作为 nn.Module 的问题(见 FastWAM/ 的 fastwam2.py 和 mot2.py )
+            # 请注释掉上面`self.fastwam.dit`相关代码块, 而使用如下代码块.
+            # MoT stores experts in _ExpertMixtures (not nn.Module), so
+            # dit.train()/requires_grad_() won't propagate to them.
+            # for expert in [self.fastwam.video_expert, self.fastwam.action_expert]:
+            #     expert.train()
+            #     expert.requires_grad_(True)
+
             if self.fastwam.proprio_encoder is not None:
                 self.fastwam.proprio_encoder.train()
                 self.fastwam.proprio_encoder.requires_grad_(True)

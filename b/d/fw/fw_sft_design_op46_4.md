@@ -1067,6 +1067,8 @@ sft-fastwam-libero-test:
 | FastWAM-Joint | `create_fastwam_joint()` | V2 |
 | FastWAM-IDM | `create_fastwam_idm()` | V2 |
 
+**任务扩展（r1_pro 三相机 / 23 维）**：在 LIBERO SFT 闭环之上，配置驱动接入 `r1_pro_chassis_uncond_3cam_384_1e-4` 的完整设计、YAML 模板与验收见 **[`fw_sft_design_op46_4_r1pr_cp25_2.md`](fw_sft_design_op46_4_r1pr_cp25_2.md)**（2026-06 代码复核版，含 FSDP `_no_split_modules=None`、mot2 说明）。历史 [`fw_sft_design_op46_4_r1pr_cp25.md`](fw_sft_design_op46_4_r1pr_cp25.md)、[`fw_sft_design_op46_4_r1pr.md`](fw_sft_design_op46_4_r1pr.md) 仅作参考。
+
 ---
 
 ## 19. 实施路线图

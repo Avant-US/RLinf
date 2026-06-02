@@ -1023,7 +1023,7 @@ export CUDA_VISIBLE_DEVICES=4,5,6,7 && source /mnt/r/VENV/rlinf_venv/bin/activat
 # export CUDA_VISIBLE_DEVICES=4,5,6,7 && source /mnt/localssd/rlinf_venv/bin/activate && export FASTWAM_ROOT=/home/luogang/S/Rb/FastWAM && export FASTWAM_PATH=${FASTWAM_ROOT}/src && export DIFFSYNTH_MODEL_BASE_PATH=/mnt/localssd/share/fastwam_checkpoints && export CUDA_HOME=/usr/local/cuda-12.8 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export RAY_ADDRESS=127.0.0.1:6399 && bash examples/sft/run_fastwam_sft.sh libero_sft_fastwam runner.max_steps=50 runner.save_interval=20 runner.log_interval=5 actor.micro_batch_size=1 actor.global_batch_size=4 2>&1 | tail -20
 
 
-
+ && export CUDA_LAUNCH_BLOCKING=1
 export CUDA_VISIBLE_DEVICES=4,5,6,7 && source /mnt/r/VENV/rlinf_venv/bin/activate && export HYDRA_FULL_ERROR=1 && export RLinf_LOG_LEVEL="DEBUG" && export FASTWAM_ROOT=/home/Luogang/SRC/Robot/FastWAM && export FASTWAM_PATH=${FASTWAM_ROOT}/src && export DIFFSYNTH_MODEL_BASE_PATH=/mnt/r/CKPT/VLA/FW && export DIFFSYNTH_SKIP_DOWNLOAD="true" && export CUDA_HOME=/usr/local/cuda-12.8 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && export RAY_ADDRESS=127.0.0.1:6399 && bash examples/sft/run_fastwam_sft.sh libero_sft_fastwam runner.max_steps=50 runner.save_interval=20 runner.log_interval=5 actor.micro_batch_size=1 actor.global_batch_size=4 hydra.verbose=true 2>&1 | tail -20
 ```
 
@@ -2006,28 +2006,171 @@ use_orig_params: true
 | DCP `mixtures.video` AttributeError | `_ExpertMixtures` 缺属性访问 | `MoT.__getattr__` |
 | 训练曾至 ~49/50 step | — | 说明 init + forward 基本可用；后续失败多属磁盘/Ray 等（见 G.8 E6、E11） |
 
-#### G.9.8 未解决问题与后续方向
+#### G.9.8 未解决问题与后续方向（接手排障手册）
 
-1. **按 DiTBlock 分片 FSDP（省显存）与当前 MoT 不兼容**  
-   需将 `_build_expert_attention_io` 迁入 `DiTBlock` 的 FSDP-safe 接口（例如在 `DiTBlock.forward` 内暴露 `build_attention_io`），或 MoT 仅通过 `FSDP(DiTBlock).forward` 触发 unshard；否则保持 `no_shard` / 根级单 wrap。
+本节面向**后续接手的工程师**：说明哪些问题仍未在架构/框架层闭环、联调中做过哪些尝试、为何未采纳、当前如何跑通训练、下一步应改哪些文件。**FSDP2 / DTensor（E10）的代码级深潜见 [G.10](#g10-e10-专项fsdp2-dtensor-混合操作--代码级根因与稳妥修复方案2026-05)**，本节仅摘要并交叉引用，避免重复粘贴长文。
 
-2. **FSDP2 + DTensor（G.8 问题 E10）**  
-   若将 `strategy` 改为 `fsdp2`，MoT 内普通 Tensor（mask、scheduler 输出等）与 DTensor 参数混合仍可能报错；当前 yaml 使用 FSDP1。
+##### G.9.8.0 未决项一览表
 
-3. **`shard_grad_op` / `full_shard` + per-block wrap**  
-   MoT 未重构前不建议用于 FastWAM SFT。
+| ID | 标题 | 状态 | 是否阻塞 SFT | 当前规避 | 深度阅读 |
+|----|------|------|--------------|----------|----------|
+| OPEN-01 | 按 `DiTBlock` 分片 FSDP + MoT 手工 forward | **OPEN** | 多卡省显存时阻塞（`no_shard` 易 OOM） | `sharding_strategy: no_shard` | [G.9.4](#g94-问题二mot-在-ditblockforward-外读-modulation--按层-fsdp)、[G.10.5 阶段 2](#g105-推荐落地路径仅方案实施时另开-pr) |
+| OPEN-02 | FSDP2 + DTensor（E10） | **MITIGATED** | 仅当 yaml 改回 `fsdp2` 时阻塞 | `strategy: fsdp`（FSDP1） | **[G.10 全文](#g10-e10-专项fsdp2-dtensor-混合操作--代码级根因与稳妥修复方案2026-05)** |
+| OPEN-03 | 运维与环境（Ray/磁盘/权重/GPU 可见性） | **部分 OPEN** | 视环境而定 | 见各子节 | [G.8 E6/E11](#e11-共享-gpu-资源)、本节 OPEN-03 |
+| OPEN-04 | Policy/yaml 与 `_no_split_modules` 语义不一致 | **OPEN**（文档/配置债） | 否（易误导配置） | 人工对照 [G.9.6](#g96-rlinf-侧与当前推荐配置) | 本节 OPEN-04 |
 
-4. **运维与其它（详见 G.8，此处仅索引）**  
-   - Ray `Too many open files`：`ulimit -n` + 重启 raylet（`run_fastwam_sft.sh` / `ray_utils/start_ray.sh`）  
-   - 根分区满、TensorBoard `finish` 失败：将 `log_path` 指到大盘（如 `/mnt/r/`）  
-   - `text_embedding_cache_dir` 不存在：先跑 `precompute_text_embeds.py`  
-   - Wan2.2 权重残缺：`modelscope` 完整下载 3 个 `diffusion_pytorch_model-*.safetensors`  
-   - `CUDA_VISIBLE_DEVICES` vs `HybridComponentPlacement` 物理 GPU 计数（E11）
+##### G.9.8.1 接手 Quick Start
 
-5. **文档 / 代码一致性（建议后续 PR）**  
-   - 将 `FastWAMPolicy._no_split_modules` 改为 `[]`，或  
-   - 在 yaml 显式 `wrap_policy.disable: true`，  
-   与 G.9.6 推荐配置对齐，避免读者误以为「DiTBlock 列表 = 不分片」。
+1. **环境**：`export FASTWAM_ROOT`、`FASTWAM_PATH`、`DIFFSYNTH_MODEL_BASE_PATH`；确认 `actor.model.text_embedding_cache_dir` 目录存在（见 OPEN-03c）。  
+2. **生产 yaml 三件套**（[`libero_sft_fastwam.yaml`](../../../examples/sft/config/libero_sft_fastwam.yaml)）：`strategy: fsdp`、`sharding_strategy: no_shard`、`use_orig_params: true`。  
+3. **step 0 在 `mot.forward` 失败**：先对照下方 OPEN-01 配置矩阵（是否误开 `full_shard` + `["DiTBlock"]`）；若报错含 `DTensor`，查是否误用 `fsdp2`（OPEN-02）。  
+4. **要省显存**：**禁止**直接 `shard_grad_op`/`full_shard` + `_no_split_modules: ["DiTBlock"]`；按 [G.10.5 阶段 2](#g105-推荐落地路径仅方案实施时另开-pr) 或 P2（仅 wrap `MoT`）推进。  
+5. **Ray / 磁盘 / 权重 / world_size**：走 OPEN-03 对应子节，不要与 OPEN-01 混查。
+
+---
+
+##### OPEN-01：按 `DiTBlock` 分片 FSDP 与 MoT 手工 forward
+
+| 字段 | 内容 |
+|------|------|
+| **状态** | OPEN（架构 + FSDP 生命周期未对齐） |
+| **业务动机** | Wan2.2 TI2V-5B 级 `video_expert` + `action_expert` 各 30 层 `DiTBlock`；4–8 卡训练时 `no_shard` 近似每卡持有完整可训参数，显存压力大。期望 `full_shard` / `shard_grad_op` + 按层 auto-wrap 降低单卡 footprint。 |
+| **技术根因** | MoT 为实现 video/action **混合注意力**，在 [`mot.py`](../../../../Robot/FastWAM/src/fastwam/models/wan22/mot.py) 的 `_build_expert_attention_io` → `_split_modulation` 中**不调用** [`DiTBlock.forward`](../../../../Robot/FastWAM/src/fastwam/models/wan22/wan_video_dit.py)，而是直接读 `block.modulation`、调用 `block.self_attn.q/k/v` 等。FSDP1/2 设计为：仅当被 wrap 子模块的 **`forward` 入口**执行时，才对该单元参数 unshard / all-gather。forward 外访问得到**分片或展平视图**，与 `pre_dit` 产生的普通 `t_mod` 做 `aten.add` 失败。详见 [G.9.4](#g94-问题二mot-在-ditblockforward-外读-modulation--按层-fsdp)。 |
+| **典型报错** | `RuntimeError: The size of tensor a (0) must match the size of tensor b (3072) at non-singleton dimension 3`（`mot.py` `_split_modulation`，`3072` 为 video `hidden_dim`）。栈：`training_loss` → `self.mot(...)` → `_build_expert_attention_io`。 |
+| **当前生产规避** | [`libero_sft_fastwam.yaml`](../../../examples/sft/config/libero_sft_fastwam.yaml)：`strategy: fsdp` + `sharding_strategy: no_shard` + `use_orig_params: true`。 |
+
+**复现条件（配置组合，改 yaml 后须重启 Ray worker）**
+
+| `sharding_strategy` | `FastWAMPolicy._no_split_modules` | `wrap_policy.disable` | 预期 |
+|---------------------|-----------------------------------|------------------------|------|
+| `no_shard` | `["DiTBlock"]` | `false` | **可训练**（当前生产） |
+| `shard_grad_op` 或 `full_shard` | `["DiTBlock"]` | `false` | **train step 0 失败**（modulation 形状/广播） |
+| `full_shard` | `[]` 或省略 DiTBlock | `true` | **待团队验证**（[G.10.5 阶段 2](#g105-推荐落地路径仅方案实施时另开-pr)） |
+| `no_shard` | `["DiTBlock"]` | `true` | 与单层根 wrap 类似；短训曾跑通 ~49/50 step（后因磁盘等中断） |
+
+**已做尝试（须区分「初始化 wrap」与「train forward modulation」两类问题）**
+
+| # | 改动 | 结果 | 为何未作为最终方案 |
+|---|------|------|---------------------|
+| 1 | FastWAM：`_ExpertMixtures` 替代 `nn.ModuleDict`（[`mot.py`](../../../../Robot/FastWAM/src/fastwam/models/wan22/mot.py) 已合入）+ [`fastwam.py`](../../../../Robot/FastWAM/src/fastwam/models/wan22/fastwam.py) 先建 expert 再建 MoT | **解决** FSDP 初始化 `AssertionError`（同一 `DiTBlock` 双路径重复 wrap） | **不解决** OPEN-01：forward 外读 `modulation` 问题仍在 |
+| 2 | `use_orig_params: true` | **解决** `Must flatten tensors with uniform requires_grad`（冻结 VAE + 可训练 DiT） | **不解决** per-block 分片下的 modulation |
+| 3 | `wrap_policy.disable: true` 或等价单层根 FSDP | 短训 forward 基本通（~49/50 step） | 显存仍高；与 `no_shard` 同属「整模/根级」策略，未验证 `full_shard` 根级组合 |
+| 4 | `mot.py` 内对 `FSDP(DiTBlock)` 调用 `FSDP.summon_full_params(block, ...)` 再读 `modulation` | 本地 `torchrun` **挂起/超时**（SIGTERM） | 根 FSDP 已在 `forward` 中时再 summon 子 FSDP，**嵌套死锁风险**；**未合入**仓库 |
+| 5 | 仅改 `reshard_after_forward: true`（E10 语境，见 [G.8 E10](#e10-fsdp2-dtensor-与普通-tensor-混合操作错误)） | GPU 占用时未完整验证；用户改回 `false` | 不改变「未走 `DiTBlock.forward` 即读参数」机制 |
+| 6 | `get_model(..., device="cuda")` | 与 FSDP 设备管理冲突，问题更复杂 | 已改回 `device="cpu"`（见 G.8 E9/E10） |
+
+**推荐后续（优先级）**
+
+1. **短期（RLinf yaml + policy，不改 MoT 算法）**：按 [G.10.5 阶段 2](#g105-推荐落地路径仅方案实施时另开-pr) 试 `full_shard` + `wrap_policy.disable: true`（或 `_no_split_modules: []`），**禁止** `["DiTBlock"]` + `full_shard` 同时开启。  
+2. **中期**：`strategy: fsdp2` 且 `_no_split_modules = ["MoT"]` **仅此一项**（对齐 DreamZero），见 [G.10.4 P2](#g104-方案评估稳定性排序)。  
+3. **长期（FastWAM）**：在 `DiTBlock` 内提供 FSDP-safe API（如 `build_attention_io` 仅在 `forward` 内调用），MoT 只调该 API，方可恢复 per-`DiTBlock` 分片。
+
+**接手验证 checklist**
+
+- [ ] 改 yaml 后执行 `ray stop`，再 `ray start` / 重跑 `run_fastwam_sft.sh`（避免旧 worker 缓存配置）  
+- [ ] 日志中 step 0 是否通过 `FSDPVlaSftWorker.run_training` → `mot.forward`  
+- [ ] `nvidia-smi` 对比 `no_shard` vs 阶段 2 配置的单卡显存  
+- [ ] 失败时保存完整栈顶 30 行 + `actor.fsdp_config` 摘录
+
+---
+
+##### OPEN-02：FSDP2 + DTensor（G.8 问题 E10）
+
+| 字段 | 内容 |
+|------|------|
+| **状态** | **MITIGATED**（生产 yaml 使用 FSDP1）；若将 `strategy` 改回 `fsdp2` 且无 P2 wrap 策略，状态变回 **OPEN** |
+| **现象** | `RuntimeError: aten.add.Tensor: got mixed torch.Tensor and DTensor, need to convert all torch.Tensor to DTensor before calling distributed operators!` |
+| **栈顶** | `fastwam.training_loss` → `self.mot(...)`（约 504 行）；高概率首炸点：`mot._split_modulation` 中 `base_mod + t_mod`（见 [G.10.2](#g102-错误复述与栈语义)） |
+| **与 OPEN-01 关系** | **同一根因**：MoT 手工 forward + 参数已分片/DTensor；FSDP2 表现为 Tensor/DTensor 混用，FSDP1 per-block 表现为 `0 vs 3072` 等形状错误 |
+
+**已做尝试（摘要，细节见 G.8 E10 与 G.10.3）**
+
+| 尝试 | 结果 |
+|------|------|
+| 切换 `strategy: fsdp`（FSDP1） | **有效规避**；当前 yaml 已采用 |
+| `reshard_after_forward: true` | 未完整验证；未证明消除 DTensor 混用 |
+| `device="cuda"` 构建模型 | 失败/复杂化；已回 `cpu` |
+| `sft_forward` 同步 `fastwam.device` | **解决 E9**；DTensor 错误仍在 MoT 内部 |
+| 中间张量 `DTensor.from_local` / `ignored_modules` 仅 VAE | **未实施**；G.10 评估为低优先级或无效 |
+
+**下一步**：阅读 **[G.10.4–G.10.5](#g104-方案评估稳定性排序)**，按阶段 0→3 推进；P2（`fsdp2` + 仅 wrap `MoT`）验证通过后，将本项标为「已解决」并更新 yaml 快照。
+
+---
+
+##### OPEN-03：运维与环境
+
+以下子项在联调中反复出现；**不修改 RLinf/FastWAM 核心代码**即可处理的多为 MITIGATED，标 **OPEN** 的需框架或环境侧改动。
+
+###### OPEN-03a：Ray `Too many open files`
+
+| 字段 | 内容 |
+|------|------|
+| **现象** | Ray worker / raylet 报错 `Too many open files`；训练尚未进入 model forward |
+| **根因** | 默认 shell `ulimit -n` 常为 1024；Ray gRPC 连接数多时不够 |
+| **已尝试** | 在训练脚本 / `ray_utils/start_ray.sh` 增加 `ulimit -n 1048576` |
+| **为何仍出问题** | **仅改训练脚本不能改变已运行的 raylet**；须在 `ray stop` 后、**同一 shell** 提高 ulimit，再 `ray start` |
+| **推荐操作** | `ray stop` → `ulimit -n 1048576` → `ray start --head ...` → 再跑 SFT |
+| **验证** | `cat /proc/$(pgrep -f raylet | head -1)/limits \| grep "open files"`（raylet 进程 fd 上限已升高） |
+
+###### OPEN-03b：根分区满 / TensorBoard `finish` 失败
+
+| 字段 | 内容 |
+|------|------|
+| **现象** | 训练可跑若干 step，结束或 flush 时 TensorBoard / logger `finish()` 写盘失败；`df -h /` 显示 100% |
+| **根因** | 默认 `runner.logger.log_path: "../results"` 或 `logs/` 落在根分区；历史日志可达百 GB 级 |
+| **已尝试** | 删 `logs/` 释放空间（临时） |
+| **推荐操作** | 将 `log_path` 指到大盘（如 `/mnt/r/CKPT/...`，与 [`run_fastwam_sft.sh`](../../../examples/sft/run_fastwam_sft.sh) 中 `BTLOG_ROOT` 一致） |
+| **验证** | `df -h` 目标分区有余量；训练结束后 tensorboard 事件文件可写 |
+
+###### OPEN-03c：`text_embedding_cache_dir` 不存在
+
+| 字段 | 内容 |
+|------|------|
+| **现象** | 启动时 `validate_fastwam_sft_model_cfg` 断言失败：`text_embedding_cache_dir does not exist` |
+| **根因** | FastWAM V1 SFT 强制离线 T5 embedding；目录未预生成 |
+| **推荐操作** | 在 `FASTWAM_ROOT` 下运行 `precompute_text_embeds.py`（或项目文档指定脚本），使 yaml 中 `text_embedding_cache_dir` 指向真实目录 |
+| **验证** | `test -d "$FASTWAM_ROOT/data/text_embeds_cache/libero"`（路径以 yaml 为准） |
+
+###### OPEN-03d：Wan2.2 预训练权重残缺
+
+| 字段 | 内容 |
+|------|------|
+| **现象** | 加载 DiT 报 `Cannot detect model type` 或 hash 不匹配 |
+| **根因** | `require_downloading()` 在 glob 到**任意 1 个**分片后即跳过下载；目录内仅部分 `diffusion_pytorch_model-*.safetensors` |
+| **已尝试** | 删除残缺目录后单进程 `modelscope download` |
+| **推荐操作** | 校验目录内 **3 个** `diffusion_pytorch_model-*.safetensors` 齐全且大小正常 |
+| **验证** | 本地 `create_fastwam` / `get_model` 可完成 Wan 权重加载无报错 |
+
+###### OPEN-03e：`CUDA_VISIBLE_DEVICES` 与 `actor_world_size` 不一致
+
+| 字段 | 内容 |
+|------|------|
+| **状态** | **OPEN**（RLinf 代码层未修） |
+| **现象** | `AssertionError: actor.global_batch_size (N) must be divisible by (micro_batch_size * actor_world_size)`；例如设 `CUDA_VISIBLE_DEVICES=4,5,6,7` 且 `global_batch_size=3`，但 `actor_world_size=8` |
+| **根因** | [`HybridComponentPlacement`](../../../rlinf/config.py) / `Cluster()` 按**物理 GPU 数量**计算 world_size，**不**随 `CUDA_VISIBLE_DEVICES` 缩小；Ray `--num-gpus` 亦不能单独改变该计数（见 [E11](#e11-共享-gpu-资源)） |
+| **已尝试** | 调 `global_batch_size`、Ray `--num-gpus=3` | 仍按 8 GPU 校验 |
+| **推荐操作** | 等待目标 GPU 独占后按 **实际参与训练的 GPU 数** 设 `global_batch_size = micro_batch_size × world_size`；或改 placement 逻辑（需 RLinf PR） |
+| **验证** | 启动前 `validate_cfg` 通过；日志中 `actor_world_size` 与预期一致 |
+
+---
+
+##### OPEN-04：文档 / 代码 / 配置语义不一致
+
+| 字段 | 内容 |
+|------|------|
+| **状态** | OPEN（配置债，不阻塞正确 yaml 下的训练） |
+| **矛盾点** | [G.6.2](#g62-rlinfmodelsembodimentfastwamfastwam_policypy--policy-包装器) 已说明 `_no_split_modules = ["DiTBlock"]` 表示 **按类 auto-wrap**，不是「禁止拆分」；但 [`fastwam_policy.py`](../../../rlinf/models/embodiment/fastwam/fastwam_policy.py) 仍保留该字段名，新人易与 `no_shard` 混淆。 |
+| **建议 PR 检查清单** | （1）Policy 改为 `_no_split_modules: list[str] = []` **或** yaml 显式 `wrap_policy.disable: true`；（2）yaml 注释与 [G.9.6](#g96-rlinf-侧与当前推荐配置) 一致；（3）[G.10.1](#g101-当前代码快照联调基准) MoT 行与 FastWAM 仓库 `_ExpertMixtures` 一致；（4）OPEN-02 在 P2 验证后更新状态。 |
+
+---
+
+##### G.9.8 与 G.10 的分工（避免重复阅读）
+
+| 想了解 | 阅读 |
+|--------|------|
+| 所有 OPEN 项状态、运维、配置矩阵、接手清单 | **本节 G.9.8** |
+| E10 栈语义、DTensor 首炸点、mermaid、P0–P4 方案、yaml 阶段 0→3 | **[G.10](#g10-e10-专项fsdp2-dtensor-混合操作--代码级根因与稳妥修复方案2026-05)** |
+| 历史单次报错流水（E1–E11） | [G.8](#g8-已解决问题的调试过程) |
 
 #### G.9.9 相关源码索引
 
@@ -2051,7 +2194,7 @@ use_orig_params: true
 |------|------|----------------|
 | RLinf wrap 标记 | [`fastwam_policy.py`](../../../rlinf/models/embodiment/fastwam/fastwam_policy.py) | `_no_split_modules = ["DiTBlock"]` → FSDP1 走 `transformer_auto_wrap_policy`；FSDP2 走 `apply_fsdp2_to_model` 按类名匹配 **每个** `DiTBlock` |
 | SFT 配置 | [`libero_sft_fastwam.yaml`](../../../examples/sft/config/libero_sft_fastwam.yaml) | `strategy: fsdp`（FSDP1）、`sharding_strategy: no_shard`、`use_orig_params: true`；注释写明暂因 FastWAM 与 FSDP 不兼容 |
-| MoT 实现 | [`FastWAM/.../mot.py`](../../../../Robot/FastWAM/src/fastwam/models/wan22/mot.py) | 仍使用 **`nn.ModuleDict(mixtures)`**（与 G.9 所述 `_ExpertMixtures` **尚未合入本机 FastWAM 树** 时，双路径注册风险仍在） |
+| MoT 实现 | [`FastWAM/.../mot.py`](../../../../Robot/FastWAM/src/fastwam/models/wan22/mot.py) | 已使用 **`_ExpertMixtures`**（非 `nn.ModuleDict`）；消除双路径重复 wrap，**不单独解决** modulation / DTensor（见 [G.9.8 OPEN-01/02](#g98-未解决问题与后续方向接手排障手册)） |
 | 训练入口 | [`fastwam.py` `training_loss`](../../../../Robot/FastWAM/src/fastwam/models/wan22/fastwam.py) | `pre_dit` → `self.mot(...)`（约 504 行）→ `post_dit` |
 | DreamZero 先例 | [`dreamzero_policy.py`](../../../rlinf/models/embodiment/dreamzero/dreamzero_policy.py) | `_no_split_modules` 含 **`CausalWanModel`**，注释写明避免 FSDP2 + gradient checkpointing 的 bug |
 
@@ -2114,7 +2257,7 @@ sequenceDiagram
 
 | 配置 | 现象 | 机制 |
 |------|------|------|
-| FSDP1 + `no_shard` + `use_orig_params: true` | **当前可跑通短训**（见 G.9.7） | 不按层分片；`modulation` 为完整 Tensor；仍有 ModuleDict 双路径时需避免重复 wrap |
+| FSDP1 + `no_shard` + `use_orig_params: true` | **当前可跑通短训**（见 G.9.7） | 不按层分片；`modulation` 为完整 Tensor；`_ExpertMixtures` 已避免初始化重复 wrap |
 | FSDP1 + `full_shard` / `shard_grad_op` + `["DiTBlock"]` | `size 0 vs 3072` 等（G.9.4） | 分片视图 + forward 外读 `modulation` |
 | FSDP2 + `["DiTBlock"]` | **E10 DTensor mixed op** | `fully_shard` → DTensor + 同上 forward 外访问 |
 | FSDP2 + `["MoT"]`（拟议） | 预期与 DreamZero 同类修复 | 整段 `MoT.forward` 处于单一 `fully_shard` 上下文，内部读 block 参数时 unshard |
@@ -2211,5 +2354,6 @@ actor.fsdp_config:
 ### G.10.8 实施后建议更新的文档位点
 
 - 修订上文 [E10](#e10-fsdp2-dtensor-混合操作错误) 根因与推荐顺序，指向本节。  
-- [G.9.8](#g98-未解决问题与后续方向) 第 2 条「FSDP2 + DTensor」在 P2 验证通过后改为「已解决（MoT wrap）」并注明 yaml。  
-- 若合入 `_ExpertMixtures`，同步 G.9.3 与「当前代码快照」表。
+- **[G.9.8](#g98-未解决问题与后续方向接手排障手册)** 已扩写为 OPEN 卡片 + 一览表 + Quick Start；**E10 代码级细节仍以本节 G.10 为准**，避免在两处维护长文。  
+- [G.9.8 OPEN-02](#open-02fsdp2--dtensorg8-问题-e10)：P2（`fsdp2` + 仅 wrap `MoT`）验证通过后，将状态从 MITIGATED 改为「已解决」并注明 yaml。  
+- G.10.1 快照表已与 FastWAM 仓库 `_ExpertMixtures` 对齐（见上表 MoT 行）。
