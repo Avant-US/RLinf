@@ -31,8 +31,23 @@ def _manual_instantiate(cfg_val):
 
 
 def _instantiate_transforms(cfg_list):
+    """Instantiate a transform list from config.
+
+    Supports three formats:
+    1. List[dict] — standard ``_target_`` instantiation list
+    2. str — preset name (``"light"``, ``"medium"``, etc.)
+    3. Dict[str, List[dict]] — per-camera-key transform lists
+    """
     if cfg_list is None:
         return None
+    if isinstance(cfg_list, DictConfig):
+        cfg_list = OmegaConf.to_container(cfg_list, resolve=True)
+    if isinstance(cfg_list, str):
+        from rlinf.data.datasets.fastwam.augmentation import AugmentationPreset
+
+        return AugmentationPreset.get(cfg_list)
+    if isinstance(cfg_list, dict) and "_target_" not in cfg_list:
+        return {key: _instantiate_transforms(val) for key, val in cfg_list.items()}
     result = []
     for item in cfg_list:
         if isinstance(item, DictConfig):
@@ -70,8 +85,29 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
     train_transforms_obj = _instantiate_transforms(processor_cfg.get("train_transforms", None))
     val_transforms_obj = _instantiate_transforms(processor_cfg.get("val_transforms", None))
 
+    aug_preset = processor_cfg.get("augmentation_preset", None)
+    if aug_preset and isinstance(train_transforms_obj, list) and not eval_dataset:
+        from rlinf.data.datasets.fastwam.augmentation import AugmentationPreset
+
+        preset_transforms = AugmentationPreset.get(aug_preset)
+        if preset_transforms:
+            insert_idx = len(train_transforms_obj)
+            for i, t in enumerate(train_transforms_obj):
+                if "Resize" in type(t).__name__:
+                    insert_idx = i
+                    break
+            for j, aug in enumerate(preset_transforms):
+                train_transforms_obj.insert(insert_idx + j, aug)
+
     proprio_output_dim = processor_cfg.get("proprio_output_dim", None)
     delta_mask = _ensure_dict(processor_cfg.get("delta_action_dim_mask", None))
+
+    proprio_aug_cfg = processor_cfg.get("proprio_augmentations", None)
+    proprio_aug_list = None
+    if proprio_aug_cfg is not None:
+        if isinstance(proprio_aug_cfg, DictConfig):
+            proprio_aug_cfg = OmegaConf.to_container(proprio_aug_cfg, resolve=True)
+        proprio_aug_list = [_manual_instantiate(item) for item in proprio_aug_cfg]
 
     processor = FastWAMProcessor(
         shape_meta=shape_meta,
@@ -85,6 +121,7 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
         ),
         proprio_output_dim=int(proprio_output_dim) if proprio_output_dim else None,
         action_state_transforms=processor_cfg.get("action_state_transforms", None),
+        proprio_augmentations=proprio_aug_list,
         use_stepwise_action_norm=processor_cfg.get("use_stepwise_action_norm", False),
         norm_default_mode=processor_cfg.get("norm_default_mode", "min/max"),
         norm_exception_mode=processor_cfg.get("norm_exception_mode", None),
@@ -111,6 +148,8 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
         val_set_proportion=float(data_cfg.get("val_set_proportion", 0.0)),
         global_sample_stride=int(data_cfg.get("global_sample_stride", 1)),
         skip_padding_as_possible=data_cfg.get("skip_padding_as_possible", False),
+        tolerance_s=float(data_cfg.get("tolerance_s", 0.005)),
+        video_backend=str(data_cfg.get("video_backend", "pyav")),
     )
 
     sampler = DistributedSampler(
@@ -118,6 +157,7 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
         num_replicas=world_size,
         rank=rank,
         shuffle=not eval_dataset,
+        seed=cfg.actor.get("seed", 0),
     )
 
     loader = StatefulDataLoader(

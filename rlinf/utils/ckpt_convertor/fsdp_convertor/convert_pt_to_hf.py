@@ -98,14 +98,44 @@ def _resolve_train_config_path(cfg: DictConfig) -> str | None:
     return found
 
 
+def load_train_config(
+    train_config_path: str,
+    *,
+    compose_defaults: bool = True,
+) -> DictConfig:
+    """Load an RLinf training config, merging Hydra ``defaults`` when present."""
+    path = Path(train_config_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Training config not found: {path}")
+
+    raw_cfg = OmegaConf.load(path)
+    if not compose_defaults or "defaults" not in raw_cfg:
+        return raw_cfg
+
+    from hydra import compose, initialize_config_dir
+
+    config_dir = str(path.parent)
+    config_name = path.stem
+    with initialize_config_dir(version_base="1.1", config_dir=config_dir):
+        composed_cfg = compose(config_name=config_name)
+    print(
+        f"Composed Hydra training config: {path} "
+        f"(merged defaults from {config_dir})"
+    )
+    return composed_cfg
+
+
 def _model_cfg_from_train_file(train_config_path: str, cfg: DictConfig) -> DictConfig:
-    train_cfg = OmegaConf.load(train_config_path)
+    compose_defaults = bool(cfg.convertor.get("compose_train_config", True))
+    train_cfg = load_train_config(
+        train_config_path, compose_defaults=compose_defaults
+    )
     if "actor" not in train_cfg or "model" not in train_cfg.actor:
         raise KeyError(
             f"Could not find actor.model in training config: {train_config_path}"
         )
 
-    model_cfg = OmegaConf.create(OmegaConf.to_container(train_cfg.actor.model))
+    model_cfg = OmegaConf.create(OmegaConf.to_container(train_cfg.actor.model, resolve=True))
     model_overrides = cfg.convertor.get("model_overrides", None)
     if model_overrides:
         model_cfg = OmegaConf.merge(model_cfg, model_overrides)

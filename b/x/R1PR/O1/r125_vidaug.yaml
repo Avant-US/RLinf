@@ -1,0 +1,225 @@
+defaults:
+  - training_backend/fsdp@actor.fsdp_config
+  - /model/fastwam@actor.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+    - file://${oc.env:RUN_CFGPATH}/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 4-7
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "r1_pro_sft_fastwam"
+    logger_backends: ["wandb"]
+  max_epochs: -1
+  max_steps: 50000
+  val_check_interval: -1
+  save_interval: 2000
+  log_interval: 10
+  resume_dir: null
+
+data:
+  train_data_paths: ${oc.env:R1PRO_DATA}
+  num_workers: 4
+  prefetch_factor: 4
+  num_frames: 33
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  concat_multi_camera: "robotwin"
+  global_sample_stride: 1
+  val_set_proportion: 0.0
+  skip_padding_as_possible: false
+  tolerance_s: 0.005
+  video_backend: pyav
+
+  shape_meta:
+    images:
+      - key: head_rgb
+        lerobot_key: head_rgb
+        raw_shape: [3, 360, 640]
+        shape: [3, 240, 320]
+      - key: left_wrist_rgb
+        lerobot_key: left_wrist_rgb
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+      - key: right_wrist_rgb
+        lerobot_key: right_wrist_rgb
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+    action:
+      - key: default
+        lerobot_key: actions
+        raw_shape: 23
+        shape: 23
+    state:
+      - key: default
+        lerobot_key: state
+        raw_shape: 23
+        shape: 23
+
+  processor:
+    num_output_cameras: 3
+    action_output_dim: 23
+    proprio_output_dim: 23
+    use_stepwise_action_norm: false
+    norm_default_mode: "q01/q99"
+    norm_exception_mode: null
+    action_state_transforms: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms:
+      head_rgb:
+        - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+          p: 0.3
+        - _target_: torchvision.transforms.Resize
+          size: [240, 320]
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+          scale: [0.01, 0.01]
+          p: 0.3
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomRotation
+          p: 0.2
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+          # ws_client head_rgb: less yellow -> stronger cool hue + lower saturation
+          # cursor auto
+          # brightness: [1.12, 1.16]
+          # contrast: [0.84, 0.89]
+          # saturation: [0.48, 0.54]
+          # hue: [0.050, 0.070]
+          # p: 1.0
+          # op4.8
+          # brightness: [1.02, 1.08]
+          # contrast: [0.92, 1.02]
+          # saturation: [0.70, 0.88]
+          # hue: [-0.070, -0.040]
+          # p: 1.0
+          # 下面是参考p0.5的
+          # brightness: 0.3
+          # contrast: 0.4
+          # saturation: 0.5
+          # hue: 0.08
+          # p: 0.8
+          # 参考大家
+          brightness: [0.3, 1.2]
+          contrast: [0.4, 1.04]
+          saturation: [0.5, 1.0]
+          hue: [-0.1, 0.04]
+          p: 0.8
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomHorizontalLinePerFrame
+          p_line: 0.7
+          length_frac_range: [0.3, 0.7]
+          row_range: [0.1, 0.4]
+          p: 0.7
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+          p: 0.15                    # head 是彩色的，适度灰度化减少颜色依赖
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomFisheye
+          k_range: [0.10, 0.18]
+          center_jitter: 0.05
+          p: 0.15                    # 镜头畸变鲁棒性
+      left_wrist_rgb:
+        - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [240, 320]
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+          brightness: 1.08
+          contrast: 1.02
+          saturation: 0.88
+          hue: 0.07
+          p: 0.6
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+          p: 0.2                     # 强制灰度化，确保彩色 wrist 也能处理
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoGaussianNoise
+          std: 0.01
+          per_frame: false
+          p: 0.2                     # 弥补 saturation/hue 无效的增强缺口
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+          scale: [0.02, 0.08]
+          p: 0.2                     # 近距离抓取遮挡鲁棒性
+      right_wrist_rgb:
+        - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [240, 320]
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+          brightness: 1.08
+          contrast: 1.02
+          saturation: 0.88
+          hue: 0.07
+          p: 0.6
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+          p: 0.2                     # 强制灰度化，确保彩色 wrist 也能处理
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoGaussianNoise
+          std: 0.01
+          per_frame: false
+          p: 0.2                     # 弥补 saturation/hue 无效的增强缺口
+        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+          scale: [0.02, 0.08]
+          p: 0.2                     # 近距离抓取遮挡鲁棒性
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 8
+  seed: 42
+
+  model:
+    model_type: "fastwam"
+    precision: bf16
+    model_path: null
+    text_embedding_cache_dir: ${oc.env:FASTWAM_ROOT}/data/text_embeds_cache/r1_pro_chassis
+    context_len: 128
+    proprio_dim: 23
+    mot_checkpoint_mixed_attn: false
+    video_dit_config:
+      action_dim: 23
+    action_dit_config:
+      action_dim: 23
+
+  optim:
+    lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-2
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: -1
+    lr_warmup_steps_ratio: 0.05
+    total_training_steps: ${runner.max_steps}
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: true
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: true
+    limit_all_gathers: false
+    forward_prefetch: true
+    backward_prefetch: "pre"
+    reshard_after_forward: false
+    save_full_model_weights: false
+    grad_scaler:
+      enabled: false
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    amp_autocast:
+      enabled: true
+      precision: "bf16"

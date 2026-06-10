@@ -755,4 +755,126 @@ ls ${FASTWAM_ROOT}/data/text_embeds_cache/r1_pro_chassis/*.pt | head
 
 ---
 
-**文档版本**：cp25_2-v1 · 与 2026-06 本地 FastWAM / RLinf 源码同步。
+## 16. 实施记录（2026-06-02）
+
+### 16.1 PR-A 实施：`r1_pro_sft_fastwam.yaml`
+
+**文件**：[`examples/sft/config/r1_pro_sft_fastwam.yaml`](../../examples/sft/config/r1_pro_sft_fastwam.yaml)
+
+按 §9 全文创建，关键覆盖项（相对 `model/fastwam.yaml` 默认值）：
+
+| 字段 | 默认值 | r1_pro 覆盖 |
+|------|--------|-------------|
+| `actor.model.proprio_dim` | 8 | **23** |
+| `actor.model.mot_checkpoint_mixed_attn` | true | **false** |
+| `actor.model.context_len` | （隐含 128） | **128**（显式） |
+| `actor.model.video_dit_config.action_dim` | 7 | **23** |
+| `actor.model.action_dit_config.action_dim` | 7 | **23** |
+| `data.concat_multi_camera` | horizontal | **robotwin** |
+| `data.video_size` | [224, 448] | **[384, 320]** |
+| `data.processor.num_output_cameras` | 2 | **3** |
+| `data.processor.norm_default_mode` | min/max | **z-score** |
+| `actor.fsdp_config.sharding_strategy` | full_shard | **no_shard** |
+
+### 16.2 前置步骤：T5 预计算
+
+r1_pro T5 缓存不存在，需在 FastWAM 仓执行预计算：
+
+```bash
+cd ${FASTWAM_ROOT}
+python scripts/precompute_text_embeds.py task=r1_pro_chassis_uncond_3cam_384_1e-4
+```
+
+产出：`data/text_embeds_cache/r1_pro_chassis/` 下 1 个 `.pt` 文件（1 个去重 prompt）。
+
+### 16.3 验收结果
+
+#### L0 — 数据（通过）
+
+```
+video:       (1, 3, 9, 384, 320)  ✓
+action:      (1, 32, 23)          ✓
+proprio:     (1, 32, 23)          ✓
+context:     (1, 128, 4096)       ✓  (dtype=bfloat16)
+context_mask:(1, 128)             ✓  (dtype=bool)
+image_is_pad:(1, 9)               ✓
+action_is_pad:(1, 32)             ✓
+```
+
+`dataset_stats.json`（z-score mean/std）自动生成在 `log_path` 下。
+
+#### L2 — RLinf 训练 20 步（通过）
+
+启动命令：
+```bash
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+bash examples/sft/run_fastwam_sft.sh r1_pro_sft_fastwam \
+  runner.max_steps=20 runner.save_interval=10 runner.log_interval=1 \
+  actor.micro_batch_size=1 actor.global_batch_size=4
+```
+
+| 指标 | 验收标准 | 实际值 | 结果 |
+|------|----------|--------|------|
+| 训练完成 | 20 步无 Error | exit code 0 | ✓ |
+| loss 有限 | 非 NaN/Inf | 1.17–5.49 | ✓ |
+| dynamics_loss | 有日志 | 0.215–0.620 | ✓ |
+| action_loss | 有日志 | 0.895–4.93 | ✓ |
+| grad_norm | 非零 | 5.5–20.6 | ✓ |
+| learning_rate | warmup 递增 | 4e-8 → 8e-7 | ✓ |
+| checkpoint step 10 | 目录存在 | `global_step_10/actor/dcp_checkpoint` | ✓ |
+| checkpoint step 20 | 目录存在 | `global_step_20/actor/dcp_checkpoint` | ✓ |
+| data.pt / rng.pt | 各 step 存在 | ✓ | ✓ |
+| TensorBoard | 日志目录 | `tensorboard/` 存在 | ✓ |
+| 训练速度 | — | ~0.8 s/step（非 checkpoint 步） | — |
+
+步骤 10 和 20 的 checkpoint 保存耗时 ~78–83 秒（DCP 格式，`save_full_model_weights: false`），这是 `no_shard` 策略下正常行为。
+
+### 16.4 遇到的错误与修复
+
+#### Error 1：`_split_modulation` tensor 形状不匹配（FSDP per-DiTBlock wrap）
+
+```
+RuntimeError: The size of tensor a (0) must match the size of tensor b (3072)
+at non-singleton dimension 3
+```
+
+**根因**：`_no_split_modules = ["DiTBlock"]` 在 RLinf 的 `get_fsdp_wrap_policy` 中被解释为 `transformer_layer_cls_to_wrap`（**与 HuggingFace 语义相反**）。每个 `DiTBlock` 被独立 FSDP 包装后，MoT 在 `_split_modulation` 中直接访问 `block.modulation` 时看到的是未 all-gather 的空 tensor `[0]`。
+
+**修复**：将 `_no_split_modules` 设为 `None`，使 `get_fsdp_wrap_policy` 返回 `None`（无 auto-wrap，仅根级 FSDP）。
+
+```python
+# fastwam_policy.py
+_no_split_modules = None
+```
+
+#### Error 2：Checkpoint 保存 CUDA error（`shard_grad_op` 策略）
+
+```
+RuntimeError: CUDA error: invalid argument
+```
+
+发生在 `dcp.save` → `_offload_state_dict_to_cpu` → `ret.to(cpu_device)` 时。
+
+**根因**：`sharding_strategy: "shard_grad_op"` 与 FastWAM 的 MoT 架构（自定义 `state_dict()`、`_ExpertMixtures` / `ModuleDict` 双注册）不兼容。DCP 在提取分片 state dict 并 offload 到 CPU 时，某些参数引用了无效 CUDA 内存。
+
+**修复**：将 `sharding_strategy` 改为 `"no_shard"`（配置文件中已有注释说明此约束）。
+
+#### Error 3：`FastWAMPolicy.train()` 参数冻结（训练前修复）
+
+**根因**：当 MoT 使用 `_ExpertMixtures`（`mot2.py`）时，`self.fastwam.dit.requires_grad_(True)` 不会传播到 expert 参数，导致所有参数冻结、`grad_norm=0`。
+
+**修复**：当前代码使用 `mot.py`（`nn.ModuleDict`），`dit.requires_grad_(True)` 能正确传播。若切换到 `mot2.py`，需改用显式的 expert 解冻方式（已在 `fastwam_policy.py` 中注释）。
+
+### 16.5 实施检查清单更新
+
+- [x] PR-A：`r1_pro_sft_fastwam.yaml` 入库
+- [x] 预计算 T5 + cache 目录
+- [x] L0 batch 形状
+- [x] L2 smoke 20 step + TensorBoard
+- [x] 多卡 `global_batch_size` 整除（4 卡 × micro=1 → global=4）
+- [x] checkpoint 含 DCP 格式 + data.pt + rng.pt
+- [ ] L3 LIBERO 回归（待手动验证）
+
+---
+
+**文档版本**：cp25_2-v2 · 2026-06-02 实施记录。
