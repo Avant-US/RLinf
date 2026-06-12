@@ -674,3 +674,527 @@ Columns per file:
   index          — int64
   task_index     — int64
 ```
+
+---
+
+## 13. 元数据修复记录：补充 Episode 39
+
+> **操作日期**: 2026-06-10  
+> **操作人**: Claude (自动化脚本)
+
+### 13.1 问题描述
+
+分析过程中发现 Episode 39 是一个"幽灵 episode"：parquet 数据文件存在（931 帧有效数据），但未被纳入 `meta/episodes.jsonl` 和 `meta/episodes_stats.jsonl` 索引。这导致依赖 jsonl 索引的数据加载器会跳过该 episode。
+
+### 13.2 操作内容
+
+| 步骤 | 文件 | 操作 |
+|------|------|------|
+| 1 | `meta/backup_ep39_restore/` | 备份修改前的 3 个文件 |
+| 2 | `meta/episodes.jsonl` | 在 ep 38 和 ep 40 之间插入 ep 39 条目（62→63 行） |
+| 3 | `meta/episodes_stats.jsonl` | 在 ep 38 和 ep 40 之间插入 ep 39 完整统计量（62→63 行） |
+| 4 | `meta/info.json` | `total_frames` 从 60992 修正为 61913 |
+
+### 13.3 episodes.jsonl 新增条目
+
+```json
+{"episode_index": 39, "tasks": ["Open the door with a downward-press handle, go through it, and enter the room."], "length": 931}
+```
+
+### 13.4 episodes_stats.jsonl 计算方法
+
+使用与 LeRobot v0.3.3 `compute_stats.py` 完全一致的逻辑：
+
+- **数值特征** (state, actions, timestamp, frame_index, episode_index, index, task_index)：对全部 931 帧计算 min/max/mean/std，count=931
+- **图像特征** (head_rgb, left_wrist_rgb, right_wrist_rgb)：
+  - 采样数量：`max(100, min(int(931^0.75), 10000))` = 168 帧
+  - 采样索引：`np.linspace(0, 930, 168)` 均匀采样
+  - 每帧解码 PNG → numpy(C,H,W) → 下采样（head: 90×160, wrist: 120×160）
+  - 计算 per-channel (3,1,1) 的 min/max/mean/std，归一化 /255.0
+  - count=168
+
+### 13.5 未修改的文件
+
+| 文件 | 原因 |
+|------|------|
+| `stats.json` | 全局统计量。现有值与含 ep 39 的全量计算极为接近，单 episode 影响可忽略 |
+| `relative_stats.json` | 内容为 `{}`，无需改动 |
+| `modality.json` | 模态定义不变 |
+| `tasks.jsonl` | ep 39 使用 task_index=0，已存在 |
+
+### 13.6 验证结果
+
+```
+episodes.jsonl:       63 行 ✅ (原 62 行)
+episodes_stats.jsonl: 63 行 ✅ (原 62 行)
+info.json total_frames: 61913 ✅ (原 60992)
+episodes.jsonl 帧数总和: 61913 ✅ (与 info.json 一致)
+ep 39 图像采样数: 168 ✅ (与 int(931^0.75) 一致)
+ep 39 位置: 介于 ep 38 和 ep 40 之间 ✅
+```
+
+### 13.7 回退方法
+
+如需回退，将备份文件恢复：
+```bash
+cp meta/backup_ep39_restore/* meta/
+```
+
+---
+
+## 14. Episode 39 元数据修复的代码影响分析
+
+> **分析日期**: 2026-06-10  
+> **分析范围**: RLinf 本地代码 + FastWAM 整合链路
+
+本节系统分析第 13 节元数据修复（补充 Episode 39）对代码的影响。结论是**不需要修改任何 Python 代码**——所有变化均在数据层面，代码逻辑本身正确处理了修复后的元数据。以下逐条记录每个影响点、对应代码路径、影响范围和应对方案。
+
+### 14.1 数据加载全链路概览
+
+```mermaid
+graph TD
+    subgraph RLinf ["RLinf 入口"]
+        A["build_fastwam_sft_dataloader()<br/>rlinf/data/datasets/fastwam/__init__.py:59"]
+    end
+
+    subgraph FastWAM ["FastWAM 数据加载链"]
+        B["RobotVideoDataset<br/>robot_video_dataset.py:25"]
+        C["BaseLerobotDataset<br/>base_lerobot_dataset.py:19"]
+        D["MultiLeRobotDataset<br/>lerobot_dataset.py:1078"]
+        E["LeRobotDataset<br/>lerobot_dataset.py:343"]
+        F["LeRobotDatasetMetadata<br/>lerobot_dataset.py:52"]
+    end
+
+    subgraph Meta ["元数据文件 (已修复)"]
+        G["episodes.jsonl<br/>62→63 行"]
+        H["episodes_stats.jsonl<br/>62→63 行"]
+        I["info.json<br/>total_frames: 61913"]
+    end
+
+    subgraph Parquet ["Parquet 数据"]
+        J["63 个 parquet 文件<br/>(含 ep39, 缺 ep35)"]
+    end
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F -->|"load_metadata()"| G
+    F -->|"load_metadata()"| H
+    F -->|"load_metadata()"| I
+    E -->|"load_hf_dataset()"| J
+    E -->|"get_episode_data_index()"| G
+
+    style G fill:#ffd700,stroke:#333
+    style H fill:#ffd700,stroke:#333
+    style I fill:#ffd700,stroke:#333
+```
+
+### 14.2 影响 1: 训练数据量增加 (+931 帧 / +1.5%)
+
+| 项目 | 修复前 | 修复后 |
+|------|--------|--------|
+| episodes.jsonl 条目数 | 62 | 63 |
+| 加载的 episode 数 | 62 | 63 |
+| 总帧数 (num_frames) | 60,982 | 61,913 |
+| 增量 | — | +931 帧 (+1.50%) |
+
+**代码路径追踪**:
+
+1. `BaseLerobotDataset.__init__` (`base_lerobot_dataset.py:107`):
+   ```python
+   episode_indices = sorted(meta.episodes.keys())
+   ```
+   这里从 `episodes.jsonl` 获取实际的 episode 索引（不是 `range(total_episodes)`），所以修复后自动包含 ep 39。
+
+2. → `MultiLeRobotDataset.__init__` → `LeRobotDataset.__init__(episodes=63个索引)`
+
+3. → `LeRobotDataset.load_hf_dataset()` (`lerobot_dataset.py:617`):
+   ```python
+   files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
+   hf_dataset = load_dataset("parquet", data_files=files, split="train")
+   ```
+   显式按 `self.episodes` 列表加载 parquet 文件，修复后加载 63 个文件（含 ep 39）。
+
+4. `RobotVideoDataset.__len__` → `BaseLerobotDataset.__len__` (`base_lerobot_dataset.py:210`):
+   ```python
+   return self.multi_dataset.num_frames  # 60,982 → 61,913
+   ```
+
+**影响级别**: 🟢 低  
+**应对方案**: 无需改代码。+1.5% 的数据量增加对训练效果是正面的（恢复了被意外排除的有效数据）。
+
+### 14.3 影响 2: Episode 数据索引 (episode_data_index) 重建
+
+**代码路径**:
+
+`get_episode_data_index()` (`lerobot/datasets/utils.py:538-549`):
+```python
+def get_episode_data_index(episode_dicts, episodes):
+    episode_lengths = {ep_idx: ep_dict["length"] for ep_idx, ep_dict in episode_dicts.items()}
+    if episodes is not None:
+        episode_lengths = {ep_idx: episode_lengths[ep_idx] for ep_idx in episodes}
+    cumulative_lengths = list(accumulate(episode_lengths.values()))
+    return {
+        "from": torch.LongTensor([0] + cumulative_lengths[:-1]),
+        "to": torch.LongTensor(cumulative_lengths),
+    }
+```
+
+**变化细节** (示意，以 ep 37–41 为例):
+
+| Episode | 修复前 from | 修复前 to | 修复后 from | 修复后 to |
+|---------|-----------|---------|-----------|---------|
+| ep 37 | ... | ... | (不变) | (不变) |
+| ep 38 | ... | X | (不变) | X |
+| ep 39 | (不存在) | (不存在) | X | X+931 |
+| ep 40 | X | X+len(40) | X+931 | X+931+len(40) |
+| ep 41+ | ... | ... | 全部 +931 | 全部 +931 |
+
+**影响级别**: 🟢 低  
+**应对方案**: 无需改代码。`get_episode_data_index` 是纯函数，每次从 `meta.episodes` 动态计算，自动适应新的 episode 列表。
+
+### 14.4 影响 3: 全局统计量变化 (LeRobot aggregate_stats)
+
+**代码路径**:
+
+1. `LeRobotDatasetMetadata.load_metadata()` (`lerobot_dataset.py:107-120`):
+   - 对 v2.1 格式，加载 `episodes_stats.jsonl` 后调用:
+   ```python
+   self.stats = aggregate_stats(list(self.episodes_stats.values()))
+   ```
+   - 输入从 62 条 episode_stats 变为 63 条
+
+2. `MultiLeRobotDataset.__init__` (`lerobot_dataset.py:1151`):
+   ```python
+   self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
+   ```
+
+3. `aggregate_stats()` (`compute_stats.py:155-176`) 使用 parallel variance 算法:
+   - 加权均值: $\bar{x} = \frac{\sum n_i \cdot \bar{x}_i}{\sum n_i}$
+   - 合并方差: $\sigma^2 = \frac{\sum n_i \cdot (\sigma_i^2 + (\bar{x}_i - \bar{x})^2)}{\sum n_i}$
+   - min/max 取所有 episode 的极值
+
+**影响定量估算**:
+- ep 39 权重: $\frac{931}{61913} \approx 1.50\%$
+- 对 mean 的影响: $\Delta\bar{x} \approx 0.015 \cdot (\bar{x}_{39} - \bar{x}_{old})$，量级约 $O(10^{-3})$
+- 对 std 的影响: 类似量级
+- 对 min/max: 仅当 ep 39 含极值时变化
+
+**影响级别**: 🟢 低  
+**应对方案**: 无需改代码。`stats.json` 不被 v2.1 格式使用（`aggregate_stats` 每次加载时动态聚合）。全局 stats 的轻微变化不影响训练稳定性。
+
+### 14.5 影响 4: 归一化统计量变化 (q01/q99 和 mean/std)
+
+这是 **影响最大** 的一项，因为归一化统计量直接决定了模型输入的数值范围。
+
+**代码路径**:
+
+1. `BaseLerobotDataset.get_dataset_stats()` (`base_lerobot_dataset.py:295-417`):
+   ```python
+   episodes_num = self.multi_dataset.num_episodes  # 62 → 63
+   # 遍历所有 episode 计算统计量
+   for episode_idx in range(episodes_num):
+       batch = self._get_episode_data(episode_idx)
+       # 计算 min/max/mean/var/q01/q99
+   ```
+
+2. q01/q99 的跨 episode 聚合方式 (`base_lerobot_dataset.py:389-392`):
+   ```python
+   stats["state"][key]["stepwise_q01"] = torch.stack(state_q01[key]).amin(0)  # 取所有 ep 的 q01 最小值
+   stats["state"][key]["stepwise_q99"] = torch.stack(state_q99[key]).amax(0)  # 取所有 ep 的 q99 最大值
+   ```
+   这意味着 ep 39 的 q01 如果小于当前最小 q01，整体 q01 会降低；ep 39 的 q99 如果大于当前最大 q99，整体 q99 会升高。
+
+3. `RobotVideoDataset.__init__` (`robot_video_dataset.py:92-108`):
+   ```python
+   if not pretrained_norm_stats:
+       dataset_stats = self.lerobot_dataset.get_dataset_stats(processor)  # 首次计算
+       save_dataset_stats_to_json(dataset_stats, ...)                      # 保存到 dataset_stats.json
+   else:
+       dataset_stats = load_dataset_stats_from_json(pretrained_norm_stats) # 加载已有文件
+   ```
+
+**归一化公式** (以 q01/q99 模式为例):
+
+$$x_{norm} = \frac{x - q_{01}}{q_{99} - q_{01}}$$
+
+当 $q_{01}$ 或 $q_{99}$ 因 ep 39 参与而变化时，相同的原始值 $x$ 会被映射到略微不同的归一化值。
+
+**影响级别**: 🟡 中  
+**应对方案**:
+1. 如果之前已生成 `pretrained_norm_stats`（即 `dataset_stats.json`）：**删除旧文件**，下次训练会自动重新计算
+2. 或在配置中设置 `data.pretrained_norm_stats: null`，强制首次运行时重算
+3. 如果是首次训练（尚未生成 `dataset_stats.json`）：无需额外操作
+
+### 14.6 影响 5: DistributedSampler 和训练步数
+
+**代码路径**:
+
+1. `build_fastwam_sft_dataloader()` (`rlinf/data/datasets/fastwam/__init__.py:155-161`):
+   ```python
+   sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, ...)
+   ```
+   - `DistributedSampler` 内部使用 `len(dataset)` 分配样本，修复后每个 rank 分到的样本数略增
+
+2. `data_config["num_samples"] = len(dataset)` (`__init__.py:176`):
+   - 60,982 → 61,913
+   - Runner 使用此值计算每 epoch 的迭代次数
+
+**影响定量**:
+- 设 `micro_batch_size = 4`, `world_size = 8`:
+  - 修复前: $\lceil 60982 / (4 \times 8) \rceil = 1907$ steps/epoch
+  - 修复后: $\lceil 61913 / (4 \times 8) \rceil = 1936$ steps/epoch
+  - 每 epoch 多约 29 步 (+1.5%)
+
+**影响级别**: 🟢 低  
+**应对方案**: 无需改代码。`DistributedSampler` 和 Runner 完全基于 `len(dataset)` 动态计算。
+
+### 14.7 影响 6: Checkpoint 恢复兼容性
+
+这是需要**特别注意**的操作层面影响。
+
+**场景**: 假设已用修复前的数据集（62 episodes / 60,982 帧）训练并保存了 checkpoint，修复后尝试恢复训练 (`runner.resume_dir`)：
+
+| 组件 | 恢复行为 | 风险 |
+|------|---------|------|
+| **模型权重** | 正常恢复 | 🟢 无风险 |
+| **优化器状态** | 正常恢复 | 🟢 无风险 |
+| **StatefulDataLoader 状态** | 包含 sampler 位置和 epoch 计数 | 🔴 **数据集大小不匹配** |
+| **Sampler 位置** | 基于旧的 60,982 帧分区 | 🔴 **索引越界或数据错位** |
+
+**具体风险**:
+- `StatefulDataLoader` (`rlinf/data/datasets/fastwam/__init__.py:163`) 恢复时，sampler 的内部索引是基于旧数据集大小生成的
+- ep 40 及之后的帧索引已经偏移 +931，恢复的 sampler 位置会指向错误的帧
+- 最坏情况下会导致索引越界 IndexError
+
+**影响级别**: 🔴 高（仅在恢复已有 checkpoint 时）  
+**应对方案**:
+1. **推荐**: 从头开始训练（`runner.resume_dir` 不设或置空）
+2. **折中**: 仅恢复模型权重，不恢复 dataloader/sampler 状态（需确认 Runner 是否支持此模式）
+3. 如果必须恢复：使用修复前的备份元数据(`meta/backup_ep39_restore/`)恢复到旧状态完成本轮训练，下轮再用修复后的元数据
+
+### 14.8 影响 7: get_episodes_file_paths 与缺失 ep 35 的潜在风险
+
+**代码路径**:
+
+`LeRobotDataset.get_episodes_file_paths()` (`lerobot_dataset.py:598-609`):
+```python
+def get_episodes_file_paths(self) -> list[Path]:
+    episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
+    fpaths = [str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
+    ...
+```
+
+**两条代码路径对比**:
+
+```mermaid
+graph LR
+    subgraph 安全路径 ["✅ FastWAM-RLinf 整合路径 (当前使用)"]
+        A1["BaseLerobotDataset"] -->|"episodes=sorted(meta.episodes.keys())<br/>= [0..34, 36..63]"| B1["LeRobotDataset"]
+        B1 -->|"get_episodes_file_paths()<br/>使用 self.episodes"| C1["仅加载存在的 63 个 parquet<br/>不含 ep 35 ✅"]
+    end
+
+    subgraph 风险路径 ["⚠️ 直接使用 LeRobotDataset (不推荐)"]
+        A2["直接调用"] -->|"episodes=None"| B2["LeRobotDataset"]
+        B2 -->|"get_episodes_file_paths()<br/>使用 range(total_episodes)=range(63)"| C2["尝试加载 ep 0..62<br/>ep 35 不存在 ❌"]
+    end
+```
+
+**当前整合路径安全性**:
+- `build_fastwam_sft_dataloader` → `RobotVideoDataset` → `BaseLerobotDataset` 始终通过 `sorted(meta.episodes.keys())` 获取实际存在的 episode 索引
+- `episodes.jsonl` 中没有 ep 35 的条目，因此 `meta.episodes.keys()` 不包含 35
+- `get_episodes_file_paths` 使用 `self.episodes` (显式列表)，跳过 ep 35
+
+**影响级别**: 🟢 低（当前路径安全）/ 🟡 中（其他使用方式需注意）  
+**应对方案**: 在数据集文档或 README 中注明 `ep 35 parquet 缺失`，警告不要使用 `LeRobotDataset(episodes=None)` 直接加载该数据集。
+
+### 14.9 影响汇总与操作清单
+
+| # | 影响 | 级别 | 需改代码? | 操作项 |
+|---|------|------|----------|--------|
+| 1 | 训练数据 +931 帧 (+1.5%) | 🟢 低 | 否 | 无 |
+| 2 | episode_data_index 偏移 | 🟢 低 | 否 | 无 (动态计算) |
+| 3 | aggregate_stats 轻微变化 | 🟢 低 | 否 | 无 (动态聚合) |
+| 4 | q01/q99 归一化值变化 | 🟡 中 | 否 | 删除旧 `dataset_stats.json` |
+| 5 | DistributedSampler 分区变化 | 🟢 低 | 否 | 无 (动态计算) |
+| 6 | Checkpoint 恢复不兼容 | 🔴 高 | 否 | 从头训练或仅恢复权重 |
+| 7 | ep 35 缺失的潜在风险 | 🟢 低 | 否 | 文档注明 |
+
+**最终结论**: 此次元数据修复不需要修改任何 Python 代码。所有影响均通过操作层面的应对即可解决。修复本身是正确且必要的——它恢复了一个被意外排除的有效 episode（931 帧数据），使数据集完整性从 98.5% 提升到 100%。
+
+> **⚠️ 注意**: 第 13 节的 Episode 39 补充操作已在第 15 节中回滚。第 14 节的影响分析仅供参考，不再适用于当前数据集状态。
+
+---
+
+## 15. 回滚 Episode 39 并清除问题 Episode
+
+> **操作日期**: 2026-06-11  
+> **操作人**: Claude (自动化操作)  
+> **前序**: 回滚第 13 节操作，并进一步清理
+
+### 15.1 回滚原因
+
+第 13 节中将 Episode 39 的元数据补回了数据集。然而经人工审查视频录像后发现：
+
+| Episode | 问题 | 证据 |
+|---------|------|------|
+| **Episode 39** | right_wrist 录像异常短，内容为空（什么都没录到） | `right_wrist_rgb.mp4` 仅 16KB（正常应为数 MB） |
+| **Episode 35** | 所有录像异常短，无有效内容 | 3 个视频分别为 40KB、57KB、56KB；无 parquet 文件 |
+
+这两个 episode 的数据质量不合格，不应纳入训练。需要：
+1. 回滚第 13 节的 ep 39 元数据补充
+2. 从数据集中彻底移除 ep 35 和 ep 39
+3. 修正 `info.json` 中的历史不一致值
+
+### 15.2 操作前状态 (第 13 节操作后)
+
+| 项目 | 值 |
+|------|-----|
+| `episodes.jsonl` | 63 行，索引 [0-34, 36-39, 40-63] |
+| `episodes_stats.jsonl` | 63 行 |
+| `info.json` | total_episodes=63, total_frames=61913, total_videos=189 |
+| ep 35 parquet | ❌ 不存在 |
+| ep 39 parquet | ✅ 670MB |
+
+### 15.3 操作内容
+
+| 步骤 | 操作 | 详情 |
+|------|------|------|
+| 1 | 备份当前状态 | 将修改前的 `episodes.jsonl`、`episodes_stats.jsonl`、`info.json` 备份到 `meta/backup_cleanup_ep35_39/` |
+| 2 | 恢复 jsonl 文件 | 从 `meta/backup_ep39_restore/` 恢复 `episodes.jsonl` 和 `episodes_stats.jsonl`（62 行，无 ep 35/39） |
+| 3 | 修正 info.json | 不从备份恢复（备份值有历史不一致），而是逐项修正为正确值 |
+| 4 | 移除 ep 39 parquet | 将 `episode_000039.parquet`（640MB）移至 `meta/backup_cleanup_ep35_39/` |
+
+**info.json 修正明细**:
+
+| 字段 | 修改前 | 修改后 | 说明 |
+|------|--------|--------|------|
+| `total_episodes` | 63 | **62** | 匹配 jsonl 行数和 parquet 文件数 |
+| `total_frames` | 61913 | **60982** | 匹配 jsonl 帧数总和 |
+| `total_videos` | 189 | **186** | = 62 × 3 cameras |
+| `splits.train` | "0:63" | **"0:62"** | 匹配 total_episodes |
+
+> **注**: 备份中的 info.json 有 `total_episodes=63`、`total_frames=60992`，两者都与实际不一致。本次操作首次将 info.json 的所有数值修正为精确匹配 jsonl 和 parquet 的正确值。
+
+### 15.4 操作后状态
+
+| 项目 | 值 |
+|------|-----|
+| `episodes.jsonl` | 62 行，索引 [0-34, 36-38, 40-63] |
+| `episodes_stats.jsonl` | 62 行（同上） |
+| `info.json` | total_episodes=62, total_frames=60982, total_videos=186 |
+| ep 35 parquet | ❌ 不存在（从未存在） |
+| ep 39 parquet | ❌ 已移至备份 |
+| parquet 文件数 | 62 个 |
+| ep 35/39 videos | 保留原位于 `videos_backup/`（不在 jsonl 索引中，不会被加载） |
+
+### 15.5 验证结果
+
+```
+episodes.jsonl:       62 行 ✅
+episodes_stats.jsonl: 62 行 ✅
+ep 35 in jsonl:       未找到 ✅
+ep 39 in jsonl:       未找到 ✅
+ep 35 in stats:       未找到 ✅
+ep 39 in stats:       未找到 ✅
+帧数总和:              60982 ✅ (与 info.json 一致)
+info.json:            total_episodes=62, total_frames=60982, total_videos=186 ✅
+parquet 文件数:        62 ✅
+ep 35 parquet:        不存在 ✅
+ep 39 parquet:        不存在 ✅
+jsonl ↔ parquet 一致性: 62 个 episode 完全匹配 ✅
+```
+
+### 15.6 对 RLinf/FastWAM 代码的影响分析
+
+#### 15.6.1 结论：不需要修改任何代码
+
+回滚后的数据集状态等同于"从未执行第 13 节操作"的正确初始状态（且修正了历史 info.json 不一致值）。由于该数据集此前**尚未开始训练**（无 checkpoint、无 `pretrained_norm_stats` 文件），因此不存在兼容性问题。
+
+#### 15.6.2 数据加载链路验证
+
+```mermaid
+graph TD
+    subgraph 入口 ["RLinf 入口"]
+        A["build_fastwam_sft_dataloader()<br/>rlinf/data/datasets/fastwam/__init__.py:59"]
+    end
+
+    subgraph 加载链 ["FastWAM 数据加载链"]
+        B["RobotVideoDataset"]
+        C["BaseLerobotDataset"]
+        D["MultiLeRobotDataset"]
+        E["LeRobotDataset"]
+        F["LeRobotDatasetMetadata"]
+    end
+
+    subgraph Meta ["元数据文件 (已清理)"]
+        G["episodes.jsonl<br/>62 行, 无 ep35/39"]
+        H["episodes_stats.jsonl<br/>62 行"]
+        I["info.json<br/>total_episodes=62<br/>total_frames=60982"]
+    end
+
+    subgraph Data ["数据文件 (已清理)"]
+        J["62 个 parquet 文件<br/>[0-34, 36-38, 40-63]"]
+    end
+
+    A --> B --> C --> D --> E --> F
+    F -->|"load_metadata()"| G
+    F -->|"load_metadata()"| H
+    F -->|"load_metadata()"| I
+    E -->|"load_hf_dataset()"| J
+
+    style G fill:#90ee90,stroke:#333
+    style H fill:#90ee90,stroke:#333
+    style I fill:#90ee90,stroke:#333
+    style J fill:#90ee90,stroke:#333
+```
+
+#### 15.6.3 逐环节影响确认
+
+| 代码环节 | 文件:行号 | 行为 | 影响 |
+|----------|-----------|------|------|
+| Episode 索引获取 | `base_lerobot_dataset.py:107` | `sorted(meta.episodes.keys())` → [0-34, 36-38, 40-63] (62个) | 🟢 不含 ep 35/39 |
+| Parquet 加载 | `lerobot_dataset.py:617` | 按 episodes 列表加载 62 个 parquet | 🟢 每个文件都存在 |
+| 帧索引构建 | `utils.py:538` `get_episode_data_index()` | 62 个 episode 的累积长度 = 60,982 | 🟢 与 hf_dataset 行数一致 |
+| 全局统计聚合 | `lerobot_dataset.py:107-120` `aggregate_stats()` | 62 条 episodes_stats 聚合 | 🟢 正常 |
+| 归一化统计 | `base_lerobot_dataset.py:310` `get_dataset_stats()` | 遍历 62 个 episode 计算 q01/q99 | 🟢 首次计算，无旧文件冲突 |
+| 数据集长度 | `base_lerobot_dataset.py:210` `__len__` | `num_frames` = 60,982 | 🟢 正常 |
+| DistributedSampler | `fastwam/__init__.py:155` | 基于 `len(dataset)=60982` 分区 | 🟢 动态计算 |
+
+#### 15.6.4 info.json 修正的额外收益
+
+本次操作首次将 `info.json` 修正为**完全自洽**的状态，消除了自数据集创建以来就存在的数值不一致：
+
+| 字段 | 原始值 (有误) | 第 13 节后 | 本次修正 | 正确性 |
+|------|-------------|-----------|---------|--------|
+| `total_episodes` | 63 | 63 | **62** | ✅ = jsonl 行数 = parquet 文件数 |
+| `total_frames` | 60992 | 61913 | **60982** | ✅ = jsonl 帧数总和 |
+| `total_videos` | 189 | 189 | **186** | ✅ = 62 × 3 |
+
+#### 15.6.5 残留风险：`get_episodes_file_paths()` 的 range 路径
+
+`LeRobotDataset.get_episodes_file_paths()` (`lerobot_dataset.py:598-609`) 在 `episodes=None` 时使用 `range(total_episodes)` = `range(62)` = [0..61]。但实际 episode 索引包含 62 和 63，因此该路径仍然不安全。
+
+**风险评估**: 🟢 低。FastWAM-RLinf 整合路径始终通过 `BaseLerobotDataset` 传递显式 episode 列表（来自 `meta.episodes.keys()`），**从不触发** `episodes=None` 分支。详见第 14.8 节分析。
+
+### 15.7 备份文件汇总
+
+| 备份目录 | 内容 | 用途 |
+|----------|------|------|
+| `meta/backup_ep39_restore/` | 第 13 节操作前的 3 个 meta 文件 | 第 13 节回滚参考（已使用） |
+| `meta/backup_cleanup_ep35_39/` | 本次操作前的 3 个 meta 文件 + ep 39 parquet (640MB) | 本次操作回滚 |
+
+### 15.8 回退方法
+
+如需回退本次操作：
+```bash
+cd /mnt/r/share/zwy/datasets/r1_pro_data_v2/r1_pro_data_convert_chassis
+# 恢复 meta 文件
+cp meta/backup_cleanup_ep35_39/episodes.jsonl meta/
+cp meta/backup_cleanup_ep35_39/episodes_stats.jsonl meta/
+cp meta/backup_cleanup_ep35_39/info.json meta/
+# 恢复 parquet
+cp meta/backup_cleanup_ep35_39/episode_000039.parquet data/chunk-000/
+```

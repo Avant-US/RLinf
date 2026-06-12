@@ -63,7 +63,8 @@ When only ``dcp_checkpoint/`` exists (older runs)::
         --from-dcp
 
 export EMBODIED_PATH=/home/Luogang/SRC/RL/RLinf/examples/sft
-python b/scripts/rlinf_ckpt_to_hf.py --checkpoint /mnt/r/CKPT/VLA/FW/RUN/R1PR/R1/checkpoints/global_step_1000/actor   --output /mnt/r/CKPT/VLA/FW/RUN/R1PR/R1/checkpoints/global_step_1000_HF  --train-config examples/sft/config/r1_pro_sft_fastwam.yaml  --torch-dtype bf16  --from-dcp
+export R1PRO_DATA=/mnt/r/share/zwy/datasets/r1_pro_data_v2/r1_pro_data_convert_chassis
+python b/scripts/rlinf_ckpt_to_hf.py --checkpoint /mnt/r/CKPT/VLA/FW/RUN/R1PR/O2/O2/checkpoints/global_step_2000/actor   --output /mnt/r/CKPT/VLA/FW/RUN/R1PR/O2/O2/checkpoints/global_step_2000_HF  --train-config examples/sft/config/r1_pro_sft_fastwam.yaml  --torch-dtype bf16  --from-dcp
 
 """
 
