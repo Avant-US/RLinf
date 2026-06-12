@@ -837,4 +837,91 @@ fastwam.proprio_encoder.{key} → payload["proprio_encoder"][{key}]
 
 ---
 
-**文档版本**：op46_4 · 2026-06-04 · 整合 op46_2 + cp25_3，纠正 9 个错误，含 §13 训练脚本实现记录 · §14 checkpoint 转换
+## 15. Checkpoint 加权平均合并
+
+### 15.1 动机
+
+多个 run 用不同数据/配置训练后，各 checkpoint 在不同维度各有优劣。通过按 `action_loss` 反比加权平均，可将低 action_loss 的 checkpoint 赋予更高权重，合并出兼具多 run 优势的新 checkpoint。
+
+### 15.2 核心逻辑
+
+脚本：[`b/scripts/merge_fastwam_ckpts.py`](../../scripts/merge_fastwam_ckpts.py)
+
+```
+输入: N 个 fastwam_native.pt + N 个 action_loss 值
+       ↓
+取倒数: w_i = 1 / action_loss_i
+       ↓
+归一化: w_i = w_i / Σ w_j
+       ↓
+递归遍历嵌套 dict:
+  - Tensor: merged = Σ (w_i × tensor_i)   (float32 计算, 转回原 dtype)
+  - 非 Tensor (step, torch_dtype 等): 取第一个 checkpoint 的值
+       ↓
+输出: 新的 fastwam_native.pt
+```
+
+权重计算示例：
+
+$$w_{\text{O1}} = \frac{1/0.0144}{1/0.0144 + 1/0.0135} = \frac{69.44}{69.44 + 74.07} = 48.39\%$$
+
+$$w_{\text{O2}} = \frac{1/0.0135}{1/0.0144 + 1/0.0135} = \frac{74.07}{69.44 + 74.07} = 51.61\%$$
+
+### 15.3 使用方法
+
+```bash
+python b/scripts/merge_fastwam_ckpts.py \
+  --ckpts <ckpt_1.pt> <ckpt_2.pt> [<ckpt_3.pt> ...] \
+  --weights <action_loss_1> <action_loss_2> [<action_loss_3> ...] \
+  --output <output.pt>
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--ckpts` | 两个或多个 `fastwam_native.pt` 路径 |
+| `--weights` | 每个 checkpoint 对应的 `action_loss`（越小 → 合并权重越大） |
+| `--output` | 输出路径（目录自动创建） |
+
+### 15.4 实际合并示例：O1 + O2
+
+**输入**：
+
+| Run | Checkpoint | action_loss | 归一化权重 |
+|-----|-----------|-------------|-----------|
+| O1 | `.../R1PR/O1/O1/checkpoints/global_step_3000_HF/fastwam_native.pt` | 0.0144 | 48.39% |
+| O2 | `.../R1PR/O2/O2/checkpoints/global_step_3000_HF/fastwam_native.pt` | 0.0135 | 51.61% |
+
+**命令**：
+
+```bash
+python b/scripts/merge_fastwam_ckpts.py \
+  --ckpts /mnt/r/CKPT/VLA/FW/RUN/R1PR/O1/O1/checkpoints/global_step_3000_HF/fastwam_native.pt \
+           /mnt/r/CKPT/VLA/FW/RUN/R1PR/O2/O2/checkpoints/global_step_3000_HF/fastwam_native.pt \
+  --weights 0.0144 0.0135 \
+  --output /mnt/r/CKPT/VLA/FW/RUN/R1PR/O2/O2/checkpoints/O1O2_3000_HF/fastwam_native.pt
+```
+
+**输出**：
+
+```
+Merge plan:
+  global_step_3000_HF/fastwam_native.pt  action_loss=0.0144  weight=0.4839
+  global_step_3000_HF/fastwam_native.pt  action_loss=0.0135  weight=0.5161
+Loading checkpoint 1/2: ...O1/.../fastwam_native.pt
+Loading checkpoint 2/2: ...O2/.../fastwam_native.pt
+Merging weights...
+Saving to ...O1O2_3000_HF/fastwam_native.pt
+
+Verification:
+  Total tensor keys: 1651
+  step: 0
+  torch_dtype: torch.bfloat16
+  Spot-check 'mot.mixtures.video.patch_embedding.weight': PASS
+Done.
+```
+
+输出文件 12GB，与源 checkpoint 大小一致。
+
+---
+
+**文档版本**：op46_4 · 2026-06-04 · 整合 op46_2 + cp25_3，纠正 9 个错误，含 §13 训练脚本实现记录 · §14 checkpoint 转换 · §15 checkpoint 加权平均合并
