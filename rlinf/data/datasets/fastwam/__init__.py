@@ -43,7 +43,7 @@ def _instantiate_transforms(cfg_list):
     if isinstance(cfg_list, DictConfig):
         cfg_list = OmegaConf.to_container(cfg_list, resolve=True)
     if isinstance(cfg_list, str):
-        from rlinf.data.datasets.fastwam.augmentation import AugmentationPreset
+        from rlinf.data.aug.augmentation import AugmentationPreset
 
         return AugmentationPreset.get(cfg_list)
     if isinstance(cfg_list, dict) and "_target_" not in cfg_list:
@@ -60,8 +60,13 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
     import os
 
     from fastwam.datasets.lerobot.robot_video_dataset import RobotVideoDataset
-    from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
     from fastwam.utils.misc import register_work_dir
+
+    from rlinf.data.datasets.fastwam.processor import (
+        build_proprio_aug_processor_cls, register_episode_frame_loader
+    )
+
+    RLinfFastWAMProcessor = build_proprio_aug_processor_cls()
 
     log_path = cfg.runner.logger.get("log_path", "./runs")
     register_work_dir(log_path)
@@ -87,7 +92,7 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
 
     aug_preset = processor_cfg.get("augmentation_preset", None)
     if aug_preset and isinstance(train_transforms_obj, list) and not eval_dataset:
-        from rlinf.data.datasets.fastwam.augmentation import AugmentationPreset
+        from rlinf.data.aug.augmentation  import AugmentationPreset
 
         preset_transforms = AugmentationPreset.get(aug_preset)
         if preset_transforms:
@@ -109,7 +114,7 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
             proprio_aug_cfg = OmegaConf.to_container(proprio_aug_cfg, resolve=True)
         proprio_aug_list = [_manual_instantiate(item) for item in proprio_aug_cfg]
 
-    processor = FastWAMProcessor(
+    processor = RLinfFastWAMProcessor(
         shape_meta=shape_meta,
         num_obs_steps=int(data_cfg.get("num_frames", 33)),
         num_output_cameras=int(processor_cfg.get("num_output_cameras", 2)),
@@ -151,6 +156,12 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
         tolerance_s=float(data_cfg.get("tolerance_s", 0.005)),
         video_backend=str(data_cfg.get("video_backend", "pyav")),
     )
+
+    if os.environ.get("FASTWAM_DUMP_TRANSFORM_MP4") == "1":
+        from rlinf.data.datasets.fastwam.processor import load_full_episode_camera_frames
+        register_episode_frame_loader(load_full_episode_camera_frames)
+    else:
+        register_episode_frame_loader(None)
 
     sampler = DistributedSampler(
         dataset,

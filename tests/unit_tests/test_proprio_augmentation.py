@@ -16,7 +16,7 @@ from copy import deepcopy
 import pytest
 import torch
 
-from rlinf.data.datasets.fastwam.augmentation import (
+from rlinf.data.aug.augmentation import (
     ProprioAugmentation,
     ProprioRandomOffset,
     ProprioRandomScale,
@@ -646,26 +646,26 @@ def test_t36_chain_offset_then_scale():
 def test_t37_yaml_instantiation():
     configs = [
         {
-            "_target_": "rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset",
+            "_target_": "rlinf.data.aug.augmentation.ProprioRandomOffset",
             "offset_range": 0.02,
             "exclude_dims": [14, 15, 16, 17, 18, 19, 20, 21, 22],
             "p": 0.5,
             "frame_indices": "all",
         },
         {
-            "_target_": "rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale",
+            "_target_": "rlinf.data.aug.augmentation.ProprioRandomScale",
             "scale_range": 0.05,
             "exclude_dims": [14, 15, 16, 17, 18, 19, 22],
             "p": 0.3,
         },
         {
-            "_target_": "rlinf.data.datasets.fastwam.augmentation.ProprioRandomDeadzone",
+            "_target_": "rlinf.data.aug.augmentation.ProprioRandomDeadzone",
             "deadzone_max": 0.005,
             "exclude_dims": [14, 15, 16, 17, 18, 19, 20, 21, 22],
             "p": 0.2,
         },
         {
-            "_target_": "rlinf.data.datasets.fastwam.augmentation.ProprioRandomNoise",
+            "_target_": "rlinf.data.aug.augmentation.ProprioRandomNoise",
             "noise_std": 0.008,
             "exclude_dims": [14, 15, 16, 17, 18, 19, 20, 21, 22],
             "frame_indices": {"random_n": 5},
@@ -675,10 +675,10 @@ def test_t37_yaml_instantiation():
     ]
 
     class_map = {
-        "rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset": ProprioRandomOffset,
-        "rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale": ProprioRandomScale,
-        "rlinf.data.datasets.fastwam.augmentation.ProprioRandomDeadzone": ProprioRandomDeadzone,
-        "rlinf.data.datasets.fastwam.augmentation.ProprioRandomNoise": ProprioRandomNoise,
+        "rlinf.data.aug.augmentation.ProprioRandomOffset": ProprioRandomOffset,
+        "rlinf.data.aug.augmentation.ProprioRandomScale": ProprioRandomScale,
+        "rlinf.data.aug.augmentation.ProprioRandomDeadzone": ProprioRandomDeadzone,
+        "rlinf.data.aug.augmentation.ProprioRandomNoise": ProprioRandomNoise,
     }
 
     instances = []

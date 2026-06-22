@@ -126,12 +126,13 @@ def main() -> None:
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
-    import fastwam.datasets.lerobot.processors.fastwam_processor as fwp_module
-    from fastwam.datasets.lerobot.processors.fastwam_processor import (
-        FastWAMProcessor,
+    import rlinf.data.datasets.fastwam.processor as fwp_module
+    from rlinf.data.datasets.fastwam.processor import (
+        build_proprio_aug_processor_cls,
         dump_episode_transform_mp4,
         reset_episode_transform_dump_state,
     )
+    FastWAMProcessor = build_proprio_aug_processor_cls()
     from fastwam.datasets.lerobot.robot_video_dataset import RobotVideoDataset
     from fastwam.utils.misc import register_work_dir
 

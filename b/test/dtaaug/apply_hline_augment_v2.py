@@ -178,7 +178,8 @@ def load_r1_robotwin_video(data_dir: str, fastwam_root: str, sample_idx: int) ->
     from omegaconf import OmegaConf
     from torchvision.transforms import Resize
 
-    from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
+    from rlinf.data.datasets.fastwam.processor import build_proprio_aug_processor_cls
+    FastWAMProcessor = build_proprio_aug_processor_cls()
     from fastwam.datasets.lerobot.robot_video_dataset import RobotVideoDataset
     from fastwam.datasets.lerobot.transforms.action_state_merger import ConcatLeftAlign
     from fastwam.datasets.lerobot.transforms.image import ToTensor

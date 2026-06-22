@@ -669,7 +669,8 @@ flowchart TB
 ```python
 def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset=False):
     from fastwam.datasets.lerobot.robot_video_dataset import RobotVideoDataset
-    from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
+    from rlinf.data.datasets.fastwam.processor import build_proprio_aug_processor_cls
+    FastWAMProcessor = build_proprio_aug_processor_cls()
 
     model_cfg = cfg.actor.model
     data_cfg = cfg.data

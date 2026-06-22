@@ -76,7 +76,7 @@ echo "[6] Python 环境"
 check "torch 可导入" python -c "import torch"
 check "fastwam 可导入" python -c "import fastwam"
 check "rlinf 可导入" python -c "import rlinf"
-check "augmentation 模块" python -c "from rlinf.data.datasets.fastwam.augmentation import AugmentationPreset"
+check "augmentation 模块" python -c "from rlinf.data.aug.augmentation import AugmentationPreset"
 
 echo
 echo "============================================================"

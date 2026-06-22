@@ -598,13 +598,13 @@ data:
   processor:
     train_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+      - _target_: rlinf.data.aug.augmentation.VideoColorJitter
         brightness: 0.3
         contrast: 0.4
         saturation: 0.5
         hue: 0.08
         p: 0.8
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+      - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
         scale: 0.95
         p: 0.5
       - _target_: torchvision.transforms.Resize
@@ -647,20 +647,20 @@ data:
     train_transforms:
       head_rgb:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 0.3
           contrast: 0.4
           saturation: 0.5
           hue: 0.08
           p: 0.8
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+        - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
           scale: 0.95
           p: 0.5
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
       left_wrist_rgb:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 0.2
           contrast: 0.2
           saturation: 0.3
@@ -685,10 +685,10 @@ data:
   processor:
     train_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+      - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
         scale: 0.95
         p: 0.5
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+      - _target_: rlinf.data.aug.augmentation.VideoColorJitter
         brightness: 0.2
         contrast: 0.3
         saturation: 0.3
@@ -708,16 +708,16 @@ data:
   processor:
     train_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+      - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
         scale: 0.95
         p: 0.5
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+      - _target_: rlinf.data.aug.augmentation.VideoColorJitter
         brightness: 0.3
         contrast: 0.4
         saturation: 0.5
         hue: 0.08
         p: 0.9
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoGaussianNoise
+      - _target_: rlinf.data.aug.augmentation.VideoGaussianNoise
         std: 0.01
         p: 0.2
       - _target_: torchvision.transforms.Resize
@@ -807,7 +807,7 @@ def _instantiate_transforms(cfg_list):
     
     # 预设模式
     if isinstance(cfg_list, str):
-        from rlinf.data.datasets.fastwam.augmentation import AugmentationPreset
+        from rlinf.data.aug.augmentation import AugmentationPreset
         return AugmentationPreset.get(cfg_list)
     
     # dict 模式（按相机 key 分配）
@@ -836,7 +836,7 @@ def build_fastwam_sft_dataloader(cfg, world_size, rank, data_paths, eval_dataset
     # 在 ToTensor 之后、Resize 之前插入预设增强
     aug_preset = processor_cfg.get("augmentation_preset", None)
     if aug_preset and isinstance(train_transforms_obj, list) and not eval_dataset:
-        from rlinf.data.datasets.fastwam.augmentation import AugmentationPreset
+        from rlinf.data.aug.augmentation import AugmentationPreset
         preset_transforms = AugmentationPreset.get(aug_preset)
         if preset_transforms:
             # 找到第一个 Resize 的位置，在其前面插入增强
@@ -1102,9 +1102,9 @@ def test_augmented_dataloader_e2e():
                 # 带增强的 train_transforms
                 "train_transforms": [
                     {"_target_": "fastwam.datasets.lerobot.transforms.image.ToTensor"},
-                    {"_target_": "rlinf.data.datasets.fastwam.augmentation.VideoColorJitter",
+                    {"_target_": "rlinf.data.aug.augmentation.VideoColorJitter",
                      "brightness": 0.3, "contrast": 0.4, "saturation": 0.5, "hue": 0.08},
-                    {"_target_": "rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop",
+                    {"_target_": "rlinf.data.aug.augmentation.VideoRandomCrop",
                      "scale": 0.95, "p": 0.5},
                     {"_target_": "torchvision.transforms.Resize", "size": [240, 320]},
                 ],
@@ -1338,7 +1338,7 @@ T17 None input: PASS
 
 **测试 A**：`augmentation_preset: "medium"` 模式 — 通过 `build_fastwam_sft_dataloader` 加载 R1 Pro 真实数据，预设增强自动注入，输出 `video shape=[1, 3, 9, 384, 320]`，值域 `[-1.0, 1.0]`。
 
-**测试 B**：直接 `_target_` 模式 — 在 YAML 的 `train_transforms` 列表中直接写 `rlinf.data.datasets.fastwam.augmentation.VideoColorJitter` 和 `VideoRandomCrop`，通过 `build_fastwam_sft_dataloader` 实例化并加载数据，输出正确。
+**测试 B**：直接 `_target_` 模式 — 在 YAML 的 `train_transforms` 列表中直接写 `rlinf.data.aug.augmentation.VideoColorJitter` 和 `VideoRandomCrop`，通过 `build_fastwam_sft_dataloader` 实例化并加载数据，输出正确。
 
 #### 可视化测试
 

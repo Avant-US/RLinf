@@ -82,16 +82,16 @@ data:
     train_transforms:
       head_rgb:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+        - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
           p: 0.3
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+        - _target_: rlinf.data.aug.augmentation.VideoRandomErasing
           scale: [0.01, 0.01]
           p: 0.3
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomRotation
+        - _target_: rlinf.data.aug.augmentation.VideoRandomRotation
           p: 0.2
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           # ws_client head_rgb: less yellow -> stronger cool hue + lower saturation
           # cursor auto
           # brightness: [1.12, 1.16]
@@ -117,14 +117,14 @@ data:
           saturation: [0.5, 1.0]
           hue: [-0.1, 0.04]
           p: 0.8
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomHorizontalLinePerFrame
+        - _target_: rlinf.data.aug.augmentation.VideoRandomHorizontalLinePerFrame
           p_line: 0.7
           length_frac_range: [0.3, 0.7]
           row_range: [0.1, 0.4]
           p: 0.7
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+        - _target_: rlinf.data.aug.augmentation.VideoRandomGrayscale
           p: 0.15                    # head 是彩色的，适度灰度化减少颜色依赖
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomFisheye
+        - _target_: rlinf.data.aug.augmentation.VideoRandomFisheye
           k_range: [0.10, 0.18]
           center_jitter: 0.05
           p: 0.15                    # 镜头畸变鲁棒性
@@ -132,38 +132,38 @@ data:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 1.08
           contrast: 1.02
           saturation: 0.88
           hue: 0.07
           p: 0.6
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+        - _target_: rlinf.data.aug.augmentation.VideoRandomGrayscale
           p: 0.2                     # 强制灰度化，确保彩色 wrist 也能处理
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoGaussianNoise
+        - _target_: rlinf.data.aug.augmentation.VideoGaussianNoise
           std: 0.01
           per_frame: false
           p: 0.2                     # 弥补 saturation/hue 无效的增强缺口
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+        - _target_: rlinf.data.aug.augmentation.VideoRandomErasing
           scale: [0.02, 0.08]
           p: 0.2                     # 近距离抓取遮挡鲁棒性
       right_wrist_rgb:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 1.08
           contrast: 1.02
           saturation: 0.88
           hue: 0.07
           p: 0.6
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+        - _target_: rlinf.data.aug.augmentation.VideoRandomGrayscale
           p: 0.2                     # 强制灰度化，确保彩色 wrist 也能处理
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoGaussianNoise
+        - _target_: rlinf.data.aug.augmentation.VideoGaussianNoise
           std: 0.01
           per_frame: false
           p: 0.2                     # 弥补 saturation/hue 无效的增强缺口
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+        - _target_: rlinf.data.aug.augmentation.VideoRandomErasing
           scale: [0.02, 0.08]
           p: 0.2                     # 近距离抓取遮挡鲁棒性
     val_transforms:

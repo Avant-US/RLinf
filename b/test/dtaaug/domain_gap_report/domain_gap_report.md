@@ -487,25 +487,25 @@ wrist_image = wrist_to_gray(wrist_image)  # [T, 3, H, W] → [T, 3, H, W]，R=G=
     train_transforms:
       head_rgb:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+        - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
           p: 0.3
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+        - _target_: rlinf.data.aug.augmentation.VideoRandomErasing
           scale: [0.01, 0.01]
           p: 0.3
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomRotation
+        - _target_: rlinf.data.aug.augmentation.VideoRandomRotation
           p: 0.3
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 0.3
           contrast: 0.4
           saturation: 0.5
           hue: 0.08
           p: 0.8
         # ---- 新增 ----
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+        - _target_: rlinf.data.aug.augmentation.VideoRandomGrayscale
           p: 0.15                    # head 是彩色的，适度灰度化减少颜色依赖
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomFisheye
+        - _target_: rlinf.data.aug.augmentation.VideoRandomFisheye
           k_range: [0.10, 0.35]
           center_jitter: 0.05
           p: 0.15                    # 镜头畸变鲁棒性
@@ -514,20 +514,20 @@ wrist_image = wrist_to_gray(wrist_image)  # [T, 3, H, W] → [T, 3, H, W]，R=G=
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 0.3
           contrast: 0.4
           saturation: 0.5           # 对灰度无效，但保留：万一未来用彩色 wrist 数据
           hue: 0.08
           p: 0.8
         # ---- 新增 ----
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+        - _target_: rlinf.data.aug.augmentation.VideoRandomGrayscale
           p: 0.2                     # 强制灰度化，确保彩色 wrist 也能处理
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoGaussianNoise
+        - _target_: rlinf.data.aug.augmentation.VideoGaussianNoise
           std_range: [0.01, 0.05]
           per_frame: false
           p: 0.3                     # 弥补 saturation/hue 无效的增强缺口
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+        - _target_: rlinf.data.aug.augmentation.VideoRandomErasing
           scale: [0.02, 0.08]
           p: 0.2                     # 近距离抓取遮挡鲁棒性
 
@@ -535,20 +535,20 @@ wrist_image = wrist_to_gray(wrist_image)  # [T, 3, H, W] → [T, 3, H, W]，R=G=
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 0.3
           contrast: 0.4
           saturation: 0.5
           hue: 0.08
           p: 0.8
         # ---- 新增（与 left_wrist 对称） ----
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomGrayscale
+        - _target_: rlinf.data.aug.augmentation.VideoRandomGrayscale
           p: 0.2
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoGaussianNoise
+        - _target_: rlinf.data.aug.augmentation.VideoGaussianNoise
           std_range: [0.01, 0.05]
           per_frame: false
           p: 0.3
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+        - _target_: rlinf.data.aug.augmentation.VideoRandomErasing
           scale: [0.02, 0.08]
           p: 0.2
 ```
@@ -677,11 +677,11 @@ YAML 配置：
 ```yaml
 processor:
   proprio_augmentations:
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
       offset_range: 0.02
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       p: 0.5
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomScale
       scale_range: 0.05
       exclude_dims: [14, 15, 16, 17, 18, 19, 22]
       p: 0.3
@@ -1166,15 +1166,15 @@ class FastWAMProcessor(BaseProcessor):
 processor:
   # ... 现有配置 ...
   proprio_augmentations:
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
       offset_range: 0.02          # ±0.02 rad ≈ ±1.1° 关节零位漂移
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]  # 只对 arm joints
       p: 0.5
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomScale
       scale_range: 0.05           # ±5% 增益差异
       exclude_dims: [14, 15, 16, 17, 18, 19, 22]           # 只对 arm + chassis_vel
       p: 0.3
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomDeadzone
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomDeadzone
       deadzone_max: 0.005         # 最大死区 0.005 rad
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       p: 0.2
@@ -1246,7 +1246,7 @@ Scale 模拟的是**执行端差异**（齿轮/摩擦），state 是传感器读
 # 1. 单元测试：验证各增强类的输出形状和值域
 python -c "
 import torch
-from rlinf.data.datasets.fastwam.augmentation import (
+from rlinf.data.aug.augmentation import (
     ProprioRandomOffset, ProprioRandomScale, ProprioRandomDeadzone
 )
 
@@ -1507,7 +1507,7 @@ respect_pad 过滤后:   [False, False, True, False, ..., False]
 ```yaml
 processor:
   proprio_augmentations:
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
       offset_range: 0.03          # 初始位姿偏差可以大一些
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices:
@@ -1521,20 +1521,20 @@ processor:
 processor:
   proprio_augmentations:
     # 1. 全帧零位漂移（小幅度）
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
       offset_range: 0.01
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices: "all"
       p: 0.5
     # 2. 初始 2 帧额外位姿抖动（大幅度）
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
       offset_range: 0.05
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices:
         first_n: 2
       p: 0.3
     # 3. 全帧执行器增益差异
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomScale
       scale_range: 0.05
       exclude_dims: [14, 15, 16, 17, 18, 19, 22]
       frame_indices: "all"
@@ -1544,7 +1544,7 @@ processor:
 **场景 C：只在 episode 末尾 3 帧加死区（模拟减速阶段间隙更明显）**
 
 ```yaml
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomDeadzone
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomDeadzone
       deadzone_max: 0.008
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices:
@@ -1989,7 +1989,7 @@ ProprioRandomNoise + {"random_n": 3}:
 ```yaml
 processor:
   proprio_augmentations:
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomNoise
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomNoise
       noise_std: 0.008              # 高斯噪声标准差
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices:
@@ -2001,7 +2001,7 @@ processor:
 **场景 E：随机 20% 帧通信丢帧（只扰动 action，共享 offset）**
 
 ```yaml
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
       offset_range: 0.015
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices:
@@ -2016,20 +2016,20 @@ processor:
 processor:
   proprio_augmentations:
     # 1. 全帧零位漂移
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
       offset_range: 0.01
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices: "all"
       p: 0.5
     # 2. 初始 2 帧位姿抖动
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
       offset_range: 0.05
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices:
         first_n: 2
       p: 0.3
     # 3. 随机帧传感器噪声（只 state）
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomNoise
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomNoise
       noise_std: 0.008
       exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
       frame_indices:
@@ -2037,7 +2037,7 @@ processor:
       augment_target: "state"
       p: 0.4
     # 4. 全帧执行器增益差异
-    - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale
+    - _target_: rlinf.data.aug.augmentation.ProprioRandomScale
       scale_range: 0.05
       exclude_dims: [14, 15, 16, 17, 18, 19, 22]
       frame_indices: "all"
@@ -2224,7 +2224,7 @@ import pytest
 import torch
 from copy import deepcopy
 
-from rlinf.data.datasets.fastwam.augmentation import (
+from rlinf.data.aug.augmentation import (
     ProprioAugmentation,
     ProprioRandomOffset,
     ProprioRandomScale,
@@ -2937,26 +2937,26 @@ def test_t37_yaml_instantiation():
     """
     configs = [
         {
-            "_target_": "rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset",
+            "_target_": "rlinf.data.aug.augmentation.ProprioRandomOffset",
             "offset_range": 0.02,
             "exclude_dims": [14, 15, 16, 17, 18, 19, 20, 21, 22],
             "p": 0.5,
             "frame_indices": "all",
         },
         {
-            "_target_": "rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale",
+            "_target_": "rlinf.data.aug.augmentation.ProprioRandomScale",
             "scale_range": 0.05,
             "exclude_dims": [14, 15, 16, 17, 18, 19, 22],
             "p": 0.3,
         },
         {
-            "_target_": "rlinf.data.datasets.fastwam.augmentation.ProprioRandomDeadzone",
+            "_target_": "rlinf.data.aug.augmentation.ProprioRandomDeadzone",
             "deadzone_max": 0.005,
             "exclude_dims": [14, 15, 16, 17, 18, 19, 20, 21, 22],
             "p": 0.2,
         },
         {
-            "_target_": "rlinf.data.datasets.fastwam.augmentation.ProprioRandomNoise",
+            "_target_": "rlinf.data.aug.augmentation.ProprioRandomNoise",
             "noise_std": 0.008,
             "exclude_dims": [14, 15, 16, 17, 18, 19, 20, 21, 22],
             "frame_indices": {"random_n": 5},
@@ -2966,10 +2966,10 @@ def test_t37_yaml_instantiation():
     ]
 
     class_map = {
-        "rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset": ProprioRandomOffset,
-        "rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale": ProprioRandomScale,
-        "rlinf.data.datasets.fastwam.augmentation.ProprioRandomDeadzone": ProprioRandomDeadzone,
-        "rlinf.data.datasets.fastwam.augmentation.ProprioRandomNoise": ProprioRandomNoise,
+        "rlinf.data.aug.augmentation.ProprioRandomOffset": ProprioRandomOffset,
+        "rlinf.data.aug.augmentation.ProprioRandomScale": ProprioRandomScale,
+        "rlinf.data.aug.augmentation.ProprioRandomDeadzone": ProprioRandomDeadzone,
+        "rlinf.data.aug.augmentation.ProprioRandomNoise": ProprioRandomNoise,
     }
 
     instances = []
@@ -3103,7 +3103,7 @@ pytest tests/unit_tests/test_proprio_augmentation.py -v -s -k "t17 or t18 or t19
 pytest tests/unit_tests/test_proprio_augmentation.py -v -s -k "t35 or t36 or t37"
 
 # 生成覆盖率报告 (需要 pytest-cov)
-pytest tests/unit_tests/test_proprio_augmentation.py -v --cov=rlinf.data.datasets.fastwam.augmentation --cov-report=term-missing
+pytest tests/unit_tests/test_proprio_augmentation.py -v --cov=rlinf.data.aug.augmentation --cov-report=term-missing
 ```
 
 #### 9.9.5 预期结果
@@ -3409,7 +3409,7 @@ processor = FastWAMProcessor(
 flowchart TD
     YAML["YAML 配置项:<br/>_target_: rlinf...ProprioRandomOffset<br/>offset_range: 0.02<br/>exclude_dims: [14, 15]<br/>p: 0.5"]
     MI["_manual_instantiate(cfg_dict)"]
-    POP["target = cfg.pop('_target_')<br/>→ 'rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset'"]
+    POP["target = cfg.pop('_target_')<br/>→ 'rlinf.data.aug.augmentation.ProprioRandomOffset'"]
     IMP["importlib.import_module(module_path)<br/>cls = getattr(mod, 'ProprioRandomOffset')"]
     INST["cls(offset_range=0.02, exclude_dims=[14,15], p=0.5)"]
     OBJ["ProprioRandomOffset 实例"]
@@ -3550,25 +3550,25 @@ data:
   processor:
     # ... 已有的 norm_default_mode, action_state_transforms 等 ...
     proprio_augmentations:
-      - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomOffset
+      - _target_: rlinf.data.aug.augmentation.ProprioRandomOffset
         offset_range: 0.02
         exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
         frame_indices: "all"
         p: 0.5
 
-      - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomScale
+      - _target_: rlinf.data.aug.augmentation.ProprioRandomScale
         scale_range: 0.05
         exclude_dims: [14, 15, 16, 17, 18, 19, 22]
         frame_indices: "all"
         p: 0.3
 
-      - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomDeadzone
+      - _target_: rlinf.data.aug.augmentation.ProprioRandomDeadzone
         deadzone_max: 0.005
         exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
         frame_indices: "all"
         p: 0.2
 
-      - _target_: rlinf.data.datasets.fastwam.augmentation.ProprioRandomNoise
+      - _target_: rlinf.data.aug.augmentation.ProprioRandomNoise
         noise_std: 0.008
         exclude_dims: [14, 15, 16, 17, 18, 19, 20, 21, 22]
         frame_indices:

@@ -293,16 +293,16 @@ data:
   processor:
     train_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+      - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
         scale: 0.95
         p: 0.5
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+      - _target_: rlinf.data.aug.augmentation.VideoColorJitter
         brightness: 0.25
         contrast: 0.35
         saturation: 0.35
         hue: 0.06
         p: 0.85
-      - _target_: rlinf.data.datasets.fastwam.augmentation.VideoGaussianNoise
+      - _target_: rlinf.data.aug.augmentation.VideoGaussianNoise
         std: 0.015
         per_frame: false
         p: 0.25

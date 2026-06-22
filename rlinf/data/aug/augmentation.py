@@ -1,4 +1,4 @@
-"""Video data augmentation transforms for FastWAM SFT training.
+"""Video data augmentation transforms for training.
 
 All transforms accept [T, C, H, W] float32 tensors in [0, 1] range
 and return tensors with the same dtype and value range.

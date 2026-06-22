@@ -81,16 +81,16 @@ data:
     train_transforms:
       head_rgb:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+        - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
           p: 0.3
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomErasing
+        - _target_: rlinf.data.aug.augmentation.VideoRandomErasing
           scale: [0.01, 0.01]
           p: 0.3
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomRotation
+        - _target_: rlinf.data.aug.augmentation.VideoRandomRotation
           p: 0.3
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           # ws_client head_rgb: less yellow -> stronger cool hue + lower saturation
           # brightness: [1.12, 1.16]
           # contrast: [0.84, 0.89]
@@ -112,7 +112,7 @@ data:
           saturation: 0.5
           hue: 0.08
           p: 0.8
-        # - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomHorizontalLinePerFrame
+        # - _target_: rlinf.data.aug.augmentation.VideoRandomHorizontalLinePerFrame
         #   p_line: 0.7
         #   length_frac_range: [0.3, 0.7]
         #   row_range: [0.1, 0.4]
@@ -121,7 +121,7 @@ data:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 0.3
           contrast: 0.4
           saturation: 0.5
@@ -131,7 +131,7 @@ data:
         - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
         - _target_: torchvision.transforms.Resize
           size: [240, 320]
-        - _target_: rlinf.data.datasets.fastwam.augmentation.VideoColorJitter
+        - _target_: rlinf.data.aug.augmentation.VideoColorJitter
           brightness: 0.3
           contrast: 0.4
           saturation: 0.5

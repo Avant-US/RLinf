@@ -210,7 +210,8 @@ def load_sample(data_dir, fastwam_root, sample_idx=0):
                     "raw_shape": 23, "shape": 23}],
     }
 
-    from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
+    from rlinf.data.datasets.fastwam.processor import build_proprio_aug_processor_cls
+    FastWAMProcessor = build_proprio_aug_processor_cls()
     from fastwam.datasets.lerobot.transforms.action_state_merger import ConcatLeftAlign
 
     processor = FastWAMProcessor(

@@ -770,7 +770,7 @@ train_transforms:
     - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
     - _target_: torchvision.transforms.CenterCrop
       size: [1080, 1440]     # 1080 × (1080 × 4/3) = 1080 × 1440，裁掉两侧各 240 像素
-    - _target_: rlinf.data.datasets.fastwam.augmentation.VideoRandomCrop
+    - _target_: rlinf.data.aug.augmentation.VideoRandomCrop
       p: 0.3
     - _target_: torchvision.transforms.Resize
       size: [240, 320]       # 现在是 4:3 → 4:3，无拉伸
