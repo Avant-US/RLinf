@@ -1,0 +1,38 @@
+model_type: "openpi_au"
+
+model_path: "/path/to/model/openpi"
+precision: null
+
+num_action_chunks: 10
+action_dim: 7
+
+is_lora: False
+lora_rank: 32
+
+use_proprio: True
+num_steps: 5
+add_value_head: False
+
+faithful_augmentation: true
+
+# §9.3 mixed precision: keep fp32 master weights, let FSDP do bf16 compute.
+# precision stays null so torch_dtype_from_precision does not over-cast.
+fp32_master_weights: true
+# §9.6 keep activation recomputation in sft_forward to enlarge effective batch.
+sft_gradient_checkpointing: true
+
+openpi:
+  config_name: "pi05_libero"
+  num_images_in_input: 2
+  noise_level: 0.5
+  action_chunk: ${actor.model.num_action_chunks}
+  num_steps: ${actor.model.num_steps}
+  train_expert_only: True
+  action_env_dim: ${actor.model.action_dim}
+  noise_method: "flow_sde"
+  add_value_head: ${actor.model.add_value_head}
+  value_after_vlm: False
+  value_vlm_mode: "mean_token"
+  detach_critic_input: null
+  faithful_augmentation: ${actor.model.faithful_augmentation}
+  sft_gradient_checkpointing: ${actor.model.sft_gradient_checkpointing}

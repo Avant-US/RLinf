@@ -104,7 +104,7 @@ gcloud artifacts repositories create "${AR_REPO}" \
   --description="Mirror of RLinf images"
 ```
 
-### 3.2 使用 Cloud Build 在云端完成直拷
+### 3.2 使用 Cloud Build 在云端完成直拷(Optional 建议本地build后push)
 我们提供 `cloudbuild_mirror_image.yaml` 配置文件，在云端使用 `gcrane` 复制镜像。由于无需拉取到本地再推送，即使是 20GB+ 的超大镜像，速度也极快且 100% 成功。
 
 文件内容（`b/gcp/demo2/cloudbuild_mirror_image.yaml`）：

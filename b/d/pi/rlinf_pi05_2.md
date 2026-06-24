@@ -1,6 +1,8 @@
-# RLinf 复现 openpi π₀.₅ SFT 的深度分析与扩展方案
+# RLinf 复现 openpi π₀.₅ SFT 的深度分析与扩展方案（v2 · `openpi_au` 零侵入隔离版）
 
 > **摘要**：本文以"将 Physical Intelligence 的 openpi π₀.₅ 监督微调（SFT / Flow-Matching 行为克隆）忠实复现到 RLinf 框架"为核心命题，对两套实现进行从静态结构到动态流程、从数学原理到工程实现的系统性对比。我们首先澄清一个常被混淆的关键前提：**openpi 的 π₀.₅ 训练本质是监督式流匹配（Behavior Cloning），而 RLinf 的 π₀.₅ 训练栈天然偏向 PPO/GRPO 在线强化学习**。本文聚焦于二者的 **SFT 阶段**，逐项比对数据处理、前向（Forward）、反向（Backward）与训练技巧，定位所有可能影响"训练指标与最终成功率"的差异，并给出一套**以扩展为主、对 RLinf 现有代码改动最小**的 PyTorch 复现方案，目标是让 RLinf 训出的 π₀.₅ 基座质量"持平或超过"openpi JAX 版本。文中代码引用均指向真实源文件，数学公式以 LaTeX 给出，结构关系以 Mermaid 图呈现。
+>
+> **v2 修订要点（相对 v1）**：v1 的扩展方案直接在共享的 `rlinf/models/embodiment/openpi/` 目录内"原地修改"，会污染同时服务于 RL 路径的共享模块。**v2 改为"复制隔离"策略**：把整个 `rlinf/models/embodiment/openpi/` 复制为新包 `rlinf/models/embodiment/openpi_au/`（`au` = *aligned / augmented for openpi*），所有模型侧改动只发生在 `openpi_au/` 内；训练栈侧（EMA / LR / 混合精度 / 指标）改动通过**新增的 SFT worker 子类 `FSDPVlaSftWorkerAu` + 新入口脚本**承载。结果是**对 RLinf 既有文件零修改**（`openpi_au` 通过自注册接入），原 `openpi` 与 RL 路径完全不受影响。同时给出 **LIBERO 与 RoboTwin 两个 π₀.₅ SFT 示例配置**，可直接复现/超过 openpi 的 π₀.₅ 基座。
 
 ---
 
@@ -145,6 +147,8 @@ classDiagram
 ```
 
 > **关键观察**：π₀.₅ 的**前向计算图**（含 AdaRMS、双专家、流匹配损失）由 `PI0Pytorch` 提供，RLinf 与 openpi-PyTorch **逐行共享**。因此本文 §5（Forward）的 JAX↔PyTorch 差异，对 openpi-PyTorch 与 RLinf **同时成立**——这些差异是"openpi 自己的 JAX→PyTorch 移植债"，RLinf 只是继承了它。
+
+> **v2 隔离策略对静态结构的影响**：v2 不在原 `OpenPi0ForRLActionPrediction` 上原地改，而是把整个 `openpi/` 目录复制为 `openpi_au/`，在 `openpi_au/openpi_action_model.py` 中得到一个**同构的副本类**（仍 `class OpenPi0AuForRL...(PI0Pytorch, BasePolicy)`），只在其上叠加 SFT 复现所需的覆写（增强、AdaRMS bias、grad-ckpt 开关）。因此上面的类层次图对 `openpi_au` 同样成立——副本与原版共享 `PI0Pytorch` 计算图，差异仅在 `openpi_au` 内新增的 SFT 钩子。原 `openpi` 包**一字不改**，RL 路径（`model_type: openpi`）行为完全不变。
 
 ### 3.2 训练栈层：三者结构对照
 
@@ -683,20 +687,64 @@ flowchart TB
 
 ## 9. 扩展方案：在 RLinf 中复现 openpi π₀.₅ SFT
 
-### 9.0 设计总原则
+### 9.0 设计总原则（v2：复制隔离）
 
-1. **以扩展为主、最小改动**：新增独立模块（`rlinf/utils/ema.py`、`rlinf/data/aug/openpi_faithful_aug.py`），仅在 `FSDPSftWorker` / `FSDPModelManager` / `get_lr_scheduler` / `get_model` 等**已有钩子**上插入"加法"，且全部用 **config 开关**保护，缺省行为不变（向后兼容）。
-2. **挂在现有生命周期上**：EMA 挂 `setup_model_and_optimizer`（初始化）→ `run_training` 末尾（更新）→ `save_checkpoint`（导出）；LR/精度挂构建期；增强挂模型 `_preprocess_observation`（子类覆写）。
-3. **PyTorch 等价、而非搬运 JAX**：用 `torch` 重建 optax/Flax 的数值语义（warmup-cosine、fp32-master 混合精度、逐样本增强），并以**数值对齐测试**（§10）证明等价。
-4. **零改 openpi**：所有改动落在 `rlinf/`，openpi 作为只读依赖；增强、AdaRMS bias 等"openpi 移植债"通过**子类覆写 / 后置 re-init**注入。
+v2 在 v1 "以扩展为主、最小改动"的基础上更进一步，采用**复制隔离（copy-and-isolate）**，把"对共享 `openpi/` 目录的原地修改"彻底消除：
 
-> 下文代码为**设计骨架（落地蓝本）**，标注了对应的新增文件与"最小改动点"。
+1. **模型侧 = 复制目录**：把 `rlinf/models/embodiment/openpi/` 整目录复制为 `rlinf/models/embodiment/openpi_au/`，**所有模型侧改动只发生在 `openpi_au/` 内**。原 `openpi/`（同时服务 RL 路径）**一字不改**。
+2. **训练栈侧 = 子类 + 新入口**：EMA / openpi_cosine LR / 混合精度装配 / `param_norm` 等"训练循环"改动，通过**新增** SFT worker 子类 `FSDPVlaSftWorkerAu`（继承 `FSDPVlaSftWorker`，仅覆写少数方法）与**新增**入口脚本 `examples/sft/train_vla_sft_au.py` 承载，**不改** `FSDPSftWorker` / `FSDPModelManager` / `hybrid_engines/fsdp/utils.py` 等共享引擎文件。
+3. **自注册接入、零改注册表**：`openpi_au/__init__.py` 在导入时调用 `register_model("openpi_au", get_model, force=True)` **自注册**为新 `model_type`，因此**不需要**改 `rlinf/models/__init__.py`；新入口脚本顶部 `import ...openpi_au` 触发注册后再 `validate_cfg`。
+4. **config 开关 + PyTorch 等价**：所有新行为由 config 开关保护，缺省关闭；用 `torch` 重建 optax/Flax 的数值语义（warmup-cosine、fp32-master 混合精度、逐样本增强），以**数值对齐测试**（§10）证明等价。
+
+> **净效果**：对 RLinf **既有文件零修改**（仅新增 `openpi_au/` 包、一个 worker 子类文件、一个入口脚本、若干 example 配置）。`model_type: openpi`（RL）与 `model_type: openpi_au`（本文 SFT）**互不影响**，可并存。下文代码均为**落地蓝本骨架**。
+
+### 9.0.1 `openpi_au` 包：复制清单与修改清单
+
+```mermaid
+flowchart LR
+    subgraph SRC["rlinf/models/embodiment/openpi/ (原, 只读)"]
+        S1["__init__.py"]
+        S2["openpi_action_model.py"]
+        S3["dataconfig/* (libero/robotwin/...)"]
+        S4["policies/* (libero/aloha/...)"]
+    end
+    subgraph DST["rlinf/models/embodiment/openpi_au/ (复制 + 改)"]
+        D1["__init__.py ★改: 自注册 + 混合精度分支"]
+        D2["openpi_action_model.py ★改: _preprocess_observation/AdaRMS bias/grad-ckpt"]
+        D3["dataconfig/* (原样复制)"]
+        D4["policies/* (原样复制)"]
+        D5["ema.py ☆新增"]
+        D6["augmentation.py ☆新增"]
+    end
+    SRC -->|"cp -r"| DST
+```
+
+**复制（`cp -r`，原样保留，约 26 个文件）**：`dataconfig/`（`libero_dataconfig.py`、`robotwin_aloha_dataconfig.py`、`maniskill_dataconfig.py`、`__init__.py` 等）、`policies/`（`libero_policy.py`、`aloha_policy.py` 等）。这些**无需改动**——它们复用 openpi 原生 `get_openpi_config`/transforms，已与 openpi-JAX 对齐（§4）。
+
+**在 `openpi_au/` 内修改/新增（共 4 个文件）**：
+
+| 文件 | 性质 | 改动 | 小节 |
+| --- | --- | --- | --- |
+| `openpi_au/__init__.py` | 改 | ① 顶部 `register_model("openpi_au", get_model)` 自注册；② `get_model` 按 `precision==mixed_bf16` 跳过预 cast | §9.3 |
+| `openpi_au/openpi_action_model.py` | 改 | 覆写 `_preprocess_observation`（忠实增强）；`__init__` 末尾可选 zero-init AdaRMS bias；`sft_forward` 梯度检查点开关；新增 config 字段 | §9.4/§9.5/§9.6 |
+| `openpi_au/ema.py` | 新增 | `ModelEMA`（FSDP 分片友好） | §9.1 |
+| `openpi_au/augmentation.py` | 新增 | 逐样本、亮度感知忠实增强 | §9.4 |
+
+**`openpi_au/__init__.py` 自注册片段**（接在复制来的 `get_model` 定义之后）：
+
+```python
+# rlinf/models/embodiment/openpi_au/__init__.py 末尾新增
+from rlinf.models import register_model
+register_model("openpi_au", get_model, category="embodied", force=True)
+```
+
+> 这样配置里写 `actor.model.model_type: "openpi_au"` 即走本包；写 `"openpi"` 仍走原包。注册表 `rlinf/models/__init__.py` **无需改动**（自注册在 `openpi_au` 被 import 时生效，由新入口脚本触发）。
 
 ### 9.1 EMA（H1，最高优先级）
 
-**目标**：在 SFT 训练中维护衰减 0.999 的影子权重，并在保存/评估时切换到 EMA 权重（对齐 openpi `ema_decay=0.999` + 导出 EMA）。
+**目标**：在 SFT 训练中维护衰减 0.999 的影子权重，并在保存/评估时切换到 EMA 权重（对齐 openpi `ema_decay=0.999` + 导出 EMA）。**v2：通过新增 worker 子类承载，零改共享训练引擎。**
 
-**新增文件** `rlinf/utils/ema.py`：
+**新增文件** `rlinf/models/embodiment/openpi_au/ema.py`：
 
 ```python
 import torch
@@ -742,74 +790,91 @@ class ModelEMA:
         self.decay = sd["decay"]; self.shadow = sd["shadow"]
 ```
 
-**最小改动点（3 处）**：
-
-1. `rlinf/hybrid_engines/fsdp/fsdp_model_manager.py::setup_model_and_optimizer`（约 `:289` 之后）——初始化 EMA：
+**承载方式（v2：新增 worker 子类，零改共享文件）**：新增 `rlinf/workers/sft/fsdp_vla_sft_worker_au.py`，继承既有 `FSDPVlaSftWorker`，仅覆写 4 个方法把 EMA 挂到生命周期上：
 
 ```python
-ema_decay = self._cfg.optim.get("ema_decay", None)
-self.ema = ModelEMA(self.model, ema_decay) if ema_decay else None
-```
+# rlinf/workers/sft/fsdp_vla_sft_worker_au.py (新增, 全部为 override, 不改父类)
+import rlinf.models.embodiment.openpi_au  # noqa: F401 触发 openpi_au 自注册
+from rlinf.models.embodiment.openpi_au.ema import ModelEMA
+from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
 
-2. `rlinf/workers/sft/fsdp_sft_worker.py::run_training`（`:172` `optimizer_step()` 之后）——每步更新：
+class FSDPVlaSftWorkerAu(FSDPVlaSftWorker):
+    def init_worker(self):
+        super().init_worker()                       # 父类 setup_model_and_optimizer
+        decay = self.cfg.actor.optim.get("ema_decay", None)
+        self.ema = ModelEMA(self.model, decay) if decay else None
 
-```python
-grad_norm, lr_list = self.optimizer_step()
-if getattr(self, "ema", None) is not None:
-    self.ema.update(self.model)      # 仅在 step 成功后更新
-```
+    def run_training(self):
+        metrics = super().run_training()            # 复用父类完整训练步(梯度累积+optimizer_step)
+        if getattr(self, "ema", None) is not None:
+            self.ema.update(self.model)             # optimizer_step 之后逐步 EMA
+        return metrics
 
-3. `rlinf/workers/sft/fsdp_vla_sft_worker.py::save_checkpoint`（`:114`）——以 EMA 权重导出（复用既有的 `summon_full_params` 全量保存路径）：
-
-```python
-def save_checkpoint(self, save_path, step=0):
-    if getattr(self, "ema", None) is not None:
-        backup = self.ema.swap_in(self.model)     # 换入 EMA → 让既有保存逻辑写出 EMA 权重
-        try:
+    def save_checkpoint(self, save_path, step=0):
+        if getattr(self, "ema", None) is not None:
+            backup = self.ema.swap_in(self.model)   # 换入 EMA → 让父类保存逻辑写出 EMA 权重
+            try:
+                super().save_checkpoint(save_path, step)
+            finally:
+                self.ema.swap_out(self.model, backup)
+        else:
             super().save_checkpoint(save_path, step)
-        finally:
-            self.ema.swap_out(self.model, backup)  # 还原训练权重，继续训练
-        # 可选：另存一份训练权重到 .../raw/ 以便诊断
-    else:
-        super().save_checkpoint(save_path, step)
-    ...  # 既有的 data.pt / rng.pt 保存
+
+    def build_lr_scheduler(self, optimizer, optim_config):   # §9.2 openpi_cosine
+        return build_openpi_cosine_or_super(self, optimizer, optim_config)
 ```
 
-**配置开关**（`examples/sft/config/libero_sft_openpi_pi05.yaml` 新建时）：
+> 注：`run_training` 覆写采用"先调 `super().run_training()` 再 `ema.update`"的薄封装，**完全不动**父类内部的梯度累积/`optimizer_step`/`lr_scheduler.step` 逻辑。若希望严格"仅成功 step 才 EMA"，可让父类 `optimizer_step` 返回的 `grad_norm` 有限性透传后再决定是否 update（父类已对非有限 grad 跳过 step）。
+
+**新增入口脚本** `examples/sft/train_vla_sft_au.py`（复制 `train_vla_sft.py`，仅换 worker 类并 import 触发自注册）：
+
+```python
+import rlinf.models.embodiment.openpi_au   # noqa: F401 先自注册 openpi_au 再 validate_cfg
+from rlinf.workers.sft.fsdp_vla_sft_worker_au import FSDPVlaSftWorkerAu
+# ... 其余与 train_vla_sft.py 相同, 仅把 FSDPVlaSftWorker 换成 FSDPVlaSftWorkerAu
+actor_group = FSDPVlaSftWorkerAu.create_group(cfg).launch(cluster, name=..., placement_strategy=...)
+```
+
+**配置开关**（见 §9.9 的 `libero_sft_openpi_pi05_au.yaml`）：
 
 ```yaml
 optim:
   ema_decay: 0.999     # 对齐 openpi pi05_libero；为空则关闭(对齐 LoRA 配置)
 ```
 
-> 要点：EMA 是**逐元素**操作，对 FSDP 分片"天然可分"（每 rank EMA 本地 shard），保存时借助既有 `FSDP2.summon_full_params` + `full_tensor()`（`utils.py:491`）聚合为完整权重。resume 时把 `ema.state_dict()` 一并写入 checkpoint（`load_checkpoint` 对称恢复）。
+> 要点：EMA 是**逐元素**操作，对 FSDP 分片"天然可分"（每 rank EMA 本地 shard），保存时复用父类既有的 `FSDP2.summon_full_params` + `full_tensor()`（`utils.py:491`）聚合为完整权重。resume 时可在子类的 `save_checkpoint`/`load_checkpoint` 里把 `ema.state_dict()` 一并落盘/恢复。**整个 EMA 能力不触碰任何既有文件。**
 
 ### 9.2 学习率调度对齐（M2）
 
 **目标**：提供与 optax `warmup_cosine_decay_schedule` **数值等价**的调度，精确复现 `pi05_libero` 的"线性 warmup(init=peak/(warmup+1)→peak) + 余弦衰减(peak→decay_lr，跨 decay_steps)"，当 `decay_lr==peak` 即退化为 warmup-常数。
 
-**最小改动点**：在 `rlinf/hybrid_engines/fsdp/utils.py::get_lr_scheduler`（`:511`）新增分支 `"openpi_cosine"`：
+**承载方式（v2：worker_au 覆写 `build_lr_scheduler`，零改 `utils.py`）**：在 `fsdp_vla_sft_worker_au.py` 内提供独立的 `openpi_cosine` 构造函数（即 §9.1 引用的 `build_openpi_cosine_or_super`），仅当 `lr_scheduler == "openpi_cosine"` 时接管，否则回退父类 `build_lr_scheduler`：
 
 ```python
-elif lr_scheduler == "openpi_cosine":
-    import math
-    from torch.optim.lr_scheduler import LambdaLR
-    peak = optimizer.defaults["lr"]                 # 约定 optim.lr == peak_lr
-    end  = kwargs.get("decay_lr", peak)             # decay_lr==peak ⇒ warmup 后恒定
-    init = peak / (num_warmup_steps + 1)            # 与 optax init_value 一致
-    decay_steps = kwargs.get("decay_steps", num_training_steps)
+# rlinf/workers/sft/fsdp_vla_sft_worker_au.py 内
+import math
+from torch.optim.lr_scheduler import LambdaLR
+
+def build_openpi_cosine_or_super(worker, optimizer, optim_config):
+    if optim_config.get("lr_scheduler", None) != "openpi_cosine":
+        return FSDPVlaSftWorker.build_lr_scheduler(worker, optimizer, optim_config)  # 回退父类
+    peak = float(optim_config.lr)                         # 约定 optim.lr == peak_lr
+    end  = float(optim_config.get("decay_lr", peak))      # decay_lr==peak ⇒ warmup 后恒定
+    warmup = int(optim_config.get("lr_warmup_steps", 0))
+    init = peak / (warmup + 1)                            # 与 optax init_value 一致
+    decay_steps = int(optim_config.get("decay_steps", optim_config.get("total_training_steps")))
     def lr_lambda(step):
-        if step < num_warmup_steps:                 # 线性 warmup: init → peak
-            return (init + (peak - init) * step / max(1, num_warmup_steps)) / peak
+        if step < warmup:                                 # 线性 warmup: init → peak
+            return (init + (peak - init) * step / max(1, warmup)) / peak
         if step >= decay_steps:
             return end / peak
-        prog = (step - num_warmup_steps) / max(1, decay_steps - num_warmup_steps)
+        prog = (step - warmup) / max(1, decay_steps - warmup)
         cos  = end + 0.5 * (peak - end) * (1.0 + math.cos(math.pi * prog))
         return cos / peak
     return LambdaLR(optimizer, lr_lambda)
 ```
 
-`build_lr_scheduler`（`fsdp_model_manager.py:440`）只需把 `decay_lr`/`decay_steps` 透传给 `get_lr_scheduler`（从 `optim_config.get(...)` 读取）。
+> 该函数与 optax `warmup_cosine_decay_schedule` 数值等价；当 `decay_lr==peak` 时退化为"warmup-常数"（即 `pi05_libero` 形状）。**完全不触碰** `rlinf/hybrid_engines/fsdp/utils.py`，回退分支仍可用父类原有的 `constant`/`cosine`。
 
 **配置**（复现 `pi05_libero`）：
 
@@ -831,9 +896,9 @@ optim:
 
 **机理**：FSDP 的 `MixedPrecision(param_dtype, reduce_dtype, buffer_dtype)` 会在 all-gather 时把分片参数 cast 到 `param_dtype` 做前向/反向计算，但**底层分片参数与优化器状态保留其原始 dtype**。因此只要：(a) 不预先把模型 cast 成 bf16；(b) 设 `param_dtype=bf16, reduce_dtype=fp32`——即可得到 fp32 master + bf16 compute。
 
-**最小改动点（2 处）**：
+**改动点（2 处，均在 `openpi_au` 内 / 配置内）**：
 
-1. `rlinf/models/embodiment/openpi/__init__.py::get_model`（`:89`）——把无条件 cast 改为按精度模式：
+1. `rlinf/models/embodiment/openpi_au/__init__.py::get_model`（复制自 `openpi/__init__.py:89`）——把无条件 cast 改为按精度模式：
 
 ```python
 precision = getattr(cfg, "precision", None)
@@ -863,7 +928,7 @@ actor:
 
 **目标**：把 openpi-PyTorch 的"逐批次 + 等权灰度近似"增强，替换为 **逐样本 + 亮度感知（luminance）**增强，匹配 JAX `augmax` 的语义与多样性。
 
-**新增文件** `rlinf/data/aug/openpi_faithful_aug.py`（设计骨架，GPU 上批量、逐样本）：
+**新增文件** `rlinf/models/embodiment/openpi_au/augmentation.py`（设计骨架，GPU 上批量、逐样本；放在 `openpi_au/` 内以保持隔离）：
 
 ```python
 import torch
@@ -903,12 +968,12 @@ def faithful_augment(img_nchw: torch.Tensor, *, is_wrist: bool) -> torch.Tensor:
     return (x.clamp(0, 1) * 2 - 1)                                    # → [-1,1]
 ```
 
-**最小改动点（1 处，子类覆写，零改 openpi）**：在 `OpenPi0ForRLActionPrediction` 覆写 `_preprocess_observation`，**先 resize（复用 openpi，关闭其近似增强）、再逐样本忠实增强**（与 openpi `resize→augment` 顺序一致）：
+**改动点（1 处，`openpi_au` 内子类覆写，零改 openpi 与共享代码）**：在 `openpi_au/openpi_action_model.py` 的类上覆写 `_preprocess_observation`，**先 resize（复用 openpi-PyTorch 预处理，关闭其近似增强）、再逐样本忠实增强**（与 openpi `resize→augment` 顺序一致）：
 
 ```python
-# rlinf/models/embodiment/openpi/openpi_action_model.py 内新增覆写
+# rlinf/models/embodiment/openpi_au/openpi_action_model.py 内（副本类上新增覆写）
 import openpi.models_pytorch.preprocessing_pytorch as _prep
-from rlinf.data.aug.openpi_faithful_aug import faithful_augment
+from rlinf.models.embodiment.openpi_au.augmentation import faithful_augment
 
 def _preprocess_observation(self, observation, *, train=True):
     if not (train and getattr(self.config, "faithful_augmentation", False)):
@@ -931,7 +996,7 @@ def _preprocess_observation(self, observation, *, train=True):
 
 **目标**：当**从 PaliGemma-only 初始化、Action Expert 从零训练**时，恢复 AdaRMS 的"恒等启动"。**从 `pi05_base` 微调时不启用**（否则会清零已训练的 bias）。
 
-**最小改动点（1 处，后置 re-init）**：在 `OpenPi0ForRLActionPrediction.__init__` 末尾，按 config 开关执行：
+**改动点（1 处，后置 re-init，在 `openpi_au` 副本类内）**：在 `openpi_au/openpi_action_model.py` 副本类的 `__init__` 末尾，按 config 开关执行：
 
 ```python
 if getattr(config, "zero_init_adarms_bias", False):
@@ -945,9 +1010,9 @@ if getattr(config, "zero_init_adarms_bias", False):
 
 ### 9.6 梯度检查点 → 放大有效 batch（M3）
 
-**现状**：`sft_forward` 起手就 `self.gradient_checkpointing_disable()`（`openpi_action_model.py:329`），且 SFT yaml 注释"openpi 不支持"。但 `PI0Pytorch` **本身实现了** `gradient_checkpointing_enable()`（`pi0_pytorch.py:127`），其 `forward` 用 `_apply_checkpoint` 包裹各计算块。
+**现状**：`sft_forward` 起手就 `self.gradient_checkpointing_disable()`（`openpi/openpi_action_model.py:329`），且 SFT yaml 注释"openpi 不支持"。但 `PI0Pytorch` **本身实现了** `gradient_checkpointing_enable()`（`pi0_pytorch.py:127`），其 `forward` 用 `_apply_checkpoint` 包裹各计算块。
 
-**最小改动点（1 处，加开关）**：把 `sft_forward` 中的无条件禁用改为按配置：
+**改动点（1 处，加开关，在 `openpi_au` 副本类的 `sft_forward` 内）**：把无条件禁用改为按配置：
 
 ```python
 def sft_forward(self, data, use_action_chunk_loss=False, **kwargs):
@@ -980,85 +1045,193 @@ python rlinf/utils/ckpt_convertor/convert_openpi_jax_to_python.py \
 
 ### 9.8 训练指标补全（L3）
 
-在 `FSDPSftWorker.run_training` 的指标里补 `param_norm`（对齐 openpi `train.py:188`），便于与官方曲线对比诊断：
+在 §9.1 的 `FSDPVlaSftWorkerAu.run_training` 覆写里补 `param_norm`（对齐 openpi `train.py:188`），便于与官方曲线对比诊断（**零改父类**）：
 
 ```python
-with torch.no_grad():
-    pnorm = torch.norm(torch.stack([
-        p.detach().float().norm() for p in self.model.parameters() if p.requires_grad
-    ]))
-append_to_dict(metrics, {"param_norm": float(pnorm)})
+def run_training(self):                      # §9.1 的覆写中合并 param_norm
+    metrics = super().run_training()
+    if getattr(self, "ema", None) is not None:
+        self.ema.update(self.model)
+    with torch.no_grad():
+        pnorm = torch.norm(torch.stack([
+            p.detach().float().norm() for p in self.model.parameters() if p.requires_grad
+        ]))
+    metrics["param_norm"] = float(pnorm)     # super() 返回的是已 all-reduce 的 dict
+    return metrics
 ```
 
 （FSDP 下为本地 shard 范数，可按需 all-reduce 求全局范数。）
 
-### 9.9 改动汇总：新增文件 + 最小改动点 + 复现配置
+### 9.9 改动汇总（v2：仅新增文件，对现有文件零修改）+ libero/robotwin 复现配置
 
-**新增文件（2 个，纯加法）**：
+**核心卖点**：v2 把 v1 的"6 处现有文件改动"全部转化为**新增文件**——原 `openpi/` 与共享训练引擎**一字不改**。
 
-| 文件 | 作用 |
-| --- | --- |
-| `rlinf/utils/ema.py` | `ModelEMA`（FSDP 分片友好的 EMA + swap_in/out） |
-| `rlinf/data/aug/openpi_faithful_aug.py` | 逐样本、亮度感知的忠实增强 |
+**新增文件清单（全部为加法）**：
 
-**对现有文件的最小改动点（均为 config 保护的加法）**：
-
-| 文件 | 改动 | 对应差异 |
+| 文件 | 性质 | 作用 |
 | --- | --- | --- |
-| `rlinf/hybrid_engines/fsdp/fsdp_model_manager.py` | `setup_model_and_optimizer` 初始化 `self.ema`；`build_lr_scheduler` 透传 `decay_lr/decay_steps` | EMA / LR |
-| `rlinf/workers/sft/fsdp_sft_worker.py` | `run_training` 末尾 `ema.update`；补 `param_norm` | EMA / 指标 |
-| `rlinf/workers/sft/fsdp_vla_sft_worker.py` | `save_checkpoint` swap 到 EMA 权重导出 | EMA |
-| `rlinf/hybrid_engines/fsdp/utils.py` | `get_lr_scheduler` 新增 `openpi_cosine` | LR |
-| `rlinf/models/embodiment/openpi/__init__.py` | `get_model` 按 `precision==mixed_bf16` 跳过预 cast | 混合精度 |
-| `rlinf/models/embodiment/openpi/openpi_action_model.py` | 覆写 `_preprocess_observation`（忠实增强）；`__init__` 末尾可选 zero-init AdaRMS bias；`sft_forward` 梯度检查点开关 | 增强 / AdaRMS / grad-ckpt |
+| `rlinf/models/embodiment/openpi_au/` | 复制 `openpi/` | 整目录副本；其中 4 个文件改/增（见 §9.0.1） |
+| └ `openpi_au/__init__.py` | 复制+改 | 自注册 `openpi_au` + 混合精度分支（§9.3） |
+| └ `openpi_au/openpi_action_model.py` | 复制+改 | 忠实增强覆写 / AdaRMS bias / grad-ckpt 开关（§9.4–9.6） |
+| └ `openpi_au/ema.py` | 新增 | `ModelEMA`（§9.1） |
+| └ `openpi_au/augmentation.py` | 新增 | 逐样本、亮度感知忠实增强（§9.4） |
+| └ `openpi_au/dataconfig/*`、`openpi_au/policies/*` | 复制 | 原样，无改动 |
+| `rlinf/workers/sft/fsdp_vla_sft_worker_au.py` | 新增 | `FSDPVlaSftWorkerAu`：EMA / openpi_cosine / param_norm（§9.1/9.2/9.8） |
+| `examples/sft/train_vla_sft_au.py` | 新增 | 入口：import openpi_au 自注册 + 用 `FSDPVlaSftWorkerAu` |
+| `examples/sft/config/model/pi0_5_au.yaml` | 新增 | 模型默认：`model_type: openpi_au` + SFT 复现开关 |
+| `examples/sft/config/libero_sft_openpi_pi05_au.yaml` | 新增 | **LIBERO** π₀.₅ SFT 例子 |
+| `examples/sft/config/robotwin_sft_openpi_pi05_au.yaml` | 新增 | **RoboTwin** π₀.₅ SFT 例子 |
 
-**复现 `pi05_libero` SFT 的完整配置示例** `examples/sft/config/libero_sft_openpi_pi05.yaml`（新建）：
+**对现有文件的修改：无。** （`openpi_au` 通过 `register_model("openpi_au", ...)` 自注册接入；`model_type: openpi` 的 RL 路径与原 `openpi/` 包行为完全不变。）
+
+**模型默认** `examples/sft/config/model/pi0_5_au.yaml`（基于 `model/pi0_5.yaml`，仅换 `model_type` 并加开关）：
+
+```yaml
+model_type: "openpi_au"                # ★ 改为 openpi_au（其余沿用 pi0_5.yaml）
+model_path: "/path/to/model/openpi"
+precision: "mixed_bf16"                 # §9.3（原 pi0_5.yaml 为 null）
+num_action_chunks: 10
+action_dim: 7
+is_lora: False
+lora_rank: 32
+use_proprio: True
+num_steps: 5
+add_value_head: False
+openpi:
+  config_name: "pi05_libero"
+  num_images_in_input: 2
+  noise_level: 0.5
+  action_chunk: ${actor.model.num_action_chunks}
+  num_steps: ${actor.model.num_steps}
+  train_expert_only: False             # SFT 复现 openpi 全量微调 → False
+  action_env_dim: ${actor.model.action_dim}
+  noise_method: "flow_sde"
+  add_value_head: ${actor.model.add_value_head}
+  value_after_vlm: False
+  value_vlm_mode: "mean_token"
+  detach_critic_input: null
+  # ↓ openpi_au 新增 SFT 复现开关
+  faithful_augmentation: True          # §9.4 逐样本忠实增强
+  sft_gradient_checkpointing: True     # §9.6 放大 batch
+  zero_init_adarms_bias: False         # 从 pi05_base 微调 → 关；从零训练 → 开
+```
+
+#### 例子①：LIBERO — `examples/sft/config/libero_sft_openpi_pi05_au.yaml`
+
+复现 openpi-JAX `pi05_libero`（全量微调 / `action_horizon=10` / `discrete_state_input=False`）：
 
 ```yaml
 defaults:
-  - model/pi0_5@actor.model
+  - model/pi0_5_au@actor.model         # ★ 用 openpi_au 模型默认
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+runner:
+  task_type: sft
+  max_steps: 30000                      # = openpi num_train_steps
+  save_interval: 2000
+
+data:
+  train_data_paths: "physical-intelligence/libero"   # 同源 LeRobot
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 256                # 对齐 openpi(配合梯度累积/检查点)
+  model:
+    model_path: "<pi05_base_pt>"        # §9.7 由 convert_openpi_jax_to_python.py 转换
+    openpi:
+      config_name: "pi05_libero"
+      faithful_augmentation: True
+      sft_gradient_checkpointing: True
+      zero_init_adarms_bias: False
+  optim:
+    lr: 5.0e-5                          # = peak_lr
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    ema_decay: 0.999                    # §9.1（pi05_libero 用 0.999）
+    lr_scheduler: "openpi_cosine"       # §9.2 → warmup 后恒定
+    lr_warmup_steps: 10000
+    decay_steps: 1000000
+    decay_lr: 5.0e-5
+    total_training_steps: 30000
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    gradient_checkpointing: True        # §9.6
+    mixed_precision: {param_dtype: "bfloat16", reduce_dtype: "float32", buffer_dtype: "float32"}
+    grad_scaler: {enabled: false}
+```
+
+#### 例子②：RoboTwin — `examples/sft/config/robotwin_sft_openpi_pi05_au.yaml`
+
+RoboTwin（双臂 ALOHA，`pi05_aloha_robotwin`，`action_dim=14`、`action_horizon=50`、**离散状态开**、全量微调）。基于既有 `robotwin_sft_openpi_pi05.yaml`，叠加 EMA / 混合精度 / 忠实增强：
+
+```yaml
+defaults:
+  - model/pi0_5_au@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
 runner:
   task_type: sft
   max_steps: 30000
-  save_interval: 2000
+  save_interval: 5000
 
 data:
-  train_data_paths: "physical-intelligence/libero"     # 同源 LeRobot
+  train_data_paths: "/path/to/robotwin-data"   # RoboTwin LeRobot 数据集
 
 actor:
-  micro_batch_size: 8
-  global_batch_size: 256                                # 对齐 openpi(配合梯度累积/检查点)
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16
+  global_batch_size: 64
   model:
-    precision: "mixed_bf16"                             # §9.3
-    model_path: "<pi05_base_pt>"                        # §9.7 同源转换权重
+    model_path: "<pi05_robotwin_base_pt>"       # 同源转换权重(若有)
+    num_action_chunks: 50                        # RoboTwin chunk
+    action_dim: 14                               # 双臂 14 维
     openpi:
-      config_name: "pi05_libero"                        # action_horizon=10, discrete_state=False
-      faithful_augmentation: True                       # §9.4
-      sft_gradient_checkpointing: True                  # §9.6
-      zero_init_adarms_bias: False                      # 从 pi05_base 微调 → 关
+      config_name: "pi05_aloha_robotwin"        # discrete_state_input=True
+      num_images_in_input: 3                     # 顶视 + 双腕
+      train_expert_only: False                   # RoboTwin 官方训练为全量微调
+      faithful_augmentation: True                # §9.4
+      sft_gradient_checkpointing: True           # §9.6
+      zero_init_adarms_bias: False
   optim:
-    lr: 5.0e-5                                           # = peak_lr
+    lr: 2.5e-5                                   # RoboTwin 官方量级
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
     weight_decay: 1.0e-10
     clip_grad: 1.0
-    ema_decay: 0.999                                     # §9.1
-    lr_scheduler: "openpi_cosine"                        # §9.2
-    lr_warmup_steps: 10000
-    decay_steps: 1000000
-    decay_lr: 5.0e-5
+    ema_decay: 0.999                             # §9.1（pi05 全量微调建议开）
+    lr_scheduler: "cosine"                       # RoboTwin 用余弦衰减到 min_lr
+    lr_warmup_steps: 1000
+    num_cycles: 0.5
+    min_lr: 2.5e-6
     total_training_steps: 30000
   fsdp_config:
-    gradient_checkpointing: True                         # §9.6
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"                # 与既有 robotwin 配置一致
+    gradient_checkpointing: True
     mixed_precision: {param_dtype: "bfloat16", reduce_dtype: "float32", buffer_dtype: "float32"}
     grad_scaler: {enabled: false}
 ```
 
-> 该配置把 §8 的所有高/中优先级差异一次性补齐：EMA、忠实增强、混合精度、LR 形状、batch、同源起点。落地后，RLinf 的 PyTorch SFT 训练栈即与 openpi-JAX `pi05_libero` **逐项对齐**，并在混合精度/增强多样性上可能更优。
+**启动命令**（新入口脚本）：
+
+```bash
+# LIBERO π₀.₅ SFT
+python examples/sft/train_vla_sft_au.py --config-name libero_sft_openpi_pi05_au
+# RoboTwin π₀.₅ SFT
+python examples/sft/train_vla_sft_au.py --config-name robotwin_sft_openpi_pi05_au
+```
+
+> 两个配置都把 §8 的高/中优先级差异一次性补齐：EMA、忠实增强、混合精度、（LIBERO）warmup-常数 LR、batch、同源起点。LIBERO 严格对齐 openpi-JAX `pi05_libero`；RoboTwin 在 openpi 没有对应 JAX 命名配置时，对齐 RoboTwin 官方全量微调并叠加同一套 SFT 质量增强。**全部以新增文件实现，对 RLinf 既有代码零修改。**
 
 ## 10. 验证与复现协议
 
@@ -1117,8 +1290,8 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    C0["① 转换 pi05_base (JAX→PT) + 校验前向对齐(§10.1)"] --> C1["② 写 libero_sft_openpi_pi05.yaml(§9.9)"]
-    C1 --> C2["③ SFT 训练(EMA/混合精度/忠实增强/openpi_cosine, batch=256, 30k)"]
+    C0["① 复制 openpi→openpi_au + 转换 pi05_base(JAX→PT) + 校验前向对齐(§10.1)"] --> C1["② 写 libero/robotwin _sft_openpi_pi05_au.yaml(§9.9)"]
+    C1 --> C2["③ train_vla_sft_au.py 训练(EMA/混合精度/忠实增强/openpi_cosine, batch=256, 30k)"]
     C2 --> C3["④ 训练曲线对齐(§10.2)"]
     C3 --> C4["⑤ EMA 权重端到端评测(§10.3) ≥ 77.1%"]
     C4 --> C5["⑥ 消融(§10.4)确认各扩展贡献"]
@@ -1138,13 +1311,16 @@ flowchart TB
 | 梯度检查点 × RL 路径 | RL forward 可能与 ckpt 冲突 | 仅在 **SFT** 路径用 `sft_gradient_checkpointing` 开关，RL 路径保持原状 |
 | 转换器正确性 | JAX→PT 权重映射出错 | 用 §10.1 前向对齐做"金标准"回归测试 |
 | RLDS 数据 | PyTorch 路径不支持 RLDS | LIBERO/ManiSkill/RoboTwin 均为 LeRobot，不受影响；DROID 类需另行处理 |
-| 向后兼容 | 影响既有 RL/SFT 用户 | **全部加法均由 config 开关保护，缺省关闭**，不改变现有行为 |
+| 向后兼容 | 影响既有 RL/SFT 用户 | **v2 对现有文件零修改**：新增 `openpi_au` 包 + worker 子类 + 入口；`model_type: openpi` 完全不变 |
 | AdaRMS bias 清零误用 | 对 `pi05_base` 微调误清零 | `zero_init_adarms_bias` 缺省 False，仅"从零预训练"显式开启 |
+| openpi_au 与 openpi 漂移 | 副本与原版随上游更新分叉 | `openpi_au` 仅改 4 个文件，其余 `cp` 自原版；可写一个 diff 脚本定期核对副本与 `openpi/` 的非改动文件是否一致 |
+| 自注册时机 | `openpi_au` 未导入 → `model_type` 未注册 | 新入口脚本顶部 `import ...openpi_au` 在 `validate_cfg` 前触发；或在 `openpi_au/__init__.py` 顶层注册 |
 
 **工程注意**：
-- EMA/优化器状态需纳入 checkpoint（`save_checkpoint`/`load_checkpoint` 对称），保证断点续训时 EMA 不丢。
+- EMA/优化器状态需纳入 checkpoint（子类 `save_checkpoint`/`load_checkpoint` 对称），保证断点续训时 EMA 不丢。
 - `b2=0.95`、`wd=1e-10`、`clip=1.0` 已与 openpi 一致，**不要**改回 RLinf 其他任务的默认 `b2=0.999`/`wd=1e-2`。
 - 评测务必用 **EMA 权重**（openpi 的报告成绩即 EMA 权重）；用训练瞬时权重对比会系统性低估。
+- `openpi_au` 内复制的 `dataconfig/`、`policies/` 若引用了相对/包内导入，复制后需确认 import 路径指向 `openpi_au`（或保持引用 openpi 原生 transforms，二者皆可，因这些文件不改逻辑）。
 
 ## 12. 附录
 
@@ -1166,20 +1342,36 @@ flowchart TB
 | `src/openpi/models_pytorch/preprocessing_pytorch.py` | PyTorch 近似增强 |
 | `src/openpi/models_pytorch/.../gemma/modeling_gemma.py` | PyTorch AdaRMS（`:49`，bias 未零初始化） |
 
-**RLinf（`/home/physical/SRC/RL/RLinf`，待扩展）**
+**RLinf（`/home/physical/SRC/RL/RLinf`，原有 · 只读参考）**
 
 | 文件 | 核心内容 |
 | --- | --- |
-| `rlinf/models/embodiment/openpi/openpi_action_model.py` | `OpenPi0ForRLActionPrediction`、`sft_forward`（`:328`） |
-| `rlinf/models/embodiment/openpi/__init__.py` | `get_model`、`to_bfloat16_for_selected_params`（`:89`） |
+| `rlinf/models/embodiment/openpi/openpi_action_model.py` | `OpenPi0ForRLActionPrediction`、`sft_forward`（`:328`）——**原版，不改** |
+| `rlinf/models/embodiment/openpi/__init__.py` | `get_model`、`to_bfloat16_for_selected_params`（`:89`）——**原版，不改** |
 | `rlinf/models/embodiment/openpi/dataconfig/` | 各环境 DataConfig（quantile/离散状态/delta） |
-| `rlinf/workers/sft/fsdp_sft_worker.py` | SFT 训练主循环 `run_training`（`:135`） |
-| `rlinf/workers/sft/fsdp_vla_sft_worker.py` | VLA SFT：dataloader、`sft_forward` 调用、`save_checkpoint` |
+| `rlinf/models/__init__.py` | `register_model` / `get_model` 注册表（`openpi_au` 自注册接入，**不改**） |
+| `rlinf/workers/sft/fsdp_sft_worker.py` | SFT 训练主循环 `run_training`（`:135`）——**原版，不改** |
+| `rlinf/workers/sft/fsdp_vla_sft_worker.py` | VLA SFT：dataloader、`sft_forward` 调用、`save_checkpoint`（`FSDPVlaSftWorkerAu` 的父类） |
 | `rlinf/runners/sft_runner.py` | SFT 主循环 `run`（`:77`） |
 | `rlinf/hybrid_engines/fsdp/fsdp_model_manager.py` | `build_optimizer`/`build_lr_scheduler`/`optimizer_step`/`save_checkpoint` |
 | `rlinf/hybrid_engines/fsdp/utils.py` | `get_lr_scheduler`（`:511`）、`summon_full_params` 全量保存（`:491`） |
 | `rlinf/utils/ckpt_convertor/convert_openpi_jax_to_python.py` | JAX→PyTorch 权重转换 |
-| `examples/sft/config/*openpi*.yaml` | SFT 配置示例 |
+| `examples/sft/train_vla_sft.py`、`config/model/pi0_5.yaml` | 原 SFT 入口与模型默认（被复制为 `_au` 版本） |
+
+**RLinf（v2 新增 · 全部为加法，对上表零修改）**
+
+| 文件 | 核心内容 |
+| --- | --- |
+| `rlinf/models/embodiment/openpi_au/` | `openpi/` 整目录副本 |
+| `rlinf/models/embodiment/openpi_au/__init__.py` | 复制+改：自注册 `openpi_au` + 混合精度分支（§9.3） |
+| `rlinf/models/embodiment/openpi_au/openpi_action_model.py` | 复制+改：忠实增强覆写 / AdaRMS bias / grad-ckpt 开关（§9.4–9.6） |
+| `rlinf/models/embodiment/openpi_au/ema.py` | 新增：`ModelEMA`（§9.1） |
+| `rlinf/models/embodiment/openpi_au/augmentation.py` | 新增：逐样本、亮度感知忠实增强（§9.4） |
+| `rlinf/workers/sft/fsdp_vla_sft_worker_au.py` | 新增：`FSDPVlaSftWorkerAu`（EMA / openpi_cosine / param_norm） |
+| `examples/sft/train_vla_sft_au.py` | 新增：自注册 + `FSDPVlaSftWorkerAu` 入口 |
+| `examples/sft/config/model/pi0_5_au.yaml` | 新增：`model_type: openpi_au` + SFT 复现开关 |
+| `examples/sft/config/libero_sft_openpi_pi05_au.yaml` | 新增：LIBERO π₀.₅ SFT 例子（§9.9） |
+| `examples/sft/config/robotwin_sft_openpi_pi05_au.yaml` | 新增：RoboTwin π₀.₅ SFT 例子（§9.9） |
 
 ### 附录 B：`pi05_libero` SFT 配置速查（openpi → RLinf 映射）
 
@@ -1225,7 +1417,7 @@ $$\theta_{\text{EMA}}^{(t)} = (1-\alpha)\sum_{k=0}^{t}\alpha^{k}\theta^{(t-k)},$
 
 ---
 
-> **结语**：RLinf 因"继承 openpi 的 `PI0Pytorch` + 复用 openpi data_loader"，在**模型计算图与数据管线层面已与 openpi 高度对齐**；真正的复现负担集中在**训练栈**——其中 **EMA 缺失** 是与 openpi 成功率拉开差距的首要单点，其次是**逐样本增强、混合精度、LR 形状、batch/起点同源**。本文给出的方案以"新增 2 个模块 + 6 处 config 保护的最小改动"为代价，将 RLinf 的 PyTorch SFT 训练栈与 openpi-JAX `pi05_libero` 逐项对齐，并在混合精度稳定性与增强多样性上具备**超过**的潜力。完成 SFT 复现后，再以该忠实基座接入 RLinf 已被验证的 PPO/GRPO（LIBERO 77.1%→97.9%），即可在 RL 阶段同步抬升上限——这正是"以扩展而非修改、严格复现并超过 openpi π₀.₅"的完整路径。
+> **结语**：RLinf 因"继承 openpi 的 `PI0Pytorch` + 复用 openpi data_loader"，在**模型计算图与数据管线层面已与 openpi 高度对齐**；真正的复现负担集中在**训练栈**——其中 **EMA 缺失** 是与 openpi 成功率拉开差距的首要单点，其次是**逐样本增强、混合精度、LR 形状、batch/起点同源**。**v2 以"复制隔离"落实"扩展而非修改"**：把全部模型侧改动收敛进 `openpi_au/` 副本包（仅改 4 个文件），训练栈改动收敛进新增的 `FSDPVlaSftWorkerAu` 子类与 `train_vla_sft_au.py` 入口，并通过自注册接入——**对 RLinf 既有文件零修改**，原 `openpi`/RL 路径完全不受影响。配套给出 **LIBERO 与 RoboTwin 两个 π₀.₅ SFT 示例配置**，把 §8 的高/中优先级差异一次性补齐，将 RLinf 的 PyTorch SFT 训练栈与 openpi-JAX `pi05_libero` 逐项对齐，并在混合精度稳定性与增强多样性上具备**超过**的潜力。完成 SFT 复现后，再以该忠实基座接入 RLinf 已被验证的 PPO/GRPO（LIBERO 77.1%→97.9%），即可在 RL 阶段同步抬升上限——这正是"以扩展而非修改、严格复现并超过 openpi π₀.₅"的完整路径。
 
 
 
