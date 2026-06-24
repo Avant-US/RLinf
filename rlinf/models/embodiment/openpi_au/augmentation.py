@@ -30,8 +30,14 @@ def faithful_augment(
         generator: Optional torch.Generator for reproducibility.
 
     Returns:
-        Augmented images [B, H, W, C] in [0, 1].
+        Augmented images [B, H, W, C] in [0, 1], cast back to the input dtype.
     """
+    # Augmentation math (grid_sample, affine grids) runs in float32 to avoid dtype
+    # mismatches under FSDP mixed precision (images may arrive as bfloat16) and for
+    # numerical fidelity; the result is cast back to the original dtype.
+    orig_dtype = images.dtype
+    images = images.float()
+
     if not is_wrist:
         images = _per_sample_crop_resize(images, crop_scale, generator)
         images = _per_sample_rotate(images, rotation_degrees, generator)
@@ -40,7 +46,7 @@ def faithful_augment(
     images = _per_sample_contrast(images, contrast, generator)
     images = _per_sample_saturation_luminance(images, saturation, generator)
 
-    return images.clamp(0.0, 1.0)
+    return images.clamp(0.0, 1.0).to(orig_dtype)
 
 
 def _rand_uniform(
