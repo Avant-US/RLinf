@@ -1,0 +1,100 @@
+# RLinf VLM SFT 配置（Qwen2.5-VL-3B + Robo2VLM-1），改造为 Vertex AI 3 机 24 卡多机分布式。
+# 基线来自 examples/sft/config/qwen2_5_vl_sft_vlm.yaml，主要改动见行内注释（#@#）。
+#
+# 关键约束（rlinf/workers/sft/fsdp_sft_worker.py）：
+#   global_batch_size % (micro_batch_size * world_size) == 0
+#   world_size = 3 节点 * 8 卡 = 24；micro_batch_size = 4 ⇒ 必须是 96 的倍数。
+#   这里取 288 = 96 * 3，相当于每个优化器 step 做 3 次梯度累积。
+
+defaults:
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 3                      #@# 3 台 a3-ultragpu-8g
+  component_placement:
+    actor: all                      #@# actor（FSDP）占满全部 24 张 GPU
+
+runner:
+  task_type: sft
+  logger:
+    # log_path 会被 bootstrap.sh 用命令行覆盖为 /gcs/<bucket>/... 的 FUSE 路径，
+    # 以便 checkpoint / tensorboard 直接落盘到 Cloud Storage（断点也不丢）。
+    log_path: ${runner.output_dir}/${runner.experiment_name}
+    project_name: rlinf
+    experiment_name: ${runner.experiment_name}
+    logger_backends: ["tensorboard"]
+
+  # SFT runner 以 len(dataset) 作为一个 epoch
+  max_epochs: -1
+  max_steps: 100000                  #@# 全量 Robo2VLM-1 跑 100k steps
+  val_check_interval: 5000          #@# 每 5000 步评估一次（共 20 次 eval）
+  save_interval: 5000               #@# 每 5000 步存 checkpoint，满足整除约束
+  experiment_name: qwen2_5_vl_sft_3node
+  output_dir: /workspace/results    #@# 仅作默认值；实际由 bootstrap 覆盖 log_path
+  resume_dir: null                  #@# 续训时设为 .../checkpoints/global_step_<N>
+
+data:
+  type: vlm
+  dataset_name: "robo2vlmsft"
+  apply_chat_template: True
+  use_chat_template: True
+  # 直接读 Cloud Storage FUSE 挂载路径（由 bootstrap 用命令行覆盖为 /gcs/<bucket>/...）。
+  # train/test 必须放在不同目录，否则会整目录加载（见官方 rst 提醒）。
+  train_data_paths: "/workspace/data/Robo2VLM-1/train_data"   #@# 由 bootstrap 覆盖
+  val_data_paths: "/workspace/data/Robo2VLM-1/test_data"      #@# 由 bootstrap 覆盖
+  prompt_key: "question"
+  choice_key: "choices"
+  answer_key: "correct_answer"
+  image_keys: ["image"]
+  max_prompt_length: 1024
+  lazy_loading: false               #@# 大数据集/内存吃紧时改 true，逐样本读取
+  num_workers: 8
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 4
+  eval_batch_size: 4                #@# EOS 重映射 (Bug 6) 保障 batched eval 安全
+  global_batch_size: 288            #@# 96 的倍数（96*3），满足整除约束
+  seed: 42
+
+  model:
+    model_type: "qwen2.5_vl"
+    precision: fp32
+    model_path: "/workspace/models/Qwen2.5-VL-3B-Instruct"   #@# 由 bootstrap 覆盖
+    is_lora: False
+
+  optim:
+    lr: 1e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    total_training_steps: ${runner.max_steps}
+    lr_warmup_steps: 200
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"  #@# 跨 24 卡全分片；显存紧张时这是关键
+    use_orig_params: False
+    gradient_checkpointing: False    #@# OOM 时改 true，用算力换显存
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: bf16
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

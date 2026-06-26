@@ -1,0 +1,37 @@
+# 用 Cloud Build 把 Docker Hub 上的官方 RLinf 镜像“镜像”到本项目的 Artifact Registry。
+# 全程在云端执行，本机无需安装/运行 Docker。
+#
+# 用 gcrane 做 registry->registry 直拷（按 blob 流式复制，不在构建机上落整镜像，
+# 对几十 GB 的大镜像更稳更快）。Cloud Build 默认服务账号对同项目 AR 有推送权限。
+#
+# 提交（变量见手册“集中参数”）：
+#   gcloud builds submit --no-source \
+#     --region=$REGION \
+#     --config=cloudbuild_mirror_image.yaml \
+#     --substitutions=_SRC_IMAGE="docker.io/${SRC_IMAGE}",_DST_IMAGE="${AR_IMAGE}"
+
+steps:
+  - id: mirror-with-gcrane
+    name: gcr.io/go-containerregistry/gcrane
+    args: ['cp', '${_SRC_IMAGE}', '${_DST_IMAGE}']
+
+  # 备选：若 gcrane 不可用，可改用 docker 拉取再推送（取消注释，并注释上面的步骤）。
+  # - id: pull
+  #   name: gcr.io/cloud-builders/docker
+  #   args: ['pull', '${_SRC_IMAGE}']
+  # - id: tag
+  #   name: gcr.io/cloud-builders/docker
+  #   args: ['tag', '${_SRC_IMAGE}', '${_DST_IMAGE}']
+  # - id: push
+  #   name: gcr.io/cloud-builders/docker
+  #   args: ['push', '${_DST_IMAGE}']
+
+substitutions:
+  _SRC_IMAGE: "docker.io/rlinf/rlinf:math-rlinf0.2-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1"
+  _DST_IMAGE: "europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf:math-rlinf0.2-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1"
+
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 200
+
+timeout: 7200s
