@@ -3,8 +3,8 @@
 #
 # 关键约束（rlinf/workers/sft/fsdp_sft_worker.py）：
 #   global_batch_size % (micro_batch_size * world_size) == 0
-#   world_size = 3 节点 * 8 卡 = 24；micro_batch_size = 4 ⇒ 必须是 96 的倍数。
-#   这里取 288 = 96 * 3，相当于每个优化器 step 做 3 次梯度累积。
+#   world_size = 3 节点 * 8 卡 = 24；micro_batch_size = 8 ⇒ 必须是 192 的倍数。
+#   这里取 192 = 192 * 1，每个优化器 step 做 1 次梯度累积。
 
 defaults:
   - override hydra/job_logging: stdout
@@ -31,9 +31,9 @@ runner:
 
   # SFT runner 以 len(dataset) 作为一个 epoch
   max_epochs: -1
-  max_steps: 4                      #@# smoke: 4 step 即可验证 train/eval/save
-  val_check_interval: 2             #@# smoke: 每 2 step 评估一次
-  save_interval: 2                  #@# 必须能被 val_check_interval 整除
+  max_steps: 400000
+  val_check_interval: 1000          # 每 1000 步评估一次
+  save_interval: 1000               # 必须能被 val_check_interval 整除
   experiment_name: qwen2_5_vl_sft_3node
   output_dir: /workspace/results    #@# 仅作默认值；实际由 bootstrap 覆盖 log_path
   resume_dir: null                  #@# 续训时设为 .../checkpoints/global_step_<N>
@@ -61,9 +61,9 @@ algorithm:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 4
-  eval_batch_size: 4                #@# smoke eval: 96 条验证样本 / 24 ranks = 每 rank 1 个 batch
-  global_batch_size: 288            #@# 96 的倍数（96*3），满足整除约束
+  micro_batch_size: 8
+  eval_batch_size: 8
+  global_batch_size: 192            #@# 192 的倍数（192*1），满足整除约束
   seed: 42
 
   model:

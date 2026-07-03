@@ -1,0 +1,167 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# Dev image for `--model aupi` (RLinf + local openpi-au/R1 Pro) that trades
+# almost nothing for fast container startup during local iteration: RLinf +
+# openpi source is never copied into any image layer at all.
+#
+# Idea: bake the *heavy, rarely-changing* stuff (CUDA/torch/jax/flash-attn/...)
+# into a venv at build time by installing RLinf + openpi from source that is
+# only *bind-mounted* into the install RUN step (`RUN --mount=type=bind`, not
+# `COPY`) — so the source is visible to `uv pip install -e .` while that one
+# RUN executes, but is never written into any image layer, and reverts to
+# nonexistent the instant the RUN finishes. At `docker run` time, bind-mount
+# your real (editable, frequently-changing) working copies of RLinf and
+# aupi05 back over those exact same paths with `-v`. Because both were
+# installed with `pip install -e .` (see install_aupi_model() in
+# au_install.sh), the venv only stores *path references* back to
+# /workspace/RLinf and /workspace/aupi05 in site-packages (a .pth /
+# editable-finder file + dist-info) — it never needed a copy of their code in
+# the first place. As long as the bind-mounted source reappears at the exact
+# same absolute path used at build time, those references resolve again and
+# your local edits are picked up immediately, with zero reinstall needed.
+#
+# Why not `COPY` + `rm -rf` afterward (an earlier version of this file did
+# that)? It works too, but every byte you COPY is still permanently charged to
+# the image on disk — deleting a file in a later layer only adds a "whiteout"
+# marker, it doesn't shrink the earlier layer that already contains it. Build
+# mounts never write the source into a layer to begin with, so there is
+# nothing to delete and nothing bloating the image: same runtime behavior,
+# strictly smaller image, and one less RUN step. (Verified empirically:
+# content written into a `--mount=type=bind` target during the RUN is neither
+# visible in the final image nor written back to the host source directory —
+# it's a throwaway overlay scoped to that single RUN instruction.)
+#
+# You only need to re-run au_install.sh inside a running container when
+# pyproject.toml/uv.lock actually changed (new/bumped dependency) — plain
+# Python edits under rlinf/ or src/openpi/ need nothing at all, since editable
+# installs just point back at your live source tree. See `resync_aupi` below
+# for that rare case.
+#
+# CRITICAL: the two --mount targets in step 1 (/workspace/RLinf,
+# /workspace/aupi05) MUST exactly match the two `-v host_path:container_path`
+# targets you use at `docker run` time. If you mount at a different path, the
+# venv's editable references won't find your code and imports will fail.
+#
+# Caveat: because the source only exists during that one RUN instruction, the
+# install and the post-install smoke-test must live in the SAME RUN step (a
+# later, separate RUN can no longer `import rlinf`/`import openpi` — the
+# bind-mounted source is already gone by then). This also means the whole
+# install is one cache layer instead of several finer-grained ones; BuildKit
+# still only reruns it when the mounted source content actually changes.
+#
+# Build (BuildKit "named additional context" brings in the aupi05 checkout;
+# the main context is the RLinf repo itself — run this from the RLinf repo root):
+#   docker buildx build  -f b/gcp/demo4/Dockerfile.aupi_dev  --build-context aupi05=/home/physical/SRC/Robot/aupi05  -t rlinf-aupi-dev:260702  --load .
+#
+# Run (bind-mount your live checkouts back over the same paths baked in above;
+# --gpus all is needed for the torch/jax CUDA smoke-test import at build time
+# to reflect real hardware, though the build itself does not require a GPU):
+#   docker run --rm -it --gpus all \
+#     -v /home/physical/SRC/RL/RLinf:/workspace/RLinf \
+#     -v /home/physical/SRC/Robot/aupi05:/workspace/aupi05 \
+#     rlinf-aupi-dev:latest
+#
+# Inside the container, the venv is already active (see ~/.bashrc). Only run
+# this after changing pyproject.toml/uv.lock in either repo:
+#   resync_aupi
+# =============================================================================
+
+ARG BASE_IMAGE=nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+ARG PLATFORM=nvidia
+ARG VENV_DIR=/venv/rlinf
+# Set to 1 to use the same CN-friendly apt/pip/uv mirrors au_install.sh's
+# --use-mirror flag uses (mirrors.ustc.edu.cn / mirrors.aliyun.com / ghfast.top).
+ARG USE_MIRROR=0
+
+SHELL ["/bin/bash", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RLINF_AUPI_VENV=${VENV_DIR}
+ENV RLINF_AUPI_PLATFORM=${PLATFORM}
+
+# --- 0. Minimal bootstrap packages ---
+# au_install.sh's own install_common_embodied_deps -> requirements/embodied/sys_deps.sh
+# installs the bulk of the embodied/openpi system libraries (opencv's libGL/libX11
+# deps, ffmpeg, Vulkan/EGL, etc.) further down, so this step only needs the bare
+# minimum to get git/python3/uv/sudo bootstrapped before that hands off.
+RUN if [ "$USE_MIRROR" = "1" ]; then \
+        sed -i 's@//.*archive.ubuntu.com@//mirrors.ustc.edu.cn@g' /etc/apt/sources.list* 2>/dev/null || true; \
+    fi \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git ca-certificates curl wget unzip sudo \
+      build-essential python3-dev python3 python3-pip cmake pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# --- 1. Install RLinf + local openpi (au) into one shared venv ---
+# Source is bind-mounted (not COPY'd): visible to the install commands below,
+# but never persisted into an image layer (see header). `rw=true` because
+# setuptools' editable-install machinery may write a `<pkg>.egg-info/` dir
+# back into the project root as a side effect (verified: such writes vanish
+# with the mount, they never reach the image or the host source directory).
+# install_aupi_model (requirements/au_install.sh) creates $VENV_DIR, installs
+# RLinf itself in editable mode (forced regardless of --install-rlinf), then
+# installs the local openpi checkout per its own install.sh recipe
+# (uv sync --inexact + editable install) on top, and finishes with flash-attn.
+# The import smoke-test must run in this same RUN step: /workspace/RLinf and
+# /workspace/aupi05 stop existing the moment this RUN ends (see header), so a
+# later, separate RUN could no longer `import rlinf` / `import openpi`.
+# `cd /workspace/RLinf` first: au_install.sh never cds to the repo root itself
+# — it assumes it's invoked with cwd already at the repo root, since `uv venv`
+# / `uv sync` resolve pyproject.toml relative to cwd, not to the script's own
+# path. WORKDIR is /workspace (one level up, so it doesn't get shadowed by the
+# /workspace/RLinf bind mount target), so this cd is required, not optional.
+RUN --mount=type=bind,source=.,target=/workspace/RLinf,rw=true \
+    --mount=type=bind,from=aupi05,source=.,target=/workspace/aupi05,rw=true \
+    cd /workspace/RLinf \
+    && MIRROR_FLAG=""; [ "$USE_MIRROR" = "1" ] && MIRROR_FLAG="--use-mirror"; \
+    bash /workspace/RLinf/requirements/au_install.sh $MIRROR_FLAG --platform "$PLATFORM" \
+        embodied --model aupi \
+        --aupi-path /workspace/aupi05 \
+        --venv "$VENV_DIR" \
+    && source "${VENV_DIR}/bin/activate" \
+    && python -c "\
+import torch, jax, rlinf, openpi; \
+print('torch', torch.__version__, '| torch.version.cuda', torch.version.cuda); \
+print('jax', jax.__version__); \
+print('rlinf', rlinf.__file__); \
+print('openpi', openpi.__file__)" \
+    && python -c "\
+import os, transformers; \
+print('transformers', transformers.__version__); \
+from transformers.models.siglip import check; \
+assert check.check_whether_transformers_replace_is_installed_correctly(), \
+    'transformers_replace patch NOT installed (au_install.sh install_aupi_model step 4 did not run or failed)'; \
+tfm = os.path.dirname(transformers.__file__); \
+assert os.path.exists(os.path.join(tfm, 'models/siglip/check.py')), 'patched siglip/check.py missing'; \
+print('transformers_replace patch OK (au version, baked into image)')"
+
+# --- 2. Tidy, empty bind-mount targets for `docker run -v ...` later ---
+# Nothing to clean up here (step 1 never left anything behind at these paths),
+# just pre-creating the directories so `docker run -v host:/workspace/RLinf`
+# mounts onto an already-existing path.
+RUN mkdir -p /workspace/RLinf /workspace/aupi05
+
+# --- 3. Convenience: re-sync after pyproject.toml/uv.lock changes ---
+# NOT needed for ordinary Python edits (those are picked up live via the
+# editable install as soon as you bind-mount your real checkouts back in).
+# --no-root skips requirements/embodied/sys_deps.sh's apt-get pass, since the
+# system packages it installs are already baked into this image's layers and
+# a container normally shouldn't need apt/root/network for that again.
+RUN cat <<'EOF' > /usr/local/bin/resync_aupi
+#!/bin/bash
+set -eo pipefail
+exec bash /workspace/RLinf/requirements/au_install.sh --no-root --platform "${RLINF_AUPI_PLATFORM:-nvidia}" \
+    embodied --model aupi \
+    --aupi-path /workspace/aupi05 \
+    --venv "${RLINF_AUPI_VENV:-/venv/rlinf}"
+EOF
+RUN chmod +x /usr/local/bin/resync_aupi
+
+RUN echo "source ${VENV_DIR}/bin/activate" >> /root/.bashrc
+
+WORKDIR /workspace/RLinf
+CMD ["/bin/bash"]

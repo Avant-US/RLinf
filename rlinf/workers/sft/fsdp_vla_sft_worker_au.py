@@ -155,52 +155,103 @@ class FSDPVlaSftWorkerAu(FSDPVlaSftWorker):
 
 
 def _local_episode_indices(repo_id: str) -> list[int]:
-    """Return the contiguous prefix of LeRobot episode indices present in the cache.
+    """Return the largest contiguous run of *officially registered* episodes (per
+    ``meta/episodes.jsonl``) whose files are fully present in the local cache.
 
-    Parsed from ``data/chunk-*/episode_NNNNNN.parquet`` under either a local dataset
-    root (when ``repo_id`` is a path) or ``HF_LEROBOT_HOME/{repo_id}``. We return
-    ``[0, 1, ..., M-1]`` where ``M`` is the largest contiguous prefix fully present
-    locally. Returns [] if none are found.
+    ``repo_id`` may be a local dataset root or an HF Hub id; resolved to an on-disk
+    root via ``resolve_lerobot_dataset_root`` (checks ``{repo_id}/meta/info.json``,
+    then ``HF_LEROBOT_HOME/{repo_id}/meta/info.json``). Returns [] if no local
+    metadata can be found.
 
-    Why a contiguous prefix (not the raw present set):
-      * Passing exactly-present indices makes ``LeRobotDataset``'s "all files present"
-        assert succeed, so it loads from disk with NO HF network call (offline-safe,
-        avoids 429 at 8 ranks).
-      * LeRobot indexes ``episode_data_index`` by raw episode index assuming a
-        contiguous ``0..N-1`` range; a gap (e.g. cached {0..N, except k}) triggers an
-        ``IndexError`` at training time. A contiguous prefix avoids that. This mirrors
-        the openpi JAX LIBERO reference, which uses ``range(available_episodes)``.
+    Two things this deliberately does NOT assume (unlike a naive
+    ``range(total_episodes)``/directory-regex scan):
+      * The official episode range starts at 0 and is exactly ``[0, total_episodes)``.
+        Some LeRobot v3.0 exports register a non-zero-based range (e.g. episodes
+        [60, 90] out of a larger raw collection) while the very same
+        ``data/chunk-*/`` directory *also* physically contains unrelated leftover
+        parquet/video files for other episode indices (e.g. 0..59) that are not part
+        of this dataset at all -- a naive scan would silently pick up the wrong
+        episodes. We use ``LeRobotDatasetMetadata.episodes`` (parsed from
+        ``meta/episodes.jsonl``) as the authoritative index set instead.
+      * Only the parquet file matters. Datasets with ``dtype: video`` camera features
+        (unlike LIBERO's inline ``dtype: image``) also need every camera's ``.mp4``
+        present; we check ``get_video_file_path`` for every registered video key too
+        (not just the ones our own policy/repack happens to read), since that is
+        exactly what ``LeRobotDataset.__init__``'s "all files present" assertion
+        checks.
+
+    We still return a *contiguous run starting at the dataset's own minimum index*
+    (not the raw present-and-complete set) and stop at the first incomplete episode:
+    this preserves the original "avoid gaps" caution (some LeRobot versions build
+    ``episode_data_index`` by walking the requested episode list in order) while
+    generalizing "prefix from 0" to "prefix from wherever this dataset's official
+    episodes actually start". Passing the result back as ``episodes=...`` makes
+    ``LeRobotDataset``'s file-presence assert succeed, so it loads purely from local
+    disk with no HF network call (offline-safe, avoids 429 at many ranks).
     """
-    import pathlib
-    import re
+    from rlinf.data.lerobot_paths import resolve_lerobot_dataset_root
 
-    candidates = []
-    if os.path.isdir(repo_id):
-        candidates.append(pathlib.Path(repo_id) / "data")
+    root = resolve_lerobot_dataset_root(repo_id)
+    if not (root / "meta" / "episodes.jsonl").is_file():
+        return []
+
     try:
-        from lerobot.common.constants import HF_LEROBOT_HOME
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
-        candidates.append(pathlib.Path(HF_LEROBOT_HOME) / repo_id / "data")
+        dataset_meta = LeRobotDatasetMetadata(repo_id, root=root)
     except Exception:
-        pass
+        logger.warning(
+            "[openpi_au] failed to read local LeRobot metadata for %s at %s",
+            repo_id,
+            root,
+            exc_info=True,
+        )
+        return []
 
-    pat = re.compile(r"episode_(\d+)\.parquet$")
-    for data_dir in candidates:
-        if not data_dir.exists():
-            continue
-        present = set()
-        for chunk in sorted(data_dir.iterdir()):
-            if chunk.is_dir() and chunk.name.startswith("chunk-"):
-                for f in chunk.iterdir():
-                    m = pat.search(f.name)
-                    if m:
-                        present.add(int(m.group(1)))
-        if present:
-            m = 0
-            while m in present:
-                m += 1
-            return list(range(m))
-    return []
+    official = sorted(dataset_meta.episodes.keys())
+    if not official:
+        return []
+
+    def _is_complete(ep_idx: int) -> bool:
+        if not (root / dataset_meta.get_data_file_path(ep_idx)).is_file():
+            return False
+        return all(
+            (root / dataset_meta.get_video_file_path(ep_idx, vid_key)).is_file()
+            for vid_key in dataset_meta.video_keys
+        )
+
+    result = []
+    prev = None
+    for ep_idx in official:
+        if prev is not None and ep_idx != prev + 1:
+            break  # gap in the official registration itself
+        if not _is_complete(ep_idx):
+            break  # first officially-registered episode missing locally
+        result.append(ep_idx)
+        prev = ep_idx
+    return result
+
+
+def _positional_episode_data_index(dataset_meta, episodes: list[int]) -> dict[str, torch.Tensor]:
+    """Build an ``episode_data_index`` that ``LeRobotDataset.__getitem__`` can index
+    directly by *raw* episode index (see the call site for why this is needed).
+
+    Same cumulative from/to row offsets lerobot's own ``get_episode_data_index`` would
+    compute (assuming ``self.hf_dataset`` rows are laid out in ``episodes`` order, which
+    they are: ``load_hf_dataset`` builds its file list by iterating ``self.episodes``),
+    just placed at position ``ep_idx`` instead of at ``episodes.index(ep_idx)``.
+    """
+    episode_lengths = {ep_idx: dataset_meta.episodes[ep_idx]["length"] for ep_idx in episodes}
+    size = max(episodes) + 1
+    from_arr = torch.zeros(size, dtype=torch.long)
+    to_arr = torch.zeros(size, dtype=torch.long)
+    cursor = 0
+    for ep_idx in episodes:
+        length = episode_lengths[ep_idx]
+        from_arr[ep_idx] = cursor
+        to_arr[ep_idx] = cursor + length
+        cursor += length
+    return {"from": from_arr, "to": to_arr}
 
 
 def _local_episodes_patch(openpi_data_loader, repo_id: str):
@@ -225,7 +276,11 @@ def _local_episodes_patch(openpi_data_loader, repo_id: str):
 
         rid = data_config.repo_id
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(rid)
-        episodes = [e for e in local_indices if e < dataset_meta.total_episodes]
+        # Defensive re-check against this fresh metadata load; `local_indices` is
+        # already a subset of the *official* episode set (see
+        # `_local_episode_indices`), NOT a `< total_episodes` bound, since the
+        # official range need not start at 0 (e.g. pushdoor registers 60..90).
+        episodes = [e for e in local_indices if e in dataset_meta.episodes]
         dataset = lerobot_dataset.LeRobotDataset(
             rid,
             episodes=episodes,
@@ -234,6 +289,17 @@ def _local_episodes_patch(openpi_data_loader, repo_id: str):
                 for key in data_config.action_sequence_keys
             },
         )
+        # Work around a lerobot (0.1.0-pinned) bug: LeRobotDataset.__getitem__ looks up
+        # `self.episode_data_index["from"/"to"][ep_idx]` using the *raw* episode_index
+        # value from each row, but `get_episode_data_index(..., episodes)` returns a
+        # dense tensor indexed by each episode's *position* in `episodes` (correct only
+        # when `episodes == range(len(episodes))`). For a non-zero-based/non-contiguous
+        # `episodes` list (e.g. pushdoor's [60..90]) this is an out-of-range/incorrect
+        # lookup at the very first training step. Rebuild it positioned at the raw
+        # index instead -- purely a runtime patch of a third-party dependency's data
+        # structure, no lerobot/openpi source is modified.
+        if episodes != list(range(len(episodes))):
+            dataset.episode_data_index = _positional_episode_data_index(dataset_meta, episodes)
         if data_config.prompt_from_task:
             dataset = openpi_data_loader.TransformedDataset(
                 dataset, [transforms.PromptFromLeRobotTask(dataset_meta.tasks)]
@@ -241,8 +307,11 @@ def _local_episodes_patch(openpi_data_loader, repo_id: str):
         return dataset
 
     logger.info(
-        "[openpi_au] restricting LIBERO dataset to %d locally cached episodes",
+        "[openpi_au] restricting dataset '%s' to %d locally cached episodes (indices %d..%d)",
+        repo_id,
         len(local_indices),
+        local_indices[0],
+        local_indices[-1],
     )
     return patch.object(openpi_data_loader, "create_torch_dataset", patched_create_torch_dataset)
 

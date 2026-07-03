@@ -53,6 +53,9 @@ from rlinf.models.embodiment.openpi_au.dataconfig.maniskill_dataconfig import (
 from rlinf.models.embodiment.openpi_au.dataconfig.metaworld_dataconfig import (
     LeRobotMetaworldDataConfig,
 )
+from rlinf.models.embodiment.openpi_au.dataconfig.pushdoor_dataconfig import (
+    LeRobotPushdoorDataConfig,
+)
 from rlinf.models.embodiment.openpi_au.dataconfig.realworld_dataconfig import (
     LeRobotRealworldDataConfig,
 )
@@ -396,6 +399,35 @@ _CONFIGS = [
             "checkpoints/jax/pi05_base/params"
         ),
         pytorch_weight_path="checkpoints/torch/pi05_base",
+    ),
+    TrainConfig(
+        name="pi05_pushdoor",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False
+        ),
+        data=LeRobotPushdoorDataConfig(
+            repo_id="rlinf/pushdoor_open0622",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_pushdoor/assets"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        seed=0,
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-5,
+            decay_steps=1_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=8,
+        num_train_steps=1_000,
+        log_interval=5,
+        save_interval=200,
     ),
 ]
 

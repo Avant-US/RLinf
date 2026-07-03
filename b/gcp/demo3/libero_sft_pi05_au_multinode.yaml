@@ -1,0 +1,106 @@
+# RLinf pi0.5 (openpi_au) LIBERO SFT — multi-node Vertex config.
+#
+# Adapted from tests_au/example/libero/libero_sft_pi05_au_8gpu.yaml for multi-node.
+# Default target: ALL 3 reserved a3-ultragpu-8g nodes = 24 GPU total
+# (1 primary + 2 workers, see vertex_pi05_au_3node.yaml).
+#
+# world_size = num_nodes * 8 = 3 * 8 = 24
+# micro_batch_size is fixed at 16 (== per-GPU local batch used by the openpi JAX
+# reference on its 8-GPU host), so global_batch_size must satisfy:
+#     global_batch_size % (micro_batch_size * world_size) == 0
+#     384 % (16 * 24) == 384 % 384 == 0  -> grad_accum = 1
+#
+# NOTE: this intentionally scales the *effective* global batch size from the JAX
+# reference's 128 (8 GPU x local batch 16) up to 384 (24 GPU x local batch 16), i.e.
+# we keep the per-GPU local batch identical to the JAX reference and let the global
+# batch grow with the extra reservation capacity, rather than shrinking micro_batch_size
+# to preserve global=128. If you need to reproduce the exact JAX global batch of 128
+# instead, override on the CLI: `actor.micro_batch_size=... actor.global_batch_size=128`
+# with a micro_batch_size that divides 128/24 (not integer) — not possible with whole
+# GPUs, so an exact global=128 repro on 24 GPUs is not supported; use the single-node
+# 8-GPU config (tests_au/example/libero/libero_sft_pi05_au_8gpu.yaml) for that.
+# All other optimization/precision/LR/EMA knobs are identical to the JAX-aligned local run.
+#
+# Group defaults (model/pi0_5_au, training_backend/fsdp) resolve via the
+# EMBODIED_PATH searchpath -> examples/sft/config (set by bootstrap.sh).
+defaults:
+  - model/pi0_5_au@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH,examples/sft}/config/
+
+cluster:
+  num_nodes: 3                        # 3 x a3-ultragpu-8g (all reservation nodes)
+  component_placement:
+    actor: all                        # FSDP actor spans all 24 GPUs across all 3 nodes
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "${oc.env:RLINF_LIBERO_LOG,/gcs/physical-ai-data-eu/rlinf/runs/pi05_libero_au}"
+    project_name: rlinf_au
+    experiment_name: "pi05_libero_au_3node"
+    logger_backends: ["tensorboard"]  # image includes tensorboard; events land on GCS FUSE
+  max_epochs: -1
+  max_steps: 1000                     # matches JAX --num-train-steps=1000
+  val_check_interval: -1
+  save_interval: 200                  # checkpoint at 200/400/600/800/1000
+
+data:
+  train_data_paths: "physical-intelligence/libero"   # overridden by bootstrap to local root
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16                # per-GPU local batch, matches JAX reference
+  global_batch_size: 384              # 24 GPU x 16 -> grad_accum = 1 (scaled from JAX's 128)
+  seed: 0
+
+  model:
+    precision: null
+    model_path: "${oc.env:RLINF_LIBERO_MODEL,/workspace/model_runtime/pi05_base_pt}"
+    num_action_chunks: 10             # action_horizon = 10
+    action_dim: 7
+    add_value_head: False
+    faithful_augmentation: true       # per-sample augmax-equivalent augmentation
+    # openpi-native selective bf16 (to_bfloat16_for_selected_params); FSDP does NOT
+    # re-cast (mixed_precision null below). Uniform FSDP bf16 breaks openpi's fp32
+    # action head (see local example problem 5 / manual troubleshooting).
+    fp32_master_weights: false
+    sft_gradient_checkpointing: true
+    openpi:
+      config_name: "pi05_libero"
+      train_expert_only: False
+
+  optim:
+    lr: 5.0e-5                         # peak_lr (== JAX --lr-schedule.peak-lr)
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0                     # global grad-norm clip = 1.0
+    ema_decay: 0.999                   # EMA decay
+    lr_scheduler: "openpi_cosine"      # optax warmup_cosine_decay equivalent
+    lr_warmup_steps: 100               # == JAX --lr-schedule.warmup-steps=100
+    decay_steps: 1000                  # == JAX --lr-schedule.decay-steps=1000
+    decay_lr: 5.0e-6                   # == JAX --lr-schedule.decay-lr=5e-6
+    total_training_steps: 1000
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"    # full 24-way FSDP sharding across all 3 nodes
+    use_orig_params: False
+    gradient_checkpointing: true       # activation remat (== JAX nn.remat)
+    gradient_checkpointing_use_reentrant: true
+    mixed_precision:                   # let openpi manage dtypes (selective bf16)
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    grad_scaler:
+      enabled: false                   # bf16 compute needs no loss scaling

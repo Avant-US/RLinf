@@ -1,0 +1,124 @@
+# =============================================================================
+# Custom image for RLinf pi0.5 (openpi_au) on Vertex AI.
+#
+# Layers the openpi runtime that openpi_au needs (openpi + jax + flax + lerobot +
+# the transformers_replace patch) ON TOP OF the mirrored RLinf base image. The base
+# image already provides Ray / FSDP / the `reason` venv used by RLinf's SFT stack;
+# it does NOT contain openpi, so we add it here.
+#
+# BUILD CONTEXT MUST BE THE openpi source repo root (so `COPY . /opt/openpi` picks up
+# src/, packages/, pyproject.toml). Typical local layout: /home/physical/SRC/Robot/openpi05
+#
+# Local build & push:
+#   cp b/gcp/demo3/Dockerfile.openpi_au /home/physical/SRC/Robot/openpi05/Dockerfile.openpi_au
+#   cd /home/physical/SRC/Robot/openpi05
+#   docker build -f Dockerfile.openpi_au \
+#     --build-arg BASE_IMAGE=europe-west4-docker.pkg.dev/<PROJECT>/rlinf/rlinf:math-... \
+#     -t europe-west4-docker.pkg.dev/<PROJECT>/rlinf/rlinf-openpi-au:pi05-libero .
+#   docker push europe-west4-docker.pkg.dev/<PROJECT>/rlinf/rlinf-openpi-au:pi05-libero
+#
+# Or via Cloud Build: see cloudbuild_openpi_au_image.yaml in this folder.
+# =============================================================================
+
+ARG BASE_IMAGE=europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf:math-rlinf0.2-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1
+FROM ${BASE_IMAGE}
+
+# The RLinf base image ships a single venv named `reason` at /opt/venv/reason.
+ARG VENV=/opt/venv/reason
+# Pin the lerobot revision openpi depends on (see openpi05/pyproject.toml [tool.uv.sources]).
+ARG LEROBOT_GIT=git+https://github.com/huggingface/lerobot@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=0
+
+# --- 0. System libraries opencv-python needs at import time ---
+# lerobot's video-backed LeRobotDataset decoding (used by any dataset with
+# `dtype: video` camera features, e.g. pushdoor's mp4 streams -- LIBERO's inline
+# `dtype: image` frames never exercise this path, which is why this was only
+# discovered on the first real pushdoor Vertex run, see gcp_rlinf_pi05_au.md)
+# transitively imports plain `opencv-python` (not `-headless`). That wheel still
+# dynamically links libX11/libGL/etc at import time even though nothing here ever
+# opens a GUI window, and the base image is a minimal CUDA runtime image without
+# desktop libraries. Symptom without this fix: `ImportError: libX11.so.6: cannot
+# open shared object file`, raised inside every PyTorch DataLoader worker
+# subprocess (num_workers>0 re-imports cv2 fresh in each spawned process) at the
+# very first training step -- all ranks crash simultaneously, and because it
+# happens inside worker subprocesses rather than the main process, the actor
+# hangs silently (no clean traceback/exit in the main log) instead of failing
+# fast. Installing the missing shared libraries (not switching the pip package)
+# is the minimal fix: it works regardless of which dependency pulls in plain
+# `opencv-python`, pinned or not.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libx11-6 \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- 1. Bring in the openpi source (build context = openpi repo root) ---
+COPY . /opt/openpi
+
+# --- 2. Install openpi + openpi-client + pinned lerobot into the reason venv ---
+# `pip install -e /opt/openpi` resolves openpi's pinned deps: jax[cuda12]==0.5.3,
+# flax==0.10.2, transformers==4.53.2, torch==2.7.1, augmax, sentencepiece, tyro, etc.
+# NOTE: openpi pins torch==2.7.1 (base image ships 2.6.0). This upgrade is what the
+# proven local openpi_venv uses; validate on the first real run (see manual §11).
+RUN . "${VENV}/bin/activate" \
+ && pip install -e /opt/openpi/packages/openpi-client \
+ && pip install "${LEROBOT_GIT}" \
+ && pip install -e /opt/openpi
+
+# --- 2b. Remove the base image's stale flash-attn build ---
+# The base image's flash-attn wheel was compiled against its torch==2.6.0 ABI. Step 2
+# just upgraded torch to openpi's pinned 2.7.1 but pip has no reason to know flash-attn
+# needs rebuilding too (it isn't part of openpi's dependency graph), so the old
+# `flash_attn_2_cuda` extension is left behind linked against the wrong libtorch. Every
+# import of `transformers.models.gemma` (via openpi's PI0Pytorch) then crashes at
+# actor-init time with `ImportError: ... undefined symbol: ...c10::Error...` (hit on the
+# first real Vertex AI run, see gcp_rlinf_pi05_au.md pushdoor section). The proven local
+# openpi_venv (same torch==2.7.1 + transformers==4.53.2 pins) has no flash-attn installed
+# at all and transformers falls back to its `sdpa` attention implementation cleanly, so
+# we match that known-good configuration here instead of rebuilding flash-attn from
+# source against torch 2.7.1 (slow and unnecessary for functional correctness).
+RUN . "${VENV}/bin/activate" \
+ && (pip uninstall -y flash-attn || true) \
+ && python -c "import flash_attn" 2>/dev/null && { echo 'flash_attn still importable after uninstall'; exit 1; } || echo 'flash_attn removed (or was already absent) - OK'
+
+# --- 3. Apply the transformers_replace patch openpi's PI0Pytorch requires ---
+# Copies the patched siglip/gemma/paligemma modules into the installed transformers
+# package, then verifies the marker check passes.
+RUN . "${VENV}/bin/activate" \
+ && TFM_DIR="$(python -c 'import os, transformers; print(os.path.dirname(transformers.__file__))')" \
+ && cp -r /opt/openpi/src/openpi/models_pytorch/transformers_replace/* "${TFM_DIR}/" \
+ && python -c "from transformers.models.siglip import check; assert check.check_whether_transformers_replace_is_installed_correctly(), 'transformers_replace patch failed'"
+
+# --- 4. Extra RLinf SFT runtime deps not guaranteed in the base image ---
+# (RLinf source itself is shipped at run time via GCS tarball + PYTHONPATH.)
+RUN . "${VENV}/bin/activate" \
+ && pip install "ray[default]>=2.47.0" hydra-core==1.3.2 torchdata accelerate tensorboard
+
+# --- 5. Smoke-check the openpi_au import chain at build time (fail fast) ---
+# Exercises the *exact* import chain `fsdp_vla_sft_worker_au.py::build_dataloader` runs
+# at actor-init time (openpi.training.data_loader -> openpi.models.model ->
+# openpi.models_pytorch.pi0_pytorch -> gemma_pytorch -> transformers.GemmaForCausalLM),
+# since that is where the flash-attn/torch ABI mismatch above actually surfaced at
+# runtime despite this same-looking check having been present already. Also asserts
+# transformers agrees flash-attn is unavailable, so it takes the sdpa/eager fallback
+# path instead of silently trying flash-attn again after some future dependency change.
+# Also imports cv2 (+ the specific submodule that crashed on the first pushdoor Vertex
+# run, see step 0's comment): plain `import cv2` alone can succeed even when the
+# native extension is broken, because some symbols resolve lazily, so exercise the
+# actual failing symbol explicitly rather than only the top-level package.
+RUN . "${VENV}/bin/activate" \
+ && python -c "\
+import openpi, jax, flax, lerobot; \
+import openpi.training.data_loader as dl; \
+import openpi.models_pytorch.pi0_pytorch as m; \
+from transformers import GemmaForCausalLM; \
+from transformers.utils import is_flash_attn_2_available; \
+assert not is_flash_attn_2_available(), 'flash-attn is importable again - re-check ABI compat with torch 2.7.1 before relying on it'; \
+import cv2, cv2.mat_wrapper; \
+print('cv2 OK:', cv2.__version__); \
+print('openpi runtime OK (flash-attn unavailable, sdpa/eager fallback active):', openpi.__file__)"
+
+# Keep the base image's default entrypoint; Vertex overrides command/args to run
+# bootstrap.sh from GCS.

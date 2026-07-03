@@ -1,0 +1,103 @@
+# RLinf pi0.5 (openpi_au) pushdoor (r1_pro) SFT — multi-node Vertex config.
+#
+# Adapted from tests_au/example/pushdoor/pushdoor_sft_pi05_au_8gpu.yaml for multi-node,
+# mirroring libero_sft_pi05_au_multinode.yaml's structure. Default target: ALL 3 reserved
+# a3-ultragpu-8g nodes = 24 GPU total (1 primary + 2 workers, see pushdoor_vertex_3node.yaml).
+#
+# world_size = num_nodes * 8 = 3 * 8 = 24
+# micro_batch_size is fixed at 16 (same per-GPU local batch as the local 8-GPU smoke test),
+# so global_batch_size must satisfy:
+#     global_batch_size % (micro_batch_size * world_size) == 0
+#     384 % (16 * 24) == 384 % 384 == 0  -> grad_accum = 1
+#
+# This is a "does the 3-node/24-GPU pipeline run" smoke test, not a convergence run (see
+# gcp_rlinf_pi05_au.md's pushdoor section for the full rationale): max_steps/save_interval
+# are trimmed accordingly. Base weights are the converted pi05_r1pro_chassis_alig_newnorm
+# checkpoint (see tests_au/example/pushdoor/convert_r1pro_ckpt.py), not vanilla pi05_base_pt.
+#
+# Group defaults (model/pi0_5_au, training_backend/fsdp) resolve via the
+# EMBODIED_PATH searchpath -> examples/sft/config (set by pushdoor_bootstrap.sh).
+defaults:
+  - model/pi0_5_au@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH,examples/sft}/config/
+
+cluster:
+  num_nodes: 3                        # 3 x a3-ultragpu-8g (all reservation nodes)
+  component_placement:
+    actor: all                        # FSDP actor spans all 24 GPUs across all 3 nodes
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "${oc.env:RLINF_PUSHDOOR_LOG,/gcs/physical-ai-data-eu/rlinf/runs/pi05_pushdoor_au}"
+    project_name: rlinf_au
+    experiment_name: "pi05_pushdoor_au_3node"
+    logger_backends: ["tensorboard"]  # image includes tensorboard; events land on GCS FUSE
+  max_epochs: -1
+  max_steps: 50                       # smoke test only (dataset is tiny: 31 episodes / 34084 frames)
+  val_check_interval: -1
+  save_interval: 25                   # checkpoint at 25/50 (>=1 save, incl. EMA)
+
+data:
+  # Direct LeRobot dataset root under the GCS FUSE mount -- resolve_lerobot_dataset_root()
+  # (rlinf/data/lerobot_paths.py) accepts an absolute path with meta/info.json directly, so
+  # (unlike LIBERO) no HF_LEROBOT_HOME/repo_id staging indirection is needed here.
+  train_data_paths: "${oc.env:RLINF_PUSHDOOR_DATA,/gcs/physical-ai-data-eu/DATA/SKILL/pushdoor/0622_lerobot_data}"
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16                # per-GPU local batch, matches the local smoke test
+  global_batch_size: 384              # 24 GPU x 16 -> grad_accum = 1
+  seed: 0
+
+  model:
+    precision: null
+    model_path: "${oc.env:RLINF_PUSHDOOR_MODEL,/workspace/model_runtime/pi05_pushdoor_r1pro_pt}"
+    num_action_chunks: 10             # action_horizon = 10
+    action_dim: 23                    # real (unpadded) action dim: 20-dim state layout + chassis_vel(3)
+    add_value_head: False
+    faithful_augmentation: true       # per-sample augmax-equivalent augmentation
+    # openpi-native selective bf16 (to_bfloat16_for_selected_params); FSDP does NOT
+    # re-cast (mixed_precision null below). Uniform FSDP bf16 breaks openpi's fp32
+    # action head (see tests_au/example/libero problem 5 / manual troubleshooting).
+    fp32_master_weights: false
+    sft_gradient_checkpointing: true
+    openpi:
+      config_name: "pi05_pushdoor"
+      train_expert_only: False
+
+  optim:
+    lr: 5.0e-5                        # peak_lr (== JAX --lr-schedule.peak-lr convention)
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0                    # global grad-norm clip = 1.0
+    ema_decay: 0.999                  # EMA decay
+    lr_scheduler: "openpi_cosine"     # optax warmup_cosine_decay equivalent
+    lr_warmup_steps: 100              # == JAX --lr-schedule.warmup-steps=100 (LIBERO parity)
+    decay_steps: 1000                 # == JAX --lr-schedule.decay-steps=1000 (LIBERO parity)
+    decay_lr: 5.0e-6                  # == JAX --lr-schedule.decay-lr=5e-6
+    total_training_steps: 50
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"   # full 24-way FSDP sharding across all 3 nodes
+    use_orig_params: False
+    gradient_checkpointing: true      # activation remat
+    gradient_checkpointing_use_reentrant: true
+    mixed_precision:                  # let openpi manage dtypes (selective bf16);
+      param_dtype: null               # FSDP does not re-cast params/grads/buffers.
+      reduce_dtype: null
+      buffer_dtype: null
+    grad_scaler:
+      enabled: false                  # bf16 compute needs no loss scaling

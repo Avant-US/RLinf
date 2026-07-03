@@ -1,0 +1,103 @@
+# RLinf pi0.5 pushdoor (r1_pro) SFT example -- single-node 8-GPU smoke test.
+#
+# Fine-tunes the openpi_au pi0.5 model on the "push door" LeRobot dataset
+# (default: /mnt/r/DATA/SKILL/pushdoor/0622_lerobot_data_tst1 -- 12 episodes /
+# 13136 frames, task "open0622"). It reuses the already-registered `pi05_pushdoor`
+# openpi data config (rlinf/models/embodiment/openpi_au/dataconfig/), so NO RLinf
+# framework or model code is changed -- only this example's config + shell scripts.
+#
+# Recipe follows the LIBERO/pushdoor reference (see b/d/pi/): global batch 128
+# (8 GPU x micro 16, grad_accum 1), bf16 compute + openpi-native selective fp32
+# (FSDP does NOT re-cast, see mixed_precision null below), cosine LR (warmup 100,
+# peak 5e-5, decay 1000 steps -> 5e-6), EMA 0.999, quantile normalization.
+#
+# Because the goal is only "does the pi0.5 SFT pipeline run + checkpoint on this
+# data", this is trimmed to a 50-step smoke test (save at 25/50); it is NOT meant
+# to produce a converged policy. Bump runner.max_steps / optim.total_training_steps
+# for a real fine-tune (see README.md).
+#
+# Group defaults (model/pi0_5_au, training_backend/fsdp) resolve via the
+# EMBODIED_PATH searchpath -> examples/sft/config (set by run_train.sh).
+defaults:
+  - model/pi0_5_au@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH,examples/sft}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0-7          # all 8 GPUs on this node
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "${oc.env:RLINF_PUSHDOOR_LOG,../results_au_pushdoor}"
+    project_name: rlinf_au
+    experiment_name: "pi05_pushdoor_tst1_smoke50"
+    # Console/tqdm metrics by default (no extra dependency). To get TensorBoard
+    # logs, `pip install tensorboard` into the venv and set ["tensorboard"].
+    logger_backends: []
+  max_epochs: -1
+  max_steps: 50                     # smoke test: only verify pipeline runs + checkpoints
+  val_check_interval: -1
+  save_interval: 25                 # checkpoint at 25/50 (>=1 save, incl. EMA)
+
+data:
+  train_data_paths: "${oc.env:RLINF_PUSHDOOR_DATA,/mnt/r/DATA/SKILL/pushdoor/0622_lerobot_data_tst1}"
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16               # per-GPU local batch
+  global_batch_size: 128             # 8 GPU x 16 -> grad_accum = 1
+  seed: 0
+
+  model:
+    precision: null
+    model_path: "${oc.env:RLINF_PUSHDOOR_MODEL,examples/au/pi/_ckpt/pi05_pushdoor_tst1}"
+    num_action_chunks: 10            # action_horizon = 10
+    action_dim: 23                   # real (unpadded) action dim: 20-dim state layout + chassis_vel(3)
+    add_value_head: False
+    faithful_augmentation: true      # per-sample augmax-equivalent augmentation
+    # openpi-native selective bf16 (to_bfloat16_for_selected_params); FSDP does NOT
+    # re-cast (mixed_precision null below). Uniform FSDP bf16 breaks openpi's fp32
+    # action head (see tests_au/example/libero problem 5 / gcp_rlinf_pi05_au.md).
+    fp32_master_weights: false
+    sft_gradient_checkpointing: true
+    openpi:
+      config_name: "pi05_pushdoor"
+      train_expert_only: False
+
+  optim:
+    lr: 5.0e-5                        # peak_lr (== JAX --lr-schedule.peak-lr convention)
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0                    # global grad-norm clip = 1.0
+    ema_decay: 0.999                  # EMA decay
+    lr_scheduler: "openpi_cosine"     # optax warmup_cosine_decay equivalent
+    lr_warmup_steps: 100              # == JAX --lr-schedule.warmup-steps=100
+    decay_steps: 1000                 # == JAX --lr-schedule.decay-steps=1000 (LIBERO parity)
+    decay_lr: 5.0e-6                  # == JAX --lr-schedule.decay-lr=5e-6
+    total_training_steps: 50
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"   # 8-way FSDP sharding
+    use_orig_params: False
+    gradient_checkpointing: true      # activation remat
+    gradient_checkpointing_use_reentrant: true
+    mixed_precision:                  # let openpi manage dtypes (selective bf16);
+      param_dtype: null               # FSDP does not re-cast params/grads/buffers.
+      reduce_dtype: null
+      buffer_dtype: null
+    grad_scaler:
+      enabled: false                  # bf16 compute needs no loss scaling

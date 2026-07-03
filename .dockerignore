@@ -1,0 +1,16 @@
+# Keeps `COPY . /workspace/RLinf`-style builds (see requirements/Dockerfile.aupi_dev)
+# fast and avoids baking host-only build artifacts into images. The existing
+# docker/Dockerfile is unaffected: it only COPYs ./pyproject.toml and
+# ./requirements explicitly, never the whole repo.
+.git/
+**/__pycache__/
+**/*.py[co]
+*.egg-info/
+.venv/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+wandb/
+outputs/
+checkpoints/
+.DS_Store

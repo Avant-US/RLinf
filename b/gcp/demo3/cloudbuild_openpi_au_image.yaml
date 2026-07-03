@@ -1,0 +1,45 @@
+# =============================================================================
+# Cloud Build: build the custom RLinf pi0.5 (openpi_au) image and push to
+# Artifact Registry. The build CONTEXT must be the openpi source repo root
+# (so the Dockerfile's `COPY . /opt/openpi` sees src/, packages/, pyproject.toml).
+#
+# Submit (context = openpi repo root; copy the Dockerfile in first):
+#   cp b/gcp/demo3/Dockerfile.openpi_au /home/physical/SRC/Robot/openpi05/Dockerfile.openpi_au
+#   gcloud builds submit /home/physical/SRC/Robot/openpi05 \
+#     --region=europe-west4 \
+#     --config=b/gcp/demo3/cloudbuild_openpi_au_image.yaml \
+#     --substitutions=_BASE_IMAGE="europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf:math-rlinf0.2-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1",_DST_IMAGE="europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-openpi-au:pi05-libero" \
+#     --gcs-log-dir="gs://physical-ai-data-eu/cloudbuild-logs"
+#
+# The --gcs-log-dir override avoids the default-log-bucket permission error
+# (see demo2 Bug 4). Point it at a bucket you can write to.
+# =============================================================================
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.openpi_au
+      - --build-arg
+      - BASE_IMAGE=${_BASE_IMAGE}
+      - -t
+      - ${_DST_IMAGE}
+      - .
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '${_DST_IMAGE}']
+
+images:
+  - ${_DST_IMAGE}
+
+substitutions:
+  _BASE_IMAGE: "europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf:math-rlinf0.2-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1"
+  _DST_IMAGE: "europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-openpi-au:pi05-libero"
+
+options:
+  # openpi + jax + torch is a large install; give the builder a big machine + disk.
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 400
+
+timeout: 7200s

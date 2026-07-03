@@ -1,17 +1,18 @@
-# Vertex AI（Agent Platform）自定义训练作业：3 台 a3-ultragpu-8g（24×H200）多机分布式。
+# Vertex AI custom training job: RLinf pi0.5 (openpi_au) pushdoor (r1_pro) SFT smoke
+# test on ALL 3 reserved a3-ultragpu-8g nodes (24 x H200) multi-node.
 #
-# 两个 worker pool：
-#   workerPoolSpecs[0]  primary/chief，replicaCount 必须为 1  -> RLINF_NODE_RANK=0（Ray head）
-#   workerPoolSpecs[1]  workers，replicaCount=2               -> RLINF_NODE_RANK=1,2
-# 三个副本都跑同一个 bootstrap.sh，由它解析 CLUSTER_SPEC 组成一个 Ray 集群。
+# Two worker pools (mirrors vertex_pi05_au_3node.yaml's LIBERO topology):
+#   workerPoolSpecs[0]  primary/chief, replicaCount MUST be 1  -> RLINF_NODE_RANK=0 (Ray head)
+#   workerPoolSpecs[1]  workers,       replicaCount=2          -> RLINF_NODE_RANK=1,2
+# All 3 replicas run the SAME pushdoor_bootstrap.sh, which parses CLUSTER_SPEC and forms
+# one Ray cluster spanning 3 nodes / 24 GPUs.
 #
-# 提交：gcloud ai custom-jobs create --region=europe-west4 \
-#          --display-name=rlinf-sft-3node --config=vertex_sft_3node.yaml
+# Uses the SAME custom openpi_au image as the LIBERO recipe (dataset-agnostic runtime;
+# built via Dockerfile.openpi_au / cloudbuild_openpi_au_image.yaml, shared with LIBERO).
+# a3-ultragpu-8g requires hyperdisk-balanced boot disks (see demo2 Bug 5).
 #
-# 注意：
-#   - 同一作业内各副本默认可互通内网（分布式训练所需），无需设置 network。
-#   - 用到的镜像、bootstrap、代码、模型、数据都已预存到 Artifact Registry / GCS。
-#   - 副本内 /gcs 为 Cloud Storage FUSE 自动挂载（只支持单区域桶）。
+# Submit: gcloud ai custom-jobs create --region=europe-west4 \
+#           --display-name=rlinf-pi05-au-pushdoor-3node --config=pushdoor_vertex_3node.yaml
 
 workerPoolSpecs:
   # ----------------------------- primary / head -----------------------------
@@ -29,20 +30,18 @@ workerPoolSpecs:
       bootDiskType: hyperdisk-balanced
       bootDiskSizeGb: 1000
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf:math-rlinf0.2-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-openpi-au:pi05-libero
       command: ["/bin/bash"]
-      args: ["/gcs/physical-ai-data-eu/rlinf/bootstrap.sh"]
+      args: ["/gcs/physical-ai-data-eu/rlinf/demo3/pushdoor_bootstrap.sh"]
       env:
         - name: GCS_BUCKET
           value: "physical-ai-data-eu"
         - name: EXP_NAME
-          value: "qwen2_5_vl_sft_3node"
+          value: "pi05_pushdoor_au_3node"
         - name: RAY_PORT
           value: "6379"
         - name: VENV_NAME
           value: "reason"
-        - name: SMOKE_MODE
-          value: "0"
         - name: PYTHONUNBUFFERED
           value: "1"
 
@@ -61,23 +60,21 @@ workerPoolSpecs:
       bootDiskType: hyperdisk-balanced
       bootDiskSizeGb: 1000
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf:math-rlinf0.2-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-openpi-au:pi05-libero
       command: ["/bin/bash"]
-      args: ["/gcs/physical-ai-data-eu/rlinf/bootstrap.sh"]
+      args: ["/gcs/physical-ai-data-eu/rlinf/demo3/pushdoor_bootstrap.sh"]
       env:
         - name: GCS_BUCKET
           value: "physical-ai-data-eu"
         - name: EXP_NAME
-          value: "qwen2_5_vl_sft_3node"
+          value: "pi05_pushdoor_au_3node"
         - name: RAY_PORT
           value: "6379"
         - name: VENV_NAME
           value: "reason"
-        - name: SMOKE_MODE
-          value: "0"
         - name: PYTHONUNBUFFERED
           value: "1"
 
 scheduling:
-  timeout: 604800s            # 最长 7 天，按需缩短
+  timeout: 604800s            # max 7 days; shorten as needed
   restartJobOnWorkerRestart: false
