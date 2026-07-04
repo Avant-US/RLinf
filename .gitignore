@@ -24,3 +24,4 @@ PKG-INFO
 _data
 _out
 _ckpt
+**/*.log

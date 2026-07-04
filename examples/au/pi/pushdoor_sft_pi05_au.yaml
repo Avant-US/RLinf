@@ -55,8 +55,8 @@ data:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 16               # per-GPU local batch
-  global_batch_size: 128             # 8 GPU x 16 -> grad_accum = 1
+  micro_batch_size: 1               # per-GPU local batch
+  global_batch_size: 8             # 8 GPU x 16 -> grad_accum = 1
   seed: 0
 
   model:

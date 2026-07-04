@@ -1,7 +1,7 @@
 #! /bin/bash
 
 set -eo pipefail
-
+#@# 例子: bash requirements/au_install.sh embodied --model aupi --aupi-path /home/physical/SRC/Robot/aupi05 --venv /mnt/r/VENV/rlinf/
 TARGET=""
 
 MODEL=""
@@ -1195,6 +1195,7 @@ EOF
 }
 
 install_aupi_model() {
+    PLATFORM_FLASH_ATTN_PREBUILT=0
     # Installs RLinf (this workspace, per its own instructions) together
     # with a local openpi (au / R1 Pro) checkout (per ITS OWN instructions,
     # see aupi05/install.sh) into a single shared venv. Unlike
@@ -1293,28 +1294,78 @@ install_aupi_model() {
     GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
     popd >/dev/null
 
-    # 2b) Force the torch / torchvision / torchaudio trio to openpi's pinned
-    #     torch 2.7.1 from a SINGLE CUDA index, so their compiled ops share one ABI.
+    # 2b) Pin the whole torch stack (torch / torchvision / torchaudio 2.6.0 +
+    #     torchcodec 0.2.1) to RLinf's torch 2.6 set from a SINGLE cu126 index so
+    #     every compiled extension (torch, torchvision, torchaudio, torchcodec,
+    #     and the flash-attn wheel picked in step 3) shares one ABI.
     #
-    #     Why this is needed: openpi (aupi05/pyproject.toml) pins torch==2.7.1, but
-    #     the `uv sync --inexact` above does NOT upgrade RLinf's pre-installed
+    #     Why this is needed: openpi (aupi05/pyproject.toml) pins torch==2.7.1, so
+    #     the `uv sync --active --inexact` above drags parts of the stack toward
+    #     the 2.7 line (torchvision==0.22.1 built against torch 2.7.1, and
+    #     torchcodec==0.4.0 which ONLY supports torch 2.7) while RLinf's
     #     torch==2.6.0+cu126 (a local-version-tagged build kept in place by
-    #     --inexact), while it still pulls in torchvision==0.22.1 (which is built
-    #     against torch 2.7.1). The mismatched pair makes `import torchvision` raise
-    #     `RuntimeError: operator torchvision::nms does not exist`, which in turn
-    #     crashes `import openpi.models_pytorch.pi0_pytorch` (via
-    #     `from transformers import GemmaForCausalLM` -> torchvision) at training
-    #     actor-init, even though `import openpi` alone succeeds. Reinstalling all
-    #     three at the matched, demo3-verified set (torch 2.7.1 / torchvision 0.22.1
-    #     / torchaudio 2.7.1) from the cu126 index makes them ABI-consistent.
-    #     Must run BEFORE install_flash_attn so the flash-attn wheel matches torch 2.7.1.
-    echo "[au_install.sh] Aligning torch/torchvision/torchaudio to torch 2.7.1 (cu126) for openpi..."
-    uv pip install --reinstall \
-        torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+    #     --inexact) is NOT upgraded. The mismatched pairs break at runtime in two
+    #     ways: (a) torch 2.6 + torchvision 0.22.1 makes `import torchvision` raise
+    #     `RuntimeError: operator torchvision::nms does not exist`, crashing
+    #     `import openpi.models_pytorch.pi0_pytorch` (via `from transformers import
+    #     GemmaForCausalLM` -> torchvision) at actor-init; (b) torch 2.6 +
+    #     torchcodec 0.4.0 fails to register the CPU video-decode custom ops, so
+    #     LeRobot dataset loading dies with `Could not run
+    #     'torchcodec_ns::add_video_stream' with arguments from the 'CPU' backend`.
+    #     torch 2.6 is self-consistent for both RLinf and openpi's PyTorch path
+    #     (SFT trains fine on it), so we align the whole stack DOWN to 2.6 (torch
+    #     2.6 <-> torchcodec 0.2 per the official compat table) rather than up to
+    #     2.7.1.
+    #     Must run BEFORE install_flash_attn so the flash-attn wheel matches torch 2.6.
+    #
+    #     --no-config is REQUIRED here: this runs with cwd inside the RLinf repo,
+    #     whose pyproject.toml `[tool.uv] override-dependencies` pins
+    #     `torchcodec==0.2`. uv overrides win over command-line requirements, so
+    #     without --no-config our explicit `torchcodec==0.2.1` is silently forced
+    #     down to 0.2.0 — and the 0.2.0+cu126 wheel ships ONLY the ffmpeg 5/6/7
+    #     decoder libs (libtorchcodec5/6/7.so, needing libavutil.so.57/58/59),
+    #     which fail to load on hosts that only have FFmpeg 4 (libavutil.so.56).
+    #     0.2.1+cu126 additionally ships libtorchcodec4.so, so it loads against
+    #     the system FFmpeg 4. --no-config makes uv ignore pyproject/uv.toml so
+    #     the exact 0.2.1 pin is honored (the cu126 index is still forced via the
+    #     explicit --index-url below).
+    echo "[au_install.sh] Aligning torch/torchvision/torchaudio/torchcodec to torch 2.6 (cu126) for openpi..."
+    uv pip install --reinstall --no-config \
+        torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 torchcodec==0.2.1 \
         --index-url https://download.pytorch.org/whl/cu126
+    # torchcodec 0.2.1+cu126 is a CUDA build whose decoder .so files dlopen
+    # libnppicc.so.12 (NVIDIA NPP). uv does not pull NPP in automatically, so
+    # install it explicitly here; it is exposed on LD_LIBRARY_PATH in step 2c.
+    uv pip install nvidia-npp-cu12==12.4.1.87
     python -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; print('[au_install.sh] torch', torch.__version__, '| torchvision', torchvision.__version__, '| torchaudio', torchaudio.__version__, '| torchvision ops OK')"
 
-    # 3) Install flash-attn matching the torch 2.7.1 aligned in step 2b above.
+    # 2c) Expose the NPP shared libs (libnppicc.so.12 et al.) that torchcodec's
+    #     cu126 decoder needs at runtime. Without this, `from torchcodec.decoders
+    #     import VideoDecoder` fails with `libnppicc.so.12: cannot open shared
+    #     object file`, which breaks LeRobot video decoding during SFT. Append the
+    #     dir to the venv's activate so every future `source .../activate` (and
+    #     Ray worker that inherits it) picks it up; guard against duplicate lines
+    #     when the venv is reused. Also export it in the current shell so the
+    #     verification import below can load the decoder.
+    local _aupi_py_mm npp_lib
+    _aupi_py_mm=$(python - <<'EOF'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+EOF
+)
+    npp_lib="$VENV_DIR/lib/python${_aupi_py_mm}/site-packages/nvidia/npp/lib"
+    if [ -d "$npp_lib" ]; then
+        export LD_LIBRARY_PATH="${npp_lib}:${LD_LIBRARY_PATH:-}"
+        if ! grep -qsF "$npp_lib" "$VENV_DIR/bin/activate"; then
+            echo "export LD_LIBRARY_PATH=\"${npp_lib}:\$LD_LIBRARY_PATH\"" >> "$VENV_DIR/bin/activate"
+            echo "[au_install.sh] Added NPP lib dir to venv activate LD_LIBRARY_PATH: ${npp_lib}"
+        fi
+        python -c "from torchcodec.decoders import VideoDecoder; import torchcodec; print('[au_install.sh] torchcodec', torchcodec.__version__, 'decode ops load OK')"
+    else
+        echo "[au_install.sh] WARNING: NPP lib dir not found at '${npp_lib}'; torchcodec video decode may fail at runtime (libnppicc.so.12)." >&2
+    fi
+    uv pip install --reinstall hydra-core==1.4.0.dev1 omegaconf==2.4.0.dev4
+    # 3) Install flash-attn matching the torch 2.6 aligned in step 2b above.
     #    Mirrors every other OpenPI-based embodied model in this script, which
     #    installs flash-attn right after the openpi package itself.
     install_flash_attn

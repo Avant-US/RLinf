@@ -1,0 +1,78 @@
+defaults:
+  - model/pi0_5_au@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH,examples/sft}/config/
+
+cluster:
+  num_nodes: 3
+  component_placement:
+    actor: all                        # FSDP actor 占满 24 张 GPU
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "${oc.env:RLINF_PUSHDOOR_LOG,/gcs/physical-ai-data-eu/rlinf/runs/pi05_pushdoor_au_tst1}"
+    project_name: rlinf_au
+    experiment_name: "pi05_pushdoor_au_tst1_3node"
+    logger_backends: []
+  max_epochs: -1
+  max_steps: 50                       # 冒烟；正式训练调大（如 1000）
+  val_check_interval: -1
+  save_interval: 25                   # 25/50 各存一次（含 EMA）
+
+data:
+  train_data_paths: "${oc.env:RLINF_PUSHDOOR_DATA,/gcs/physical-ai-data-eu/DATA/SKILL/pushdoor/0622_lerobot_data_tst1}"
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 2                # 单卡本地 batch
+  global_batch_size: 48              # 24 GPU × 2 = 48(grad_accum = 1)
+  seed: 42
+
+  model:
+    precision: null
+    model_path: "${oc.env:RLINF_PUSHDOOR_MODEL,/workspace/model_local/pi05_pushdoor_r1pro_pt}"
+    num_action_chunks: 10
+    action_dim: 23                    # 20 维 state 布局 + chassis_vel(3)
+    add_value_head: False
+    faithful_augmentation: true
+    fp32_master_weights: false
+    sft_gradient_checkpointing: true
+    openpi:
+      config_name: "pi05_pushdoor"
+      train_expert_only: False
+
+  optim:
+    lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    ema_decay: 0.999
+    lr_scheduler: "openpi_cosine"
+    lr_warmup_steps: 100
+    decay_steps: 1000
+    decay_lr: 5.0e-6
+    total_training_steps: 50
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"   # 24 路全分片
+    use_orig_params: False
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: true
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    grad_scaler:
+      enabled: false

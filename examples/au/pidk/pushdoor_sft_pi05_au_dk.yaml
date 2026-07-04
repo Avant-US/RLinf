@@ -1,0 +1,90 @@
+# RLinf pi0.5 (openpi_au) pushdoor SFT — Docker-containerized config.
+#
+# Adapted from examples/au/pi/pushdoor_sft_pi05_au.yaml for Docker-based training.
+# Supports 1-N nodes. Defaults to single-node 8-GPU. Set RLINF_NUM_NODES and
+# RLINF_GLOBAL_BATCH at launch for multi-node (bootstrap.sh auto-computes these).
+#
+# world_size = RLINF_NUM_NODES * 8
+# global_batch_size must satisfy: global_batch_size % (micro_batch_size * world_size) == 0
+# With micro_batch_size=1 and 8 GPUs per node: default RLINF_GLOBAL_BATCH = NUM_NODES * 8.
+#
+# Group defaults (model/pi0_5_au, training_backend/fsdp) resolve via the
+# EMBODIED_PATH searchpath -> examples/sft/config (set by bootstrap.sh).
+defaults:
+  - model/pi0_5_au@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH,examples/sft}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "${oc.env:RLINF_PUSHDOOR_LOG,/workspace/output}"
+    project_name: rlinf_au
+    experiment_name: "pi05_pushdoor_tst1_dk"
+    logger_backends: []
+  max_epochs: -1
+  max_steps: 50
+  val_check_interval: -1    # disabled: OOM on eval (FSDP unsharding exhausts GPU memory)
+  save_interval: -1         # disabled: OOM on checkpoint save (same reason)
+
+data:
+  train_data_paths: "${oc.env:RLINF_PUSHDOOR_DATA,/workspace/data}"
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 8
+  seed: 0
+
+  model:
+    precision: null
+    model_path: "${oc.env:RLINF_PUSHDOOR_MODEL,/workspace/model}"
+    num_action_chunks: 10
+    action_dim: 23
+    add_value_head: False
+    faithful_augmentation: true
+    fp32_master_weights: false
+    sft_gradient_checkpointing: true
+    openpi:
+      config_name: "pi05_pushdoor"
+      train_expert_only: False
+
+  optim:
+    lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    ema_decay: 0.999
+    lr_scheduler: "openpi_cosine"
+    lr_warmup_steps: 100
+    decay_steps: 1000
+    decay_lr: 5.0e-6
+    total_training_steps: 50
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: False
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: true
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    grad_scaler:
+      enabled: false
