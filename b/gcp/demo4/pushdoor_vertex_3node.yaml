@@ -14,7 +14,7 @@ workerPoolSpecs:
       bootDiskType: hyperdisk-balanced
       bootDiskSizeGb: 1000
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260702
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260705
       command: ["/bin/bash"]
       args: ["/gcs/physical-ai-data-eu/rlinf/demo4/pushdoor_bootstrap.sh"]
       env:
@@ -44,7 +44,7 @@ workerPoolSpecs:
       bootDiskType: hyperdisk-balanced
       bootDiskSizeGb: 1000
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260702
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260705
       command: ["/bin/bash"]
       args: ["/gcs/physical-ai-data-eu/rlinf/demo4/pushdoor_bootstrap.sh"]
       env:
@@ -62,3 +62,5 @@ workerPoolSpecs:
 scheduling:
   timeout: 604800s
   restartJobOnWorkerRestart: false
+
+enableWebAccess: true

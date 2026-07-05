@@ -5,8 +5,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
-PY="${PY:-/mnt/r/VENV/openpi_venv/bin/python}"
-OPENPI_SRC="${OPENPI_SRC:-/home/physical/SRC/Robot/openpi05/src}"
+
+VENV="${VENV:-/mnt/r/VENV/rlinf}"
+OPENPI_SRC="${OPENPI_SRC:-/home/physical/SRC/Robot/aupi05/src}"
+
+set +u; source "${VENV}/bin/activate"; set -u
+
 MODEL_DIR="${RLINF_PUSHDOOR_MODEL:-$HERE/_ckpt/pi05_pushdoor_tst1}"
 REPO_ID="${RLINF_PUSHDOOR_DATA:-/mnt/r/DATA/SKILL/pushdoor/0622_lerobot_data_tst1}"
 # The tst1 dataset has 12 official episodes / 13136 frames total (see
@@ -38,12 +42,12 @@ export USE_TF="${USE_TF:-0}"
 export USE_FLAX="${USE_FLAX:-0}"
 
 cd "$REPO"
-echo "[run_norm_stats] python=$PY"
+echo "[run_norm_stats] python=$(which python)"
 echo "[run_norm_stats] repo_id=$REPO_ID"
 echo "[run_norm_stats] output_dir=$MODEL_DIR  max_frames=$MAX_FRAMES  num_workers=$NUM_WORKERS"
 echo "[run_norm_stats] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
-"$PY" -u examples/au/pi/compute_norm_stats_au.py \
+python -u examples/au/pi/compute_norm_stats_au.py \
     --config_name pi05_pushdoor \
     --repo_id "$REPO_ID" \
     --output_dir "$MODEL_DIR" \

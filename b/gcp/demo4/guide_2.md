@@ -1,6 +1,6 @@
-# 在 Vertex AI 上用 dev 镜像 `rlinf-aupi-dev:260702` 多机训练 pi0.5 pushdoor SFT
+# 在 Vertex AI 上用 dev 镜像 `rlinf-aupi-dev:260705` 多机训练 pi0.5 pushdoor SFT
 
-> **目标**：用 [`Dockerfile.aupi_dev`](./Dockerfile.aupi_dev) 构建的 dev 镜像 `rlinf-aupi-dev:260702`，在 Vertex AI 的 3 台 `a3-ultragpu-8g`（24×H200，`europe-west4-a` 预留）上，对 [`openpi_au`](../../../rlinf/models/embodiment/openpi_au/) 的 pi0.5 模型做 pushdoor（R1 Pro「推门」）SFT，数据集为 `0622_lerobot_data_tst1`（LeRobot v3，12 episodes / 13136 帧）。
+> **目标**：用 [`Dockerfile.aupi_dev`](./Dockerfile.aupi_dev) 构建的 dev 镜像 `rlinf-aupi-dev:260705`，在 Vertex AI 的 3 台 `a3-ultragpu-8g`（24×H200，`europe-west4-a` 预留）上，对 [`openpi_au`](../../../rlinf/models/embodiment/openpi_au/) 的 pi0.5 模型做 pushdoor（R1 Pro「推门」）SFT，数据集为 `0622_lerobot_data_tst1`（LeRobot v3，12 episodes / 13136 帧）。
 >
 > 本手册是 [`guide_1.md`](./guide_1.md) 的修订版，修正了已知问题并对齐当前代码。
 
@@ -14,7 +14,7 @@
 本地                                          GCP
 ─────────────────────────────────────────────────────────────────
 docker buildx --load                    Artifact Registry
-rlinf-aupi-dev:260702  ──tag+push──►    europe-west4-docker.pkg.dev/.../rlinf-aupi-dev:260702
+rlinf-aupi-dev:260705  ──tag+push──►    europe-west4-docker.pkg.dev/.../rlinf-aupi-dev:260705
                                               │
                                               ▼
 tar RLinf + aupi05 ──upload──►  GCS     Vertex AI 自定义训练作业
@@ -123,8 +123,8 @@ export REGION="europe-west4"
 export ZONE="europe-west4-a"
 
 # ---- 镜像 ----
-export LOCAL_IMAGE="rlinf-aupi-dev:260702"
-export AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/rlinf/rlinf-aupi-dev:260702"
+export LOCAL_IMAGE="rlinf-aupi-dev:260705"
+export AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/rlinf/rlinf-aupi-dev:260705"
 
 # ---- 存储（必须单区域桶）----
 export GCS_BUCKET="physical-ai-data-eu"
@@ -575,7 +575,7 @@ workerPoolSpecs:
       bootDiskType: hyperdisk-balanced
       bootDiskSizeGb: 1000
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260702
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260705
       command: ["/bin/bash"]
       args: ["/gcs/physical-ai-data-eu/rlinf/demo4/pushdoor_bootstrap.sh"]
       env:
@@ -605,7 +605,7 @@ workerPoolSpecs:
       bootDiskType: hyperdisk-balanced
       bootDiskSizeGb: 1000
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260702
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260705
       command: ["/bin/bash"]
       args: ["/gcs/physical-ai-data-eu/rlinf/demo4/pushdoor_bootstrap.sh"]
       env:
@@ -781,7 +781,7 @@ python examples/sft/train_vla_sft_au.py \
 
 ## 13. 首次运行校验清单
 
-1. **镜像已推送 AR**：`gcloud artifacts docker images list .../rlinf | grep aupi-dev` 能看到 `260702`。
+1. **镜像已推送 AR**：`gcloud artifacts docker images list .../rlinf | grep aupi-dev` 能看到 `260705`。
 2. **两份源码 tar 都已上传**：`gs://.../rlinf/code/RLinf.tar.gz` 与 `gs://.../rlinf/code/aupi05.tar.gz`。
 3. **bootstrap 已上传**：`gs://.../rlinf/demo4/pushdoor_bootstrap.sh`。
 4. **模型 + norm_stats**：`gs://.../models/pi05_pushdoor_r1pro_pt/{model.safetensors,rlinf/pushdoor_open0622/norm_stats.json}`。
@@ -811,7 +811,7 @@ python examples/sft/train_vla_sft_au.py \
 
 - **Job ID**：`2008330418461343744`
 - **现象**：bootstrap.sh 在 step 4c 执行 `gcloud storage rsync` 将模型权重从 GCS 复制到本地盘时报错 `gcloud: command not found`，所有 3 个节点均失败。
-- **根因**：dev 镜像 `rlinf-aupi-dev:260702` 基于 `nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04`，没有预装 `gcloud` CLI。bootstrap.sh 中使用 `gcloud storage rsync -r "gs://..." ...` 来 stage 模型权重，但容器内没有 `gcloud` 命令。
+- **根因**：dev 镜像 `rlinf-aupi-dev:260705` 基于 `nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04`，没有预装 `gcloud` CLI。bootstrap.sh 中使用 `gcloud storage rsync -r "gs://..." ...` 来 stage 模型权重，但容器内没有 `gcloud` 命令。
 - **修复**：
   - `pushdoor_bootstrap.sh`：将 `MODEL_GCS_URI="gs://..."` 改为 `MODEL_FUSE_DIR="/gcs/..."` （使用 GCS FUSE 挂载路径），将 `gcloud storage rsync -r "${MODEL_GCS_URI}" "${LOCAL_MODEL_DIR}"` 改为 `cp -r "${MODEL_FUSE_DIR}/." "${LOCAL_MODEL_DIR}/"` 。
 

@@ -1,6 +1,6 @@
-# 在 Vertex AI 上用 dev 镜像 `rlinf-aupi-dev:260702` 多机运行 pi0.5 pushdoor SFT 操作手册
+# 在 Vertex AI 上用 dev 镜像 `rlinf-aupi-dev:260705` 多机运行 pi0.5 pushdoor SFT 操作手册
 
-> **目标**：把用 [`Dockerfile.aupi_dev`](./Dockerfile.aupi_dev) 刚构建好的开发镜像 `rlinf-aupi-dev:260702`，配合 [`rlinf/models/embodiment/openpi_au/`](../../../rlinf/models/embodiment/openpi_au/) 里的 **pi0.5（openpi_au）**，在数据集 `/mnt/r/DATA/SKILL/pushdoor/0622_lerobot_data_tst1`（R1 Pro「推门」任务，LeRobot v3 格式）上，作为 **Vertex AI 自定义训练作业**在 `europe-west4-a` 预留资源的 **3 台 `a3-ultragpu-8g`（共 24×H200）** 上做多机分布式 SFT。
+> **目标**：把用 [`Dockerfile.aupi_dev`](./Dockerfile.aupi_dev) 刚构建好的开发镜像 `rlinf-aupi-dev:260705`，配合 [`rlinf/models/embodiment/openpi_au/`](../../../rlinf/models/embodiment/openpi_au/) 里的 **pi0.5（openpi_au）**，在数据集 `/mnt/r/DATA/SKILL/pushdoor/0622_lerobot_data_tst1`（R1 Pro「推门」任务，LeRobot v3 格式）上，作为 **Vertex AI 自定义训练作业**在 `europe-west4-a` 预留资源的 **3 台 `a3-ultragpu-8g`（共 24×H200）** 上做多机分布式 SFT。
 >
 > 本手册以 demo3 的 pushdoor 方案（[`b/gcp/demo3/gcp_rlinf_pi05_au.md`](../demo3/gcp_rlinf_pi05_au.md)）为蓝本，复用其已验证的 Vertex 多机机制（`CLUSTER_SPEC`→Ray、GCS FUSE、`hyperdisk-balanced`、模型 stage 到本地盘等）。**与 demo3 最本质的区别在于镜像不同**：demo4 用的是「editable 安装 + 源码运行时挂载」的开发镜像，而不是 demo3 那个把 openpi 装进 site-packages 的独立镜像。这带来三处必须显式处理的差异（见 §0.2），否则作业一定失败。
 >
@@ -14,7 +14,7 @@
 
 ```mermaid
 flowchart LR
-  local["本地工作站: docker buildx --load\nrlinf-aupi-dev:260702"] -->|"docker tag + push"| ar["Artifact Registry\n(europe-west4)"]
+  local["本地工作站: docker buildx --load\nrlinf-aupi-dev:260705"] -->|"docker tag + push"| ar["Artifact Registry\n(europe-west4)"]
   ar --> vertex["Vertex 自定义作业\n3x a3-ultragpu-8g / 24xH200"]
   subgraph gcs [GCS: physical-ai-data-eu]
     code["code/RLinf.tar.gz"]
@@ -31,7 +31,7 @@ flowchart LR
 
 dev 镜像由 [`Dockerfile.aupi_dev`](./Dockerfile.aupi_dev) 构建，它调用 [`requirements/au_install.sh`](../../../requirements/au_install.sh) 的 `install_aupi_model()`，用 `pip install -e` 把 **RLinf 本体**和 **openpi（aupi05）** 都以 **editable（可编辑）模式**装进同一个 venv。这与 demo3 的 [`Dockerfile.openpi_au`](../demo3/Dockerfile.openpi_au)（`COPY . /opt/openpi` + 常规 `pip install -e /opt/openpi`，openpi 落进 site-packages）行为完全不同。
 
-| # | 差异 | demo3（`rlinf-openpi-au`） | demo4（`rlinf-aupi-dev:260702`） | 手册对策 |
+| # | 差异 | demo3（`rlinf-openpi-au`） | demo4（`rlinf-aupi-dev:260705`） | 手册对策 |
 | --- | --- | --- | --- | --- |
 | **A** | venv 路径 | `/opt/venv/reason` | **`/venv/rlinf`**（Dockerfile `ARG VENV_DIR=/venv/rlinf`） | bootstrap 用 `source /venv/rlinf/bin/activate`（由 `VENV_PATH` 注入） |
 | **B** | openpi/RLinf 安装方式 | openpi 装进 site-packages，运行时只需 RLinf 源码 | **两者都是 editable**，`.pth` 指向构建期路径 `/workspace/RLinf`、`/workspace/aupi05` | 运行时**必须**把两份源码分别 stage 到这两个**精确路径**，否则 `import rlinf` / `import openpi` 直接 `ModuleNotFoundError` |
@@ -41,7 +41,7 @@ dev 镜像由 [`Dockerfile.aupi_dev`](./Dockerfile.aupi_dev) 构建，它调用 
 >
 > **差异 C 的原理与现状**：[`pi0_pytorch.py`](../../../../Robot/aupi05/src/openpi/models_pytorch/pi0_pytorch.py) 在 `PI0Pytorch.__init__` 里执行 `from transformers.models.siglip import check` 并断言 `check_whether_transformers_replace_is_installed_correctly()`（要求 `transformers==4.53.2` 且补丁文件已就位）。补丁源在 `aupi05/src/openpi/models_pytorch/transformers_replace/`，需要 `cp` 进 venv 的 `transformers/` 包目录。
 >
-> **本项已修复**：[`au_install.sh`](../../../requirements/au_install.sh) 的 `install_aupi_model()` 第 4 步现在会在安装期把补丁 `cp` 进 venv 的 transformers 并校验；[`Dockerfile.aupi_dev`](./Dockerfile.aupi_dev) 构建期 smoke test 也会再确认一次。因此**用修复后的 `au_install.sh` 重建的镜像已内置补丁**（本手册对应的 `rlinf-aupi-dev:260702` 已重建并通过 `transformers_replace patch OK (au version, baked into image)` 校验）。bootstrap 里那步运行时打补丁因此降级为**幂等安全网**——对已内置补丁的新镜像是无害的空操作，对修复前构建的旧镜像仍是必需的兜底。
+> **本项已修复**：[`au_install.sh`](../../../requirements/au_install.sh) 的 `install_aupi_model()` 第 4 步现在会在安装期把补丁 `cp` 进 venv 的 transformers 并校验；[`Dockerfile.aupi_dev`](./Dockerfile.aupi_dev) 构建期 smoke test 也会再确认一次。因此**用修复后的 `au_install.sh` 重建的镜像已内置补丁**（本手册对应的 `rlinf-aupi-dev:260705` 已重建并通过 `transformers_replace patch OK (au version, baked into image)` 校验）。bootstrap 里那步运行时打补丁因此降级为**幂等安全网**——对已内置补丁的新镜像是无害的空操作，对修复前构建的旧镜像仍是必需的兜底。
 
 ### 0.3 沿用 demo3 的既有事实（不再赘述原理，照单执行）
 
@@ -111,8 +111,8 @@ export REGION="europe-west4"
 export ZONE="europe-west4-a"
 
 # ---- 镜像 ----
-export LOCAL_IMAGE="rlinf-aupi-dev:260702"                       # 本地 docker buildx --load 产物
-export AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/rlinf/rlinf-aupi-dev:260702"  # 推送后 Vertex 用它
+export LOCAL_IMAGE="rlinf-aupi-dev:260705"                       # 本地 docker buildx --load 产物
+export AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/rlinf/rlinf-aupi-dev:260705"  # 推送后 Vertex 用它
 
 # ---- 存储（必须单区域桶）----
 export GCS_BUCKET="physical-ai-data-eu"
@@ -174,10 +174,10 @@ transformers_replace patch OK (au version, baked into image)        # Dockerfile
 ```bash
 docker buildx build -f b/gcp/demo4/Dockerfile.aupi_dev \
   --build-context aupi05=/home/physical/SRC/Robot/aupi05 \
-  -t rlinf-aupi-dev:260702 --load --progress=plain .
+  -t rlinf-aupi-dev:260705 --load --progress=plain .
 ```
 
-> 本手册对应的 `rlinf-aupi-dev:260702` **已按上述命令重建并通过补丁自检**——补丁已内置进镜像，无需在运行时再打（§9 bootstrap 的运行时打补丁因此是幂等安全网，见 §0.2）。
+> 本手册对应的 `rlinf-aupi-dev:260705` **已按上述命令重建并通过补丁自检**——补丁已内置进镜像，无需在运行时再打（§9 bootstrap 的运行时打补丁因此是幂等安全网，见 §0.2）。
 
 ### 4.2 运行时完整 import 链自检（可选，更严格）
 
@@ -602,7 +602,7 @@ workerPoolSpecs:
       bootDiskType: hyperdisk-balanced      # H200 机型强制
       bootDiskSizeGb: 1000
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260702
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260705
       command: ["/bin/bash"]
       args: ["/gcs/physical-ai-data-eu/rlinf/demo4/pushdoor_bootstrap.sh"]
       env:
@@ -632,7 +632,7 @@ workerPoolSpecs:
       bootDiskType: hyperdisk-balanced
       bootDiskSizeGb: 1000
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260702
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260705
       command: ["/bin/bash"]
       args: ["/gcs/physical-ai-data-eu/rlinf/demo4/pushdoor_bootstrap.sh"]
       env:
@@ -665,7 +665,7 @@ scheduling:
 # -> 提交 Vertex 作业。
 #
 # 前置（见 guide_1.md）：
-#   * dev 镜像 rlinf-aupi-dev:260702 已 push 到 Artifact Registry（§3）。
+#   * dev 镜像 rlinf-aupi-dev:260705 已 push 到 Artifact Registry（§3）。
 #   * 模型 + norm_stats 已在 gs://<bucket>/rlinf/models/pi05_pushdoor_r1pro_pt/（§6）。
 #   * 数据集已在 gs://<bucket>/DATA/SKILL/pushdoor/0622_lerobot_data_tst1/（§7）。
 # =============================================================================
@@ -782,13 +782,13 @@ tensorboard --logdir "gs://${GCS_BUCKET}/rlinf/runs/${EXP_NAME}" --port 6006
 | `global_batch_size ... not divisible` | 批大小整除不满足 | 保持 `global_batch_size % (16 * 8 * num_nodes) == 0`（3 节点：`384 % 384 == 0`） |
 | `INVALID_ARGUMENT ... hyperdisk-balanced` | H200 机型强制盘型 | `diskSpec.bootDiskType: hyperdisk-balanced`（配置已如此） |
 | norm_stats 找不到 | `{model}/rlinf/pushdoor_open0622/norm_stats.json` 缺失 | 按 §6.2 针对 `_tst1` 重算并 rsync 到 `${MODEL_GCS}` |
-| Vertex 无法拉镜像 / `IMAGE_PULL` 失败 | 用了本地镜像名而非 AR 全路径 | `imageUri` 必须是 `europe-west4-docker.pkg.dev/.../rlinf-aupi-dev:260702`，且已 `docker push`（§3） |
+| Vertex 无法拉镜像 / `IMAGE_PULL` 失败 | 用了本地镜像名而非 AR 全路径 | `imageUri` 必须是 `europe-west4-docker.pkg.dev/.../rlinf-aupi-dev:260705`，且已 `docker push`（§3） |
 
 ---
 
 ## 14. 首次真实运行校验清单
 
-1. **镜像用修复后的 `au_install.sh` 重建并推送 AR**：构建日志出现 `transformers_replace patch OK (au version, baked into image)`；`gcloud artifacts docker images list .../rlinf | grep aupi-dev` 能看到 `260702`。
+1. **镜像用修复后的 `au_install.sh` 重建并推送 AR**：构建日志出现 `transformers_replace patch OK (au version, baked into image)`；`gcloud artifacts docker images list .../rlinf | grep aupi-dev` 能看到 `260705`。
 2. **torch/torchvision 一致性已解决**（§4.3 已知问题）：`import openpi.models_pytorch.pi0_pytorch` 不再报 `torchvision::nms does not exist`（否则训练会在 actor 初始化崩溃）。
 3. **两份源码 tar 都已上传**：`gs://.../rlinf/code/RLinf.tar.gz` 与 `gs://.../rlinf/code/aupi05.tar.gz` 都存在。
 4. **bootstrap 已上传到 demo4/**：`gs://.../rlinf/demo4/pushdoor_bootstrap.sh`。

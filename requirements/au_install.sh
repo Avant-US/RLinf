@@ -1333,6 +1333,10 @@ install_aupi_model() {
     uv pip install --reinstall --no-config \
         torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 torchcodec==0.2.1 \
         --index-url https://download.pytorch.org/whl/cu126
+    uv pip install --reinstall --no-config --no-cache-dir  "protobuf>6.31.0,<7.0.0"
+    uv  pip install --reinstall --no-config --no-cache-dir  "ml_dtypes<1.0.0,>=0.5.1"
+    uv  pip install --reinstall --no-config --no-cache-dir  "flatbuffers>=25.9.23"
+
     # torchcodec 0.2.1+cu126 is a CUDA build whose decoder .so files dlopen
     # libnppicc.so.12 (NVIDIA NPP). uv does not pull NPP in automatically, so
     # install it explicitly here; it is exposed on LD_LIBRARY_PATH in step 2c.

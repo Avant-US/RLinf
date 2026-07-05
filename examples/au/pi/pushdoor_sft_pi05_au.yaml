@@ -41,9 +41,7 @@ runner:
     log_path: "${oc.env:RLINF_PUSHDOOR_LOG,../results_au_pushdoor}"
     project_name: rlinf_au
     experiment_name: "pi05_pushdoor_tst1_smoke50"
-    # Console/tqdm metrics by default (no extra dependency). To get TensorBoard
-    # logs, `pip install tensorboard` into the venv and set ["tensorboard"].
-    logger_backends: []
+    logger_backends: ["tensorboard"]
   max_epochs: -1
   max_steps: 50                     # smoke test: only verify pipeline runs + checkpoints
   val_check_interval: -1

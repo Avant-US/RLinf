@@ -5,8 +5,8 @@ export REGION="europe-west4"
 export ZONE="europe-west4-a"
 
 # ---- 镜像 ----
-export LOCAL_IMAGE="rlinf-aupi-dev:260702"
-export AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/rlinf/rlinf-aupi-dev:260702"
+export LOCAL_IMAGE="rlinf-aupi-dev:260705"
+export AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/rlinf/rlinf-aupi-dev:260705"
 
 # ---- 存储（必须单区域桶）----
 export GCS_BUCKET="physical-ai-data-eu"

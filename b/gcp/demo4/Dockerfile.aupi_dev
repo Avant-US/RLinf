@@ -51,7 +51,7 @@
 #
 # Build (BuildKit "named additional context" brings in the aupi05 checkout;
 # the main context is the RLinf repo itself — run this from the RLinf repo root):
-#   docker buildx build  -f b/gcp/demo4/Dockerfile.aupi_dev  --build-context aupi05=/home/physical/SRC/Robot/aupi05  -t rlinf-aupi-dev:260702  --load .
+#   docker buildx build  -f b/gcp/demo4/Dockerfile.aupi_dev  --build-context aupi05=/home/physical/SRC/Robot/aupi05  -t rlinf-aupi-dev:260705  --load .
 #
 # Run (bind-mount your live checkouts back over the same paths baked in above;
 # --gpus all is needed for the torch/jax CUDA smoke-test import at build time

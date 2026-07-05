@@ -69,6 +69,7 @@ gcloud storage cp "${AUPI_TAR}"                         "${GCS_ROOT}/code/aupi05
 # 4. 提交 Vertex 作业
 echo ">> Submitting Vertex AI job: ${DISPLAY_NAME} in ${REGION}"
 gcloud ai custom-jobs create \
+  --enable-dashboard-access --enable-web-access  \
   --region="${REGION}" \
   --display-name="${DISPLAY_NAME}" \
   --config="${SCRIPT_DIR}/pushdoor_vertex_3node.yaml"

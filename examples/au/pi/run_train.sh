@@ -9,8 +9,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 
-PY="${PY:-/mnt/r/VENV/openpi_venv/bin/python}"
-OPENPI_SRC="${OPENPI_SRC:-/home/physical/SRC/Robot/openpi05/src}"
+VENV="${VENV:-/mnt/r/VENV/rlinf}"
+OPENPI_SRC="${OPENPI_SRC:-/home/physical/SRC/Robot/aupi05/src}"
+
+set +u; source "${VENV}/bin/activate"; set -u
 
 # Hydra group defaults (model/pi0_5_au, training_backend/fsdp) resolve via this dir.
 export EMBODIED_PATH="${REPO}/examples/sft"
@@ -45,7 +47,7 @@ export RLINF_PUSHDOOR_DATA="${RLINF_PUSHDOOR_DATA:-/mnt/r/DATA/SKILL/pushdoor/06
 export RLINF_PUSHDOOR_LOG="${RLINF_PUSHDOOR_LOG:-$HERE/_out}"
 # Base pi0.5 weights to stage (symlink) into the model dir. Swap for the converted
 # r1_pro checkpoint dir if you have one (must contain model.safetensors + config.json).
-BASE_CKPT="${BASE_CKPT:-/mnt/r/CKPT/VLA/pi05_base_pt_fp32}"
+BASE_CKPT="${BASE_CKPT:-/mnt/r/CKPT/VLA/DEMO/pi05_pushdoor_tst1}"
 
 # --- Stage base weights: symlink model.safetensors + config.json into MODEL_DIR ---
 # get_model() loads weights from {model_path}/model.safetensors and quantile norm
@@ -64,6 +66,10 @@ for f in model.safetensors config.json; do
         fi
     fi
 done
+if [ ! -e "${RLINF_PUSHDOOR_MODEL}/rlinf" ] && [ -d "${BASE_CKPT}/rlinf" ]; then
+    ln -s "${BASE_CKPT}/rlinf" "${RLINF_PUSHDOOR_MODEL}/rlinf"
+    echo "[run_train] symlinked rlinf/ <- ${BASE_CKPT}/rlinf"
+fi
 
 # --- Preflight: norm stats present ---
 NORM="${RLINF_PUSHDOOR_MODEL}/rlinf/pushdoor_open0622/norm_stats.json"
@@ -87,7 +93,7 @@ cd "$REPO"
 echo "[run_train] 8-GPU pi0.5 pushdoor(tst1) SFT smoke test: batch 128, 50 steps, save every 25, EMA 0.999"
 echo "[run_train] model_path=$RLINF_PUSHDOOR_MODEL  data=$RLINF_PUSHDOOR_DATA  log=$RLINF_PUSHDOOR_LOG"
 
-"$PY" examples/sft/train_vla_sft_au.py \
+python examples/sft/train_vla_sft_au.py \
     --config-path "$HERE" \
     --config-name pushdoor_sft_pi05_au
 

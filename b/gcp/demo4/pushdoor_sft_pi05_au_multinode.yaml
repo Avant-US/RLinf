@@ -21,7 +21,7 @@ runner:
     log_path: "${oc.env:RLINF_PUSHDOOR_LOG,/gcs/physical-ai-data-eu/rlinf/runs/pi05_pushdoor_au_tst1}"
     project_name: rlinf_au
     experiment_name: "pi05_pushdoor_au_tst1_3node"
-    logger_backends: []
+    logger_backends: ["tensorboard"]
   max_epochs: -1
   max_steps: 50                       # 冒烟；正式训练调大（如 1000）
   val_check_interval: -1
