@@ -1,0 +1,66 @@
+workerPoolSpecs:
+  # ─── primary / head ───
+  - replicaCount: 1
+    machineSpec:
+      machineType: a3-ultragpu-8g
+      acceleratorType: NVIDIA_H200_141GB
+      acceleratorCount: 8
+      reservationAffinity:
+        reservationAffinityType: SPECIFIC_RESERVATION
+        key: compute.googleapis.com/reservation-name
+        values:
+          - projects/autel-ai-physical-spat-intel/zones/europe-west4-a/reservations/reservation-20260422-033135
+    diskSpec:
+      bootDiskType: hyperdisk-balanced
+      bootDiskSizeGb: 1000
+    containerSpec:
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260705
+      command: ["/bin/bash"]
+      args: ["/gcs/physical-ai-data-eu/rlinf/demo4/pushdoor_bootstrap.sh"]
+      env:
+        - name: GCS_BUCKET
+          value: "physical-ai-data-eu"
+        - name: EXP_NAME
+          value: "pi05_pushdoor_au_tst1_3node"
+        - name: RAY_PORT
+          value: "6379"
+        - name: VENV_PATH
+          value: "/venv/rlinf"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+
+  # ─── workers ───
+  - replicaCount: 2
+    machineSpec:
+      machineType: a3-ultragpu-8g
+      acceleratorType: NVIDIA_H200_141GB
+      acceleratorCount: 8
+      reservationAffinity:
+        reservationAffinityType: SPECIFIC_RESERVATION
+        key: compute.googleapis.com/reservation-name
+        values:
+          - projects/autel-ai-physical-spat-intel/zones/europe-west4-a/reservations/reservation-20260422-033135
+    diskSpec:
+      bootDiskType: hyperdisk-balanced
+      bootDiskSizeGb: 1000
+    containerSpec:
+      imageUri: europe-west4-docker.pkg.dev/autel-ai-physical-spat-intel/rlinf/rlinf-aupi-dev:260705
+      command: ["/bin/bash"]
+      args: ["/gcs/physical-ai-data-eu/rlinf/demo4/pushdoor_bootstrap.sh"]
+      env:
+        - name: GCS_BUCKET
+          value: "physical-ai-data-eu"
+        - name: EXP_NAME
+          value: "pi05_pushdoor_au_tst1_3node"
+        - name: RAY_PORT
+          value: "6379"
+        - name: VENV_PATH
+          value: "/venv/rlinf"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+
+scheduling:
+  timeout: 604800s
+  restartJobOnWorkerRestart: false
+
+enableWebAccess: true
