@@ -1,0 +1,39 @@
+\begin{algorithm}[H]
+    \SetAlgoLined
+    \caption{Training \ours{} (Sec.~\refcolor{3.2})}\label{algo:train}
+    \KwIn{CoT-SFT checkpoint $\mathcal{F}_{\theta_0}$, training data $\mathcal{D}$, rollout size $N$, latent reasoning steps $M$, number of waypoints $K$, total iterations $T_{\text{total}}$}
+    \KwOut{Trained student model $\mathcal{F}_\theta$}
+    
+    \tcp{Initialize models}
+    $\mathcal{F}_\theta^T \leftarrow \mathcal{F}_{\theta_0}$, $\mathcal{F}_\theta \leftarrow \mathcal{F}_{\theta_0}$\;
+    Initialize verbalizer $\mathcal{V}_\psi$ from pre-trained LLM\;
+    $t \leftarrow 0$\;
+    
+    \While{$t < T_{\text{total}}$}{
+        Sample batch $(o, l, \hat{p})$ from $\mathcal{D}$\;\tcp{Suppose bs=1 for simplicity}
+        \vspace{0.5em}
+        
+        \tcp{Teacher GRPO training}
+        Generate $N$ rollouts $\{\tau_i\}_{i=1}^N$ from $\mathcal{F}_\theta^T(o, l)$\;
+        Compute trajectory rewards $\{r_i\}_{i=1}^N$\;
+        Compute group-wise advantages $\{A_i\}_{i=1}^N$\;
+        Update $\mathcal{F}_\theta^T$ with $\mathcal{J}_{\text{GRPO}}$ (Eq.~\refcolor{1})\;
+        $\tau^+ \leftarrow \arg\max_i A_i$, $\tau^- \leftarrow \arg\min_i A_i$ (Eq.~\refcolor{3}) \tcp*{For student distillation}
+        $h_t^T \leftarrow$ hidden state of $\tau^+$ at \texttt{<answer>} token from $\mathcal{F}_\theta^T$ \tcp*{For distillation loss}
+
+        \vspace{0.5em}
+        \tcp{Student latent distillation}
+        $\mathbf{z} = \{z_m\}_{m=1}^M \leftarrow \mathcal{F}_\theta(o, l)$ \tcp*{Perform auto-regressive latent reasoning}
+        Compute $\mathcal{L}_{\text{verb}}$ with $\mathbf{z}$, $\mathcal{V}_\psi$, $\tau^+$, $\tau^-$ (Eq.~\refcolor{4})\;
+        
+        Forward $K$ spatial tokens from $\mathcal{F}_\theta(o, l, \mathbf{z})$ to obtain $h_t$ and $\{h^\prime(\mathbf{s}_i)\}_{i=1}^K$\;
+        Compute $\mathcal{L}_{\text{distill}}$ with $h_t^T$, $h_t$ (Eq.~\refcolor{5})\;
+        Compute $\mathcal{L}_{\text{ans}}$ with $\{h^\prime(\mathbf{s}_i)\}_{i=1}^K$, $\hat{p}$ (Eq.~\refcolor{6})\;
+        
+        Update $\mathcal{F}_\theta$ with $\mathcal{L}_{\text{student}} = \mathcal{L}_{\text{verb}} + \mathcal{L}_{\text{distill}} + \mathcal{L}_{\text{ans}}$\;
+        
+        $t \leftarrow t + 1$\;
+    }
+    
+    \Return{$\mathcal{F}_\theta$}\;
+\end{algorithm}

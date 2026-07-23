@@ -1,0 +1,66 @@
+\section{Experiment}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+\label{ssec:exp_setup}
+
+\paragraph{Implementation Details}
+
+We initialize $\mathcal{F}_\theta$ with Qwen2.5-VL 7B~\cite{bai2025qwen2}. The cold-start stage runs for 20K iterations with batch size 32 and learning rate $1\text{e}{-5}$ using DeepSpeed ZeRO-3. We then apply GRPO~\cite{shao2024deepseekmath} for 6K iterations, using batch size 64, learning rate $1\text{e}{-6}$, and rollout size 5. The action model $\pi_\phi$ is a DiT-based policy~\cite{chi2023diffusion} with 432M parameters, pre-trained using the OXE dataset~\cite{o2024open}, where the state encoder is composed of a DINOv2 image encoder~\cite{oquab2023dinov2} and a CLIP text encoder~\cite{radford2021learning} that jointly encode the current state inputs into $1024$-dim embeddings. For reasoning-enhanced action adaptation, we connect the visual plan $c_t$ via a Q-Former~\cite{li2023blip} as the latent projector with 32 queries and fine-tune on 100K OXE samples for 120K iterations using batch size 256 and learning rate $2\text{e}{-5}$. LIBERO~\cite{liu2023libero} tasks are further fine-tuned for 75K iterations with batch size 128. All experiments are conducted on 16 NVIDIA A100 GPUs with 80 GB memory.
+
+\paragraph{Training Datasets and Evaluation Benchmarks}
+
+For SFT cold-start, we fine-tune the MLLM using trajectories from the subset of OXE, and QA tasks from RoboVQA~\cite{sermanet2024robovqa}, EgoPlan-IT~\cite{chen2023egoplan}, and Video-R1-CoT~\cite{feng2025video}. During RL training, we incorporate trajectories from the OXE subset and human videos from Something-Something v2~\cite{goyal2017something}. To enhance general reasoning capability, we include embodied QA datasets such as EgoPlan-IT/Val~\cite{chen2023egoplan}, RoboVQA~\cite{sermanet2024robovqa}, and the Reflect dataset~\cite{liu2023reflect}, as well as a general video instruction dataset, i.e., LLaVA-Video-178K~\cite{zhang2024video}.
+
+We evaluate \ours{} on two robot manipulation and three embodied reasoning benchmarks. For manipulation tasks, SimplerEnv~\cite{li24simpler} containing diverse scenes and LIBERO~\cite{liu2023libero} with long-horizon tasks are evaluated using task success rate. For reasoning benchmarks, EgoPlan-Bench2~\cite{qiu2024egoplan} uses accuracy on multiple-choice questions, while RoboVQA~\cite{sermanet2024robovqa} and OpenEQA~\cite{majumdar2023openeqa} are free-form QA tasks evaluated using BLEU score~\cite{papineni2002bleu} and LLM-based scoring, respectively, following their original protocols. Further details of our experimental setup are provided in the supplementary material.
+
+\subsection{Quantitative Evaluation}
+\paragraph{Robot Manipulation}
+\input{tables/simpler}
+
+
+To assess the effectiveness of \ours{} on robot manipulation task, we evaluate on SimplerEnv~\cite{li24simpler} and LIBERO~\cite{liu2023libero}. SimplerEnv~\cite{li24simpler} includes Google-VM (Visual Matching), Google-VA (Variant Aggregation), and Bridge-VM setups, introducing variations in color, material, lighting, and camera pose to evaluate model robustness. For the LIBERO~\cite{liu2023libero} benchmark, following prior works~\cite{kim24openvla, zhao2025cot}, we evaluate on the LIBERO-Spatial, LIBERO-Object, LIBERO-Goal, and LIBERO-Long subtasks to test model generalization across spatial layouts, object variations, goal diversity, and long-horizon planning.
+
+As shown in Tab.~\ref{tab:simpler_libero}, on the SimplerEnv, incorporating our reasoning-guided visual plan latents allows \ours{} to outperform our baseline action model, DiT-Policy, by 15.5\%, 16.9\%, and 11.4\% on Google-VM, Google-VA, and Bridge-VM, respectively, achieving the highest overall scores of 71.5\%, 65.1\%, and 43.8\% against all methods. On the LIBERO benchmark, \ours{} achieves the best overall success rate of 84.4\%, outperforming DiT-Policy and recent state-of-the-art CoT-VLA~\cite{zhao2025cot}, verifying the effectiveness on diverse robotic manipulation settings.
+
+
+
+\input{tables/embodied_reasoning}
+
+
+\paragraph{Embodied Reasoning}
+
+In Tab.~\ref{tab:embodied_reasoning}, we assess the reasoning capability of \ours{} in embodied scenarios on three benchmarks: EgoPlan-Bench2~\cite{qiu2024egoplan}, RoboVQA~\cite{sermanet2024robovqa}, and OpenEQA~\cite{majumdar2023openeqa}. EgoPlan-Bench2~\cite{qiu2024egoplan} measures multi-step planning in egocentric daily-life scenarios, while RoboVQA~\cite{sermanet2024robovqa} focuses on long-horizon reasoning in robotic manipulation. \ours{} outperforms the second-best method by 2.5\% and 4.1 BLEU score on these two benchmarks, demonstrating its strength in long-horizon and multi-step planning. Separately, OpenEQA~\cite{majumdar2023openeqa} measures zero-shot embodied understanding across diverse environments. The enhanced reasoning ability of \ours{} enables better generalization and scene comprehension, resulting in strong performance on this benchmark.
+
+
+
+\input{figures/visualize_manipulation}
+
+
+
+\input{figures/visualize_comparisons}
+
+\subsection{Qualitative Results}
+
+
+In Fig.~\ref{fig:qualitative_manipulation}, we qualitatively showcase the reasoning process and execution scenes of two manipulation examples from the Simpler-Bridge~\cite{li24simpler} and LIBERO-Long~\cite{liu2023libero} tasks. In the LIBERO-Long task “Pick up the book and place it in the back compartment,” \ours{} decomposes the instruction into sub-tasks: (1) pick up the book, (2) move from left to right, and (3) place it in the compartment, demonstrating its \emph{long-horizon} planning capability. We also visualize the planned trajectory, confirming that the gripper closely follows the reasoning-guided plan during execution.
+
+To better illustrate the impact of RL on the reasoning process, Fig.~\ref{fig:qualitative_comparisons} compares \ours{} before and after RL fine-tuning on embodied reasoning tasks. As we can observe in Fig.~\ref{fig:qualitative_comparisons}(a), using a RoboVQA~\cite{sermanet2024robovqa} example, the SFT cold-start model focuses only on the current state and fails to reason over future steps, while the RL-tuned model successfully infers the correct answer. Also, as demonstrated in Fig.~\ref{fig:qualitative_comparisons}(b), from OpenEQA~\cite{majumdar2023openeqa}, the cold-start model misinterprets the question, whereas the RL-tuned version demonstrates improved question and environment understanding. More qualitative comparisons and demo videos are provided in the supplementary material.
+
+
+\subsection{Ablation Study}
+In Tab.~\ref{tab:ablation_reward}, we ablate the proposed goal reward $r_\text{goal}$ and trajectory reward $r_\text{traj}$ to analyze their individual contributions to reasoning and planning. We start from the full version of \ours{}, which achieves the best performance across all benchmarks. Removing the trajectory reward leads to a noticeable drop, indicating that $r_\text{traj}$ is essential for learning coherent and structured planning behaviors. Without the goal reward, performance also declines, suggesting that $r_\text{goal}$ plays a key role in incentivizing long-horizon reasoning. When both $r_\text{traj}$ and $r_\text{goal}$ are removed, leaving only QA-style reward from QA datasets, the model shows only marginal improvements over the SFT baseline, confirming that action-aligned visual feedback is critical for effective multi-step planning in embodied settings. Finally, the SFT cold-start model without RL yields the lowest scores, verifying the effectiveness of our RL fine-tuning for eliciting the reasoning capability in MLLMs. More ablation studies (e.g., the number of interactions per reasoning step $N$) are provided in the supplementary material.
+
+
+\subsection{Analysis of \ours{}}
+
+In this section, we analyze the capabilities of \ours{} in enhancing robotic manipulation by embodied reasoning. We focus on two key aspects: (1) how reasoning facilitates effective few-shot adaptation to new tasks and environments, and (2) how it enables the robot to detect failures and perform self-correction during task execution. Through both quantitative experiments and qualitative examples, we demonstrate the unique advantages of leveraging a reasoning MLLM to tackle embodied action tasks. We further provide the analysis of MLLM backbones in the supplementary material.
+
+\input{tables/reward_ablation_fewshot}
+\input{figures/visualize_reflection}
+
+\paragraph{Reasoning Enhance Few-Shot Adaptation}
+As we can observe in Fig.~\ref{fig:qualitative_manipulation} and Fig.~\ref{fig:qualitative_comparisons}, \ours{} is capable of describing the environment and decomposing task instructions into meaningful sub-goals. To validate whether such reasoning improves the action model's adaptability, we conduct a few-shot adaptation experiment on the LIBERO benchmark~\cite{liu2023libero}. Specifically, we use LIBERO-Spatial and LIBERO-Object to evaluate adaptation to \textit{unseen environments}, and LIBERO-Goal to test adaptation to \textit{new skills}. We fine-tune the action model on just 10 demonstrations per task and evaluate performance over 100 trials. As shown in Fig.~\ref{fig:fewshot}, \ours{} consistently outperforms state-of-the-art methods, achieving the highest success rates across all tasks. Notably, it surpasses Magma~\cite{yang2025magma} by 7.3\% on LIBERO-Goal and by 9.5\% on LIBERO-Spatial, demonstrating the effectiveness of reasoning capability for few-shot generalization in both novel skills and environments.
+
+\paragraph{Reasoning Elicit Self-Correction}
+Failure detection and self-correction are critical for robust robot manipulation~\cite{liu2023reflect}. To evaluate whether \ours{} can reason about and recover from execution errors, we enable the reasoning MLLM to observe more contextual information during execution by extending its input from a single image $o_t$ to a short video segment $o_{t-N:t}$. This temporal context allows \ours{} to detect failures, reconsider the situation, and replan accordingly. For example, as shown in Fig.~\ref{fig:qualitative_reflection}, in a task where the robot is instructed to place a box into a basket, the gripper accidentally drops the box midway. The reasoning MLLM identifies the failure, says “Let's reconsider how to complete the task,” and generates a revised plan that guides the gripper back to the dropped location to regrasp the box. The robot then successfully completes the task, demonstrating \ours{}'s ability to reflect on errors and self-correct through structured reasoning.

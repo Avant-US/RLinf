@@ -1,0 +1,66 @@
+\documentclass[10pt,logo,copyright]{nvidiatechreport}
+\linespread{1.15}
+
+\input{packages}
+% \input{common.tex}
+
+\usepackage{pifont}
+\newcommand{\cmark}{\ding{51}} % Tick mark
+\newcommand{\xmark}{\ding{55}} % Cross mark
+
+
+\usepackage[nameinlink]{cleveref}
+\crefname{equation}{Eq.}{Eqs.}
+\crefname{figure}{Fig.}{Figs.}
+\crefname{section}{Sec.}{Sec.}
+\crefname{appendix}{App.}{App.}
+\crefname{table}{Tab.}{Tabs.}
+\crefname{algorithm}{Algo}{Algo}
+\crefname{thm}{Thm}{Thm}
+\Crefname{thm}{Thm}{Thm}
+\crefname{prop}{Prop}{Prop}
+
+\definecolor{darkred}{rgb}{0.7, 0.0, 0.0}
+
+
+\def\ours{ThinkAct}
+
+\newcommand{\crefnames}[3]{%
+  \@for\next:=#1\do{%
+    \expandafter\crefname\expandafter{\next}{#2}{#3}%
+  }%
+}
+
+\title{ThinkAct: Vision-Language-Action Reasoning via Reinforced Visual Latent Planning}
+
+\author{
+    {Chi-Pin Huang}$^{1,2}$\quad {Yueh-Hua Wu}$^1$\quad {Min-Hung Chen}$^1$ \quad {Yu-Chiang Frank Wang}$^{1,2}$\quad {Fu-En Yang}$^{1}$\\
+    \normalsize \textsuperscript{1} NVIDIA \quad
+    \normalsize \textsuperscript{2} National Taiwan University
+}
+
+
+
+\begin{document}
+
+\maketitle
+
+\input{sections/0_abstract}
+\abscontent
+\input{sections/1_introduction}
+\input{sections/2_related_work}
+\input{sections/3_method}
+\input{sections/4_experiment}
+\input{sections/5_conclusion}
+
+
+\clearpage
+\input{sections/X_appendix}
+
+
+\clearpage
+\setcitestyle{numbers}
+\bibliographystyle{plainnat}
+\bibliography{main}
+
+\end{document}

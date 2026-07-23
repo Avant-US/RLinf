@@ -1,0 +1,26 @@
+\begin{table*}[t]
+\centering
+\caption{\textbf{Quantitative results with larger model size (7B or 8B) on embodied reasoning benchmarks.}}
+\resizebox{1.0\textwidth}{!}{
+\small
+\begin{tabular}{lccccccccccccc}
+\toprule
+\textbf{Method} & \multicolumn{5}{c}{\textbf{EgoPlan-Bench2}} & \multicolumn{5}{c}{\textbf{RoboVQA}} & \textbf{OpenEQA} & \cellcolor{gray!15}\textbf{Overall} \\
+\cmidrule(lr){2-6} \cmidrule(lr){7-11}
+ & Daily. & Work. & Rec. & Hobbies & Avg. & B-1 & B-2 & B-3 & B-4 & B-Avg. & Score & \cellcolor{gray!15}Avg. \\
+\midrule
+InternVL2.5-8B~\cite{chen2024expanding} & 36.2 & 28.7 & 34.4 & 35.4 & 33.5 & 40.5 & 33.3 & 29.6 & 27.5 & 32.7 & 54.4 & \cellcolor{gray!15}40.2 \\
+InternVL3-8B~\cite{zhu2025internvl3} & 38.5 & 32.9 & 36.1 & 37.2 & 36.2 & 44.3 & 36.5 & 31.6 & 28.9 & 35.3 & 55.5 & \cellcolor{gray!15}42.3 \\
+NVILA-8B~\cite{liu2024nvila} & 35.8 & 28.7 & 37.2 & 35.4 & 33.7 & 42.7 & 39.7 & 37.6 & 36.1 & 39.0 & 54.0 & \cellcolor{gray!15}42.2 \\
+Qwen2.5-VL-7B~\cite{bai2025qwen2} & 31.4 & 26.7 & 29.5 & 28.6 & 29.1 & 47.8 & 41.2 & 36.2 & 33.7 & 39.7 & 50.8 & \cellcolor{gray!15}39.9 \\
+Magma-8B~\cite{yang2025magma} & 32.1 & 25.7 & 34.4 & 29.3 & 29.8 & 38.6 & 31.5 & 28.1 & 26.7 & 31.2 & 49.1 & \cellcolor{gray!15}36.7 \\
+RoboBrain2.0-7B~\cite{team2025robobrain2} & 39.4 & 27.0 & 33.9 & 32.2 & 33.2 & 44.9 & 38.2 & 34.7 & 33.5 & 37.8 & 51.1 & \cellcolor{gray!15}40.7 \\
+ThinkAct-7B~\cite{huang2025thinkact} & 50.1 & 49.8 & 44.8 & 45.2 & 48.2 & 69.1 & 61.8 & 56.0 & 52.4 & 59.8 & 56.2 & \cellcolor{gray!15}54.7 \\
+\midrule
+\ours{}-7B & 51.3 & 47.3 & 41.5 & 45.9 & 47.5 & 70.4 & 63.3 & 57.3 & 53.2 & 61.1 & 59.0 & \cellcolor{gray!15}\textbf{55.9} \\
+\bottomrule
+\end{tabular}
+}
+\label{tab:supp_er_7b}
+\vspace{-2mm}
+\end{table*}

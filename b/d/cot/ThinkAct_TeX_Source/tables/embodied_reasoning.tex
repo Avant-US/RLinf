@@ -1,0 +1,43 @@
+\begin{table*}[t]
+    \centering
+    \caption{Quantitative comparisons of embodied reasoning tasks on EgoPlan-Bench2, RoboVQA, and OpenEQA benchmarks. Note that, Qwen2.5-VL* indicates fine-tuning the original Qwen2.5-VL using EgoPlan-IT~\cite{chen2023egoplan} and RoboVQA~\cite{sermanet2024robovqa} datasets. \textbf{Bold} denotes the best result.}
+    \resizebox{\textwidth}{!}{
+        \label{tab:embodied_reasoning}
+        \begin{tabular}{ll|ccccccccc}
+            \toprule
+            \textbf{Dataset} & \textbf{Split / Metric} &
+            \makecell{\textbf{\footnotesize GPT-4V}} & \makecell{\textbf{\footnotesize LLaVA-Video}} &
+            \makecell{\textbf{\footnotesize InternVL2.5}} & \makecell{\textbf{\footnotesize InternVL3}} & \makecell{\textbf{\footnotesize NVILA}} &
+            \makecell{\textbf{\footnotesize Qwen2.5-VL}} & \makecell{\textbf{\footnotesize Qwen2.5-VL*}} &
+            \makecell{\textbf{\footnotesize Magma}} & \makecell{\textbf{\footnotesize \ours{}}\\\textbf{\footnotesize (Ours)}} \\
+            \midrule
+            \multirow{5}{*}{\makecell[l]{EgoPlan-\\Bench2}}
+              & Daily life   & 36.7 & 38.0 & 36.2 & 38.5 & 35.8 & 31.4 & 47.9 & 32.1 & 50.1 \\
+              & Work         & 27.7 & 29.9 & 28.7 & 32.9 & 28.7 & 26.7 & 46.3 & 25.7 & 49.8 \\
+              & Recreation   & 33.9 & 39.0 & 34.4 & 36.1 & 37.2 & 29.5 & 44.3 & 34.4 & 44.8 \\
+              & Hobbies      & 32.5 & 37.4 & 35.4 & 37.2 & 35.4 & 28.6 & 44.2 & 29.3 & 45.2 \\
+              \rowcolor{gray!20}
+              & Overall      & 32.6 & 35.5 & 33.5 & 36.2 & 33.7 & 29.1 & 45.7 & 29.8 & \textbf{48.2} \\
+            \midrule
+            \multirow{5}{*}{RoboVQA}
+              & BLEU-1   & 32.2 & 35.4 & 40.5 & 44.3 & 42.7 & 47.8 & 65.3 & 38.6 & 69.1 \\
+              & BLEU-2   & 26.5 & 32.1 & 33.3 & 36.5 & 39.7 & 41.2 & 57.3 & 31.5 & 61.8 \\
+              & BLEU-3   & 24.7 & 30.0 & 29.6 & 31.6 & 37.6 & 36.2 & 52.2 & 28.1 & 56.0 \\
+              & BLEU-4   & 23.9 & 29.0 & 27.5 & 28.9 & 36.1 & 33.7 & 48.0 & 26.7 & 52.4 \\
+              \rowcolor{gray!20}
+              & Overall  & 26.8 & 31.6 & 32.7 & 35.3 & 39.0 & 39.7 & 55.7 & 31.2 & \textbf{59.8} \\
+            \midrule
+            \multirow{8}{*}{OpenEQA}
+              & Obj.\ State      & 63.2 & 69.1 & 70.2 & 68.9 & 66.1 & 63.2 & 62.4 & 59.9 & 70.0 \\
+              & Obj.\ Recog.     & 43.4 & 42.6 & 47.2 & 49.1 & 49.5 & 46.2 & 45.2 & 43.8 & 47.2 \\
+              & Func.\ Reason.   & 57.4 & 50.3 & 56.2 & 54.6 & 51.0 & 51.2 & 52.3 & 50.0 & 53.2 \\
+              & Spatial          & 33.6 & 46.2 & 44.1 & 43.3 & 43.1 & 41.2 & 42.8 & 39.3 & 47.6 \\
+              & Attri.\ Recog.   & 57.2 & 64.1 & 64.9 & 74.4 & 69.3 & 63.0 & 65.0 & 58.3 & 71.1 \\
+              & World Know.      & 50.7 & 60.5 & 56.5 & 53.1 & 59.4 & 54.3 & 54.2 & 53.3 & 58.6 \\
+              & Obj.\ Loc.       & 42.0 & 38.2 & 41.9 & 45.0 & 39.9 & 36.5 & 41.9 & 38.9 & 45.9 \\
+              \rowcolor{gray!20}
+              & Overall          & 49.6 & 53.0 & 54.4 & 55.5 & 54.0 & 50.8 & 52.0 & 49.1 & \textbf{56.2} \\
+            \bottomrule
+        \end{tabular}
+    }
+\end{table*}

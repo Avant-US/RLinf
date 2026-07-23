@@ -793,22 +793,24 @@ flowchart TB
 
 下面按「CoT 形态 × 训练信号 × 动作头」对照——用户方案落在表中「**显式语言 CoT + 以动作质量/回报反哺 VLM + 连续 DiT**」象限。
 
-| 工作 | CoT 形态 | VLM/推理如何训 | 动作头如何训 | 与用户想法的关系 |
-|------|----------|----------------|--------------|------------------|
-| **SCST** (Rennie et al., CVPR 2017) | 图像描述序列 | REINFORCE；**self-critical baseline**=贪心解码奖励 | N/A（无机器人） | **经典模板**：非可微序列指标 → \(-A\log\pi\)；务必借鉴其 **baseline** |
-| **ECoT** (Zawalski et al., 2024) | 显式 embodied 文本 CoT（plan/bbox/gripper） | **纯 SFT**（合成 CoT 标签） | 离散动作 token，AR | 证明「先想后动」有效，但**无 RL**；CoT 与动作共训、可导 teacher-forcing |
-| **ERVLA** (2026) | 训练期 CoT，推理期 dropout | SFT + reasoning-dropout | 直接出动作 | 警示：把 CoT 当 **AR 前缀** 易 compounding error；可借鉴「训练用、推理可跳过」 |
-| **ACoT-VLA** (CVPR 2026) | **动作空间**粗轨迹作 CoT（EAR+IAR） | 端到端 **flow-MSE**（可导） | flow-MSE | 同目标「推理服务动作」，但**无离散采样、无 REINFORCE** |
-| **DualCoT-VLA** | 可学习 query（视觉/语言）对齐辅助模块 | 对齐损失；推理时丢弃辅助 | DiT + FM-MSE | CoT 被做成 **可微 query**，避开采样——与用户「真采样」不同 |
-| **ThinkAct** (NeurIPS 2025) | MLLM 长 CoT → 压成 **visual plan latent** | **GRPO**；奖励=目标完成+轨迹 DTW+format | DiT **IL/MSE**；**训动作时冻结 MLLM** | **架构最接近用户**：双系统、采样推理、下游 DiT。差异：①奖励是**视觉/轨迹对齐**而非动作 MSE；②分阶段，非同步用 MSE 推 VLM |
-| **LaST-R1** | **连续 latent CoT**（非语言） | **LAPO**（PPO 风格联合优化 latent+action） | 离散/并行动作；**环境回报** | 联合 RL 推理与动作，但 latent 连续、奖励来自 env，不是 offline MSE |
-| **VLA-RFT** | 无显式语言 CoT | 对整策略 **GRPO** + 辅助 FM-MSE | Flow head | 「GRPO + 小权重 MSE 辅助」可借鉴到联合目标，但优化对象主要是动作策略 |
-| **RLinf 现状**（本文 §1–§8） | 无 CoT 采样 | VLM 连续条件可导进专家 | Flow-SDE \(\log\pi(a)\) + GRPO/PPO | 对**动作**做 RL；**不是**对 CoT token 做 REINFORCE |
+| 工作 | 论文 / 代码 | CoT 形态 | VLM/推理如何训 | 动作头如何训 | 与用户想法的关系 |
+|------|-------------|----------|----------------|--------------|------------------|
+| **SCST** (Rennie et al., CVPR 2017) | [论文](https://arxiv.org/abs/1612.00563) · [代码*](https://github.com/ruotianluo/self-critical.pytorch) | 图像描述序列 | REINFORCE；**self-critical baseline**=贪心解码奖励 | N/A（无机器人） | **经典模板**：非可微序列指标 → \(-A\log\pi\)；务必借鉴其 **baseline** |
+| **ECoT** (Zawalski et al., 2024) | [论文](https://arxiv.org/abs/2407.08693) · [代码](https://github.com/MichalZawalski/embodied-CoT) · [主页](https://embodied-cot.github.io/) | 显式 embodied 文本 CoT（plan/bbox/gripper） | **纯 SFT**（合成 CoT 标签） | 离散动作 token，AR | 证明「先想后动」有效，但**无 RL**；CoT 与动作共训、可导 teacher-forcing |
+| **ERVLA** (2026) | [论文](https://arxiv.org/abs/2606.03784) · [主页](https://taoshuaiz.github.io/ERVLA/)（代码宣称将释出） | 训练期 CoT，推理期 dropout | SFT + reasoning-dropout | 直接出动作 | 警示：把 CoT 当 **AR 前缀** 易 compounding error；可借鉴「训练用、推理可跳过」 |
+| **ACoT-VLA** (CVPR 2026) | [论文](https://arxiv.org/abs/2601.11404) · [代码](https://github.com/AgibotTech/ACoT-VLA) | **动作空间**粗轨迹作 CoT（EAR+IAR） | 端到端 **flow-MSE**（可导） | flow-MSE | 同目标「推理服务动作」，但**无离散采样、无 REINFORCE** |
+| **DualCoT-VLA** | [论文](https://arxiv.org/abs/2603.22280) · [主页](https://livfour.github.io/DualCoT-VLA/)（暂无公开 GitHub） | 可学习 query（视觉/语言）对齐辅助模块 | 对齐损失；推理时丢弃辅助 | DiT + FM-MSE | CoT 被做成 **可微 query**，避开采样——与用户「真采样」不同 |
+| **ThinkAct** (NeurIPS 2025) | [论文](https://arxiv.org/abs/2507.16815) · [主页](https://jasper0314-huang.github.io/thinkact-vla/)（暂无官方训练代码） | MLLM 长 CoT → 压成 **visual plan latent** | **GRPO**；奖励=目标完成+轨迹 DTW+format | DiT **IL/MSE**；**训动作时冻结 MLLM** | **架构最接近用户**：双系统、采样推理、下游 DiT。差异：①奖励是**视觉/轨迹对齐**而非动作 MSE；②分阶段，非同步用 MSE 推 VLM |
+| **LaST-R1** | [论文](https://arxiv.org/abs/2604.28192) · [代码](https://github.com/CHEN-H01/LaST-R1) | **连续 latent CoT**（非语言） | **LAPO**（PPO 风格联合优化 latent+action） | 离散/并行动作；**环境回报** | 联合 RL 推理与动作，但 latent 连续、奖励来自 env，不是 offline MSE |
+| **VLA-RFT** | [论文](https://arxiv.org/abs/2510.00406) · [代码](https://github.com/OpenHelix-Team/VLA-RFT) · [主页](https://vla-rft.github.io/) | 无显式语言 CoT | 对整策略 **GRPO** + 辅助 FM-MSE | Flow head | 「GRPO + 小权重 MSE 辅助」可借鉴到联合目标，但优化对象主要是动作策略 |
+| **RLinf 现状**（本文 §1–§8） | [代码](https://github.com/RLinf/RLinf) · [文档](https://rlinf.readthedocs.io/en/latest/) | 无 CoT 采样 | VLM 连续条件可导进专家 | Flow-SDE \(\log\pi(a)\) + GRPO/PPO | 对**动作**做 RL；**不是**对 CoT token 做 REINFORCE |
+
+> \*SCST：官方未维护统一训练仓；上表链到社区广泛使用的 PyTorch 复现 [`ruotianluo/self-critical.pytorch`](https://github.com/ruotianluo/self-critical.pytorch)（非 IBM 官方）。
 
 **综合判断**：
 
 1. **与用户最同构的是 ThinkAct 的双系统**：先采样推理，再条件化 DiT；用 RL 塑形推理。但 ThinkAct 用 **GRPO + 视觉对齐奖励**，且 DiT 阶段冻结推理模型——用户希望 **\(A\) 直接来自动作 MSE**、且两路可同训，这是差异点，也是创新空间。
-2. **SCST / 组相对 baseline** 是把「MSE→REINFORCE」做稳的关键遗产：裸 \(A=-\mathrm{mse}\) 方差极大。
+2. **SCST / 组相对 baseline 是把「MSE→REINFORCE」做稳的关键遗产：裸 \($A=-\mathrm{mse}$\) 方差极大。**
 3. **ECoT 的合成 CoT SFT** 仍是最好的 **cold-start**：纯 REINFORCE 从零学 CoT 几乎必崩。
 4. **ACoT / DualCoT** 提醒：若能把「推理」做成可微表示，就不必付 REINFORCE 方差税；用户坚持**可读语言 CoT** 时才值得走离散采样。
 5. **ERVLA** 提醒：推理期强制解码长 CoT 有延迟与误差累积；方案应支持「训练采样 CoT / 推理可选」。
@@ -845,28 +847,28 @@ $R(z) \;=\;
 
 | 方法 | 公式直觉 | 来源 |
 |------|----------|------|
-| **组相对（首选）** | 同 \((o,\ell)\) 采 \(K\) 条 \(z\)；\(A_i=(R_i-\mu)/\sigma\) | GRPO / ThinkAct；与 RLinf `adv_type: grpo` 同构，只是「组」在 CoT 上 |
-| **SCST** | \(A=R(z^{\mathrm{sample}})-R(z^{\mathrm{greedy}})\) | SCST；\(K=1\) 时廉价 baseline |
-| **Leave-one-out** | \(A_i=R_i-\mathrm{mean}_{j\neq i}R_j\) | RLOO；无 critic |
+| **组相对（首选）** | 同 \($(o,\ell)$\) 采 \(K\) 条 \(z\)；\($A_i=(R_i-\mu)/\sigma$\) | GRPO / ThinkAct；与 RLinf `adv_type: grpo` 同构，只是「组」在 CoT 上 |
+| **SCST** | \($A=R(z^{\mathrm{sample}})-R(z^{\mathrm{greedy}})$\) | SCST；\(K=1\) 时廉价 baseline |
+| **Leave-one-out** | \($A_i=R_i-\mathrm{mean}_{j\neq i}R_j$\) | RLOO；无 critic |
 
-用户原话「以 VLA 的 MSE 作为 adv」在工程上应实现为：**\(R=-\mathrm{mse}\)，再经组相对/SCST 得到 \(A\)**，而不是直接 \(A=\mathrm{mse}\) 不归一无 baseline。
+用户原话「以 VLA 的 MSE 作为 adv」在工程上应实现为：**\($R=-\mathrm{mse}$\)，再经组相对/SCST 得到 \(A\)**，而不是直接 \($A=\mathrm{mse}$\) 不归一无 baseline。
 
 #### 11.3.3 损失与梯度流
 
 \[
-\begin{aligned}
-L_{\mathrm{DiT}} &= \mathrm{FM\text{-}MSE}\big(\pi_{\mathrm{DiT}}(\cdot\mid o,\ell,\mathrm{sg}(c)),\,a^\star\big), \\
+$$\begin{aligned}
+L_{\mathrm{DiT}} &= \mathrm{FM\text{-}MSE}\big(\pi_{\mathrm{DiT}}(\cdot\mid o,\ell,\mathrm{stop_grad}(c)),\,a^\star\big), \\
 L_{\mathrm{VLM}} &= -\mathbb{E}_{z\sim\pi_{\mathrm{VLM}}}\big[A(z)\,\log\pi_{\mathrm{VLM}}(z\mid o,\ell)\big]
 \quad\text{（}A\text{ detach）}, \\
 L &= L_{\mathrm{DiT}} + \lambda L_{\mathrm{VLM}} - \omega\,\mathcal{H}[\pi_{\mathrm{VLM}}].
-\end{aligned}
+\end{aligned}$$
 \]
 
 - **DiT**：pathwise，只更新动作头（及可选未冻结的视觉塔）。
-- **VLM**：score-function，只经 \(\log\pi_{\mathrm{VLM}}\)；**不要**对 \(L_{\mathrm{DiT}}\) 解冻 VLM 再反传（与 `sg(c)` 冲突）。
-- 若同时保留「无 CoT 的连续前缀路径」，可另加小权重端到端 FM 作辅助（VLA-RFT 的 \(\lambda_{\mathrm{mse}}\) 思路），稳定早期动作头。
+- **VLM**：score-function，只经 \($\log\pi_{\mathrm{VLM}}$\)；**不要**对 \($L_{\mathrm{DiT}}$\) 解冻 VLM 再反传（与 `stop_grad(c)` 冲突）。
+- 若同时保留「无 CoT 的连续前缀路径」，可另加小权重端到端 FM 作辅助（VLA-RFT 的 \($\lambda_{\mathrm{mse}}$\) 思路），稳定早期动作头。
 
-与 [grpo_vlm_analyz_1.md](grpo_vlm_analyz_1.md) §12 对齐：\(L_{\mathrm{VLM}}\) 正是提案中的 `loss_type: reinforce`；若要更稳，可换成仓库已有的 `loss_type: actor`（clipped \(r\)）+ `adv_type: grpo`，即 **ThinkAct 式 GRPO**，仍作用在 CoT token 上。
+与 [grpo_vlm_analyz_1.md](grpo_vlm_analyz_1.md) §12 对齐：\($L_{\mathrm{VLM}}$\) 正是提案中的 `loss_type: reinforce`；若要更稳，可换成仓库已有的 `loss_type: actor`（clipped \(r\)）+ `adv_type: grpo`，即 **ThinkAct 式 GRPO**，仍作用在 CoT token 上。
 
 #### 11.3.4 训练课程序（综合 ECoT cold-start + ThinkAct 分阶段 + 用户联合目标）
 
@@ -879,7 +881,7 @@ flowchart LR
 
 1. **Stage 0 — CoT SFT**：用合成 embodied CoT（ECoT 管线）或人工/强模型标注，teacher-forcing 训 VLM 会写合法 CoT。无此步直接 REINFORCE → 高方差 + 格式崩塌。
 2. **Stage 1 — DiT 适配**：冻结（或低 lr）VLM；用 **贪心/教师 CoT** 或 plan latent 条件化 DiT，纯 MSE/FM，直到动作头能跟条件。
-3. **Stage 2 — 联合（用户核心）**：对每个 demo \((o,\ell,a^\star)\) 采 \(K\) 条 \(z\)；算 \(R_i=-\mathrm{mse}_i+\ldots\)；组相对得 \(A_i\)；\(L_{\mathrm{DiT}}\) 对 \(K\) 条可平均或只对 greedy/best；\(L_{\mathrm{VLM}}\) 用 REINFORCE/GRPO。建议 VLM lr \(\ll\) DiT lr。
+3. **Stage 2 — 联合（用户核心）**：对每个 demo \($(o,\ell,a^\star)$\) 采 \(K\) 条 \(z\)；算 \($R_i=-\mathrm{mse}_i+\ldots$\)；组相对得 \(A_i\)；\($L_{\mathrm{DiT}}$\) 对 \(K\) 条可平均或只对 greedy/best；\($L_{\mathrm{VLM}}$\) 用 REINFORCE/GRPO。建议 VLM lr \($\ll$\) DiT lr。
 4. **Stage 3（可选）— 环境 online**：把 \(R\) 换成任务成功/稠密 shaping（或 ThinkAct 视觉奖励），在仿真里闭式改进；MSE 项降权为辅助，避免「只拟合演示分布」。
 
 #### 11.3.5 在 RLinf 中的落点（设计映射，非已实现）
@@ -887,9 +889,9 @@ flowchart LR
 | 模块 | 复用 | 需新增 |
 |------|------|--------|
 | 离散生成 | reasoning 路径的 vLLM/SGLang；或 HF `generate`（`starvla/.../fast.py` 已有先例） | VLA forward 内「先 gen CoT 再条件 DiT」的编排 |
-| \(\log\pi_{\mathrm{VLM}}\) | `compute_logprobs_from_logits`（reasoning Actor） | 对 CoT response mask 重算 logprob（训练步 teacher-forcing 于已采样 \(z\)） |
+| \($\log\pi_{\mathrm{VLM}}$\) | `compute_logprobs_from_logits`（reasoning Actor） | 对 CoT response mask 重算 logprob（训练步 teacher-forcing 于已采样 \(z\)） |
 | Advantage | `compute_grpo_advantages` / `raw` + normalize；§12 `reinforce` | reward 函数：\(-\mathrm{mse}(+format)\)；组在 CoT 维而非 env step |
-| DiT MSE | `lingbotvla.sft_forward` / flow head FM loss | 条件输入改为 `sg(encode(z))` |
+| DiT MSE | `lingbotvla.sft_forward` / flow head FM loss | 条件输入改为 `stop_grad(encode(z))` |
 | Runner | 更接近 **SFT worker + 内嵌采样**，或混合 worker | 非标准 `EmbodiedRunner` env loop（Stage 2 是 offline demo） |
 | 配置 | `group_size=K`, `loss_type: reinforce` 或 `actor` | 新 `cot_enable`, `cot_reward: mse_fmt`, `lambda_vlm` |
 
@@ -950,7 +952,7 @@ flowchart TD
 
 ### 11.6 小结
 
-用户设想与 **ThinkAct（双系统 + RL 塑形推理 + DiT 执行）** 同构，与 **SCST（序列 REINFORCE + self-critical）** 同数学骨架，又比二者多了一步：**直接用下游动作头的模仿 MSE 作为（标准化后的）奖励**——这在公开 VLA-CoT 文献里相对少见，更常见的是环境成功、视觉目标/轨迹对齐或可验证 QA。把它做成稳定系统的关键，不是「会不会写 \(-A\log\pi\)」，而是 **cold-start、组 baseline、奖励塑形、梯度隔离 `sg(z)`、分阶段课程序**。映射到 RLinf，算法侧可复用 reasoning 的 logprob/GRPO/§12 reinforce 提案，模型侧需新增 CoT 采样与条件化 DiT 的桥；与本文主线 Flow-SDE-GRPO（对动作）可并存为「推理 RL + 动作 RL」两层，但勿混用同一套 `logprobs` 张量语义。
+用户设想与 **ThinkAct（双系统 + RL 塑形推理 + DiT 执行）** 同构，与 **SCST（序列 REINFORCE + self-critical）** 同数学骨架，又比二者多了一步：**直接用下游动作头的模仿 MSE 作为（标准化后的）奖励**——这在公开 VLA-CoT 文献里相对少见，更常见的是环境成功、视觉目标/轨迹对齐或可验证 QA。把它做成稳定系统的关键，不是「会不会写 \(-A\log\pi\)」，而是 **cold-start、组 baseline、奖励塑形、梯度隔离 `stop_grad(z)`、分阶段课程序**。映射到 RLinf，算法侧可复用 reasoning 的 logprob/GRPO/§12 reinforce 提案，模型侧需新增 CoT 采样与条件化 DiT 的桥；与本文主线 Flow-SDE-GRPO（对动作）可并存为「推理 RL + 动作 RL」两层，但勿混用同一套 `logprobs` 张量语义。
 
 ### 11.7 软件系统设计与落地方案
 
@@ -1130,13 +1132,13 @@ flowchart LR
   subgraph fwd [Forward]
     O[obs+lang] --> CotS[sample z]
     CotS --> LogP["logπ_VLM(z) TF recompute"]
-    CotS --> SG["c = sg(encode(z))"]
+    CotS --> SG["c = stop_grad(encode(z))"]
     SG --> FM["FM-MSE(DiT)"]
   end
   subgraph bwd [Backward]
     FM -->|"∂L_DiT / ∂θ_DiT"| DiTθ[DiT weights]
     LogP -->|"∂L_VLM / ∂θ_VLM via A·logπ"| VLMθ[VLM weights]
-    FM -.->|"blocked by sg"| VLMθ
+    FM -.->|"blocked by stop_grad"| VLMθ
     LogP -.->|"no path"| DiTθ
   end
 ```
@@ -1146,7 +1148,7 @@ flowchart LR
 | Stage | VLM | DiT / 专家 | 损失 |
 |-------|-----|------------|------|
 | 0 `cot_sft` | 训 | 冻 | CE on CoT labels |
-| 1 `dit_adapt` | 冻（或极低 lr） | 训 | FM-MSE；\(c\) 来自教师/贪心 CoT + `sg` |
+| 1 `dit_adapt` | 冻（或极低 lr） | 训 | FM-MSE；\(c\) 来自教师/贪心 CoT + `stop_grad` |
 | 2 `hcrs_joint` | 训（小 lr） | 训 | \(L_{\mathrm{DiT}}+\lambda L_{\mathrm{VLM}}\) |
 | 3（预留） | 按需 | 按需 | env \(R\) 为主 |
 
@@ -1304,7 +1306,7 @@ import rlinf._au.algorithms.losses  # noqa: F401 register reinforce
 | `examples/au/hcrs/config/hcrs_cot_sft.yaml` | Stage0 |
 | `examples/au/hcrs/config/hcrs_dit_adapt.yaml` | Stage1 |
 | `examples/au/hcrs/config/hcrs_joint_sft.yaml` | Stage2 主配置 |
-| `tests_au/unit_tests/test_hcrs_bridge_detach.py` | `sg(c)` 无 VLM 梯度 |
+| `tests_au/unit_tests/test_hcrs_bridge_detach.py` | `stop_grad(c)` 无 VLM 梯度 |
 | `tests_au/unit_tests/test_hcrs_reinforce_loss.py` | \(L=-A\log\pi\) |
 | `tests_au/unit_tests/test_hcrs_cot_reward.py` | 奖励塑形 |
 | `tests_au/e2e_tests/test_hcrs_stage2_synthetic.py` | 合成 batch 一步 |
@@ -1338,7 +1340,7 @@ import rlinf._au.algorithms.losses  # noqa: F401 register reinforce
 |-------------------|----------|--------|
 | \(z\sim\pi_{\mathrm{VLM}}\) | `CotSampler.sample_with_logprob` | `hcrs.cot_max_new_tokens` |
 | \(\log\pi_{\mathrm{VLM}}(z)\) | `teacher_force_logprob` + `compute_logprobs_from_logits` | — |
-| \(c=\mathrm{sg}(\mathrm{encode}(z))\) | `CotBridge.encode_stopgrad` | `actor.model.bridge_*` |
+| \(c=\mathrm{stop_grad}(\mathrm{encode}(z))\) | `CotBridge.encode_stopgrad` | `actor.model.bridge_*` |
 | \(L_{\mathrm{DiT}}=\mathrm{FM\text{-}MSE}\) | `DiTAdapter.flow_mse` | `actor.model.dit_backend` |
 | \(R=-\mathrm{mse}+\ldots\) | `CotMseReward.compute` | `hcrs.reward.*` |
 | \(A\) 组相对 / SCST | `group_normalize_cot` / core GRPO | `hcrs.group_size_k`, `algorithm.adv_type` |

@@ -1,0 +1,139 @@
+\begin{thebibliography}{10}
+
+\bibitem{MSCOCO}
+Tsung{-}Yi Lin, Michael Maire, Serge~J. Belongie, Lubomir~D. Bourdev, Ross~B.
+  Girshick, James Hays, Pietro Perona, Deva Ramanan, Piotr Doll{\'{a}}r, and
+  C.~Lawrence Zitnick.
+\newblock Microsoft {COCO:} common objects in context.
+\newblock {\em EECV}, 2014.
+
+\bibitem{ChoMGBSB14}
+Kyunghyun Cho, Bart van Merrienboer, {\c{C}}aglar G{\"{u}}l{\c{c}}ehre, Fethi
+  Bougares, Holger Schwenk, and Yoshua Bengio.
+\newblock Learning phrase representations using {RNN} encoder-decoder for
+  statistical machine translation.
+\newblock {\em EMNLP}, 2014.
+
+\bibitem{GoogleNIC}
+Oriol Vinyals, Alexander Toshev, Samy Bengio, and Dumitru Erhan.
+\newblock Show and tell: {A} neural image caption generator.
+\newblock {\em CVPR}, 2015.
+
+\bibitem{KarpathyF14}
+Andrej Karpathy and Fei{-}Fei Li.
+\newblock Deep visual-semantic alignments for generating image descriptions.
+\newblock {\em CVPR}, 2015.
+
+\bibitem{HochreiterLSTM}
+Sepp Hochreiter and J\"{u}rgen Schmidhuber.
+\newblock Long short-term memory.
+\newblock {\em Neural Comput.}, 1997.
+
+\bibitem{CapAttention}
+Kelvin Xu, Jimmy Ba, Ryan Kiros, Kyunghyun Cho, Aaron~C. Courville, Ruslan
+  Salakhutdinov, Richard~S. Zemel, and Yoshua Bengio.
+\newblock Show, attend and tell: Neural image caption generation with visual
+  attention.
+\newblock In {\em ICML}, 2015.
+
+\bibitem{Ranzato}
+Marc'Aurelio Ranzato, Sumit Chopra, Michael Auli, and Wojciech Zaremba.
+\newblock Sequence level training with recurrent neural networks.
+\newblock {\em ICLR}, 2015.
+
+\bibitem{ScheduledSampling}
+Samy Bengio, Oriol Vinyals, Navdeep Jaitly, and Noam Shazeer.
+\newblock Scheduled sampling for sequence prediction with recurrent neural
+  networks.
+\newblock In {\em NIPS}, 2015.
+
+\bibitem{ProfessorForcing}
+Alex Lamb, Anirudh Goyal, Ying Zhang, Saizheng Zhang, Aaron Courville, and
+  Yoshua Bengio.
+\newblock Professor forcing: A new algorithm for training recurrent networks.
+\newblock {\em Neural Information Processing Systems (NIPS) 2016}, 2016.
+
+\bibitem{BLEU}
+Kishore Papineni, Salim Roukos, Todd Ward, and Wei-Jing Zhu.
+\newblock Bleu: A method for automatic evaluation of machine translation.
+\newblock In {\em ACL}, 2002.
+
+\bibitem{lin2004rouge}
+Chin-Yew Lin.
+\newblock Rouge: A package for automatic evaluation of summaries.
+\newblock In {\em Text summarization branches out: Proceedings of the ACL-04
+  workshop}, volume~8. Barcelona, Spain, 2004.
+
+\bibitem{banerjee2005meteor}
+Satanjeev Banerjee and Alon Lavie.
+\newblock Meteor: An automatic metric for mt evaluation with improved
+  correlation with human judgments.
+\newblock In {\em Proceedings of the acl workshop on intrinsic and extrinsic
+  evaluation measures for machine translation and/or summarization}, volume~29,
+  pages 65--72, 2005.
+
+\bibitem{CIDEr}
+Ramakrishna Vedantam, C.~Lawrence Zitnick, and Devi Parikh.
+\newblock Cider: Consensus-based image description evaluation.
+\newblock In {\em CVPR}, 2015.
+
+\bibitem{Sutton:1998}
+Richard~S. Sutton and Andrew~G. Barto.
+\newblock {\em Reinforcement learning: {A}n introduction}.
+\newblock MIT Press, 1998.
+
+\bibitem{Reinforce}
+Ronald~J. Williams.
+\newblock Simple statistical gradient-following algorithms for connectionist
+  reinforcement learning.
+\newblock In {\em Machine Learning}, pages 229--256, 1992.
+
+\bibitem{schulman2015high}
+John Schulman, Philipp Moritz, Sergey Levine, Michael Jordan, and Pieter
+  Abbeel.
+\newblock High-dimensional continuous control using generalized advantage
+  estimation.
+\newblock {\em arXiv preprint arXiv:1506.02438}, 2015.
+
+\bibitem{ZarembaS15}
+Wojciech Zaremba and Ilya Sutskever.
+\newblock Reinforcement learning neural turing machines.
+\newblock {\em Arxiv}, 2015.
+
+\bibitem{mnih2014neural}
+Andriy Mnih and Karol Gregor.
+\newblock Neural variational inference and learning in belief networks.
+\newblock {\em arXiv preprint arXiv:1402.0030}, 2014.
+
+\bibitem{actorCriticSequence}
+Dzmitry Bahdanau, Philemon Brakel, Kelvin Xu, Anirudh Goyal, Ryan Lowe, Joelle
+  Pineau, Aaron~C. Courville, and Yoshua Bengio.
+\newblock An actor-critic algorithm for sequence prediction.
+\newblock {\em Arxiv}, 2016.
+
+\bibitem{ADAM}
+Diederik~P. Kingma and Jimmy Ba.
+\newblock Adam: {A} method for stochastic optimization.
+\newblock {\em ICLR}, 2015.
+
+\bibitem{Karpathy}
+Andrej Karpathy and Fei-Fei Li.
+\newblock Deep visual-semantic alignments for generating image descriptions.
+\newblock In {\em CVPR}, 2015.
+
+\bibitem{he15deepresidual}
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+\newblock Deep residual learning for image recognition.
+\newblock In {\em CVPR}, 2016.
+
+\bibitem{VinyalsTBE16}
+Oriol Vinyals, Alexander Toshev, Samy Bengio, and Dumitru Erhan.
+\newblock Show and tell: Lessons learned from the 2015 {MSCOCO} image
+  captioning challenge.
+\newblock {\em PAMI}, 2016.
+
+\bibitem{Jinchoi_contextmodels}
+Myung Jinchoi, Antonio Torralba, and Alan~S. Willsky.
+\newblock Context models and out-of-context objects.
+
+\end{thebibliography}
