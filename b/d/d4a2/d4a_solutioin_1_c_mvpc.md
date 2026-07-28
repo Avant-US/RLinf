@@ -27,6 +27,8 @@
 - [12. 度量与评测](#12-度量与评测)
 - [13. 风险分析与失败模式](#13-风险分析与失败模式)
 - [14. 与 MVPA / MVPB / 主方案的关系](#14-与-mvpa--mvpb--主方案的关系)
+- [附录：相关知识](#附录相关知识)
+  - [A.1 GEAR-VLA 中 VGGT 的梯度来源](#a1-gear-vla-中-vggt-的梯度来源stop-gradient-之后谁在训练-3d-编码器)
 
 ---
 
@@ -675,9 +677,94 @@ $$
 s_{\text{input}} = \text{ForwardRoll}(s_{\text{observed}}, a_{\text{executing}})
 $$
 
-### 7.6 测试时候选打分
+### 7.6 训练时：4D 世界模型如何监督动作策略
 
-**[D] 这是 4D 世界模型分支的终极价值**——不仅训练时提供监督，推理时也参与决策。
+> 前面 §7.2–§7.5 主要描述了 4D 世界模型的**架构和推理时用途**，但 4D 世界模型在**训练时**对动作策略的监督作用同样关键。本节显式阐明三条训练时的监督通路——它们是 4D 世界模型分支区别于 §6 的轻量辅助损失的核心价值所在。
+
+#### 通路一：视频/4D 预测损失作为共享表征的辅助塑形（间接监督）
+
+§7.5 的 UWM 技巧引入了 $\mathcal{L}_{\text{video}}(t_v)$，但它的训练时价值值得显式展开：
+
+**机制**：scene 支（latent diffusion）在训练时被要求预测未来帧/latent。这个预测损失 $\mathcal{L}_{\text{video}}$ 反传到共享骨干（VLM + VGGT），迫使共享表征编码**时空动态信息**——"当前场景 + 当前动作 → 场景会怎么变"。这些动态信息虽然不直接出现在动作损失中，但它们塑造了 DiT 动作专家所消费的 latent action token 的质量。
+
+$$
+\underbrace{\mathcal{L}_{\text{video}}}_{\text{训练 scene 支}} \xrightarrow{\text{反传}} \underbrace{\text{VLM 共享骨干}}_{\text{表征被塑形}} \xrightarrow{\text{前传}} \underbrace{h_{\text{la}}}_{\text{更好的 latent}} \xrightarrow{\text{sg() 后传给}} \underbrace{\text{DiT}}_{\text{更好的动作}}
+$$
+
+**关键区别**：$\mathcal{L}_{\text{video}}$ 的梯度**可以**流回 VLM 骨干（它不在 stop-gradient 之后），而 $\mathcal{L}_{\text{FM}}$（flow matching）的梯度被 sg() 切断了（§3.1.2 / 附录 A.1）。因此 $\mathcal{L}_{\text{video}}$ 是 VGGT 和 VLM 骨干的**额外梯度来源**，与 FAST/潜在动作 ID 的离散交叉熵梯度并行。
+
+**证据 [B]**：
+- UWM [B]：在推理时屏蔽视频生成（$t_v = T_{\max}$），仍保留了训练期间 $\mathcal{L}_{\text{video}}$ 塑造出的更好表征——"推理零成本，训练有收益"
+- Cosmos Policy [B]：把视频预测和动作预测统一为同一个去噪过程，LIBERO 98.5%——共享表征的质量直接体现在动作性能上
+- LingBot-VA [B]：视频生成质量与动作成功率正相关（FDM-grounded 90.4% vs 无 FDM 74.3%）
+
+**⚠️ 注意**：此通路的梯度来源是 $\mathcal{L}_{\text{video}}$，它流回 VLM 骨干但**不流入 DiT**（因为 sg() 在中间）。所以这是**间接监督**——它不直接改善动作头，而是改善动作头消费的输入表征。
+
+#### 通路二：4D latent 读回作为动作条件（直接监督）
+
+§7.2 的架构图中有一条箭头"4D Latent 融合 → 4D latent 读回 → DiT"，但此前未解释其训练时机制：
+
+**机制**：在训练时，ego 支和 scene 支各自产出预测的未来 4D latent，经融合后作为**额外条件**注入 DiT 动作专家。DiT 的训练目标不变（flow matching 拟合真值动作），但它现在多了一个输入通道——对"如果执行当前动作，世界会怎么变"的预测。
+
+```mermaid
+graph LR
+    subgraph "训练时"
+        DiT_IN["DiT 输入：<br/>sg(h_la) + 4D latent 读回"]
+        DiT_IN --> DiT["DiT 去噪"]
+        DiT --> L_FM["ℒ_FM（匹配真值动作）"]
+        GT["真值未来帧"] --> L_V["ℒ_video（匹配真值未来）"]
+        SCENE["Scene 支预测"] --> L_V
+        SCENE --> FUSE["4D 融合"]
+        EGO["Ego 支（FK）"] --> FUSE
+        FUSE -->|"4D latent 读回"| DiT_IN
+    end
+```
+
+**训练时的 4D 来源有三种选择**：
+
+| 选项 | 描述 | 优点 | 缺点 |
+|---|---|---|---|
+| **真值 4D 条件（teacher forcing）** | 把数据集中的真实未来帧编码为 latent，作为 DiT 的条件输入 | 信号最强，动作头可以直接利用"未来长什么样"做决策 | 训练-推理不匹配：推理时只有预测的 4D，不是真值 |
+| **预测 4D 条件（autoregressive）** | 用 scene 支的实际预测作为条件 | 无 train-test 不匹配 | 训练早期 scene 支预测差，条件信号质量低 |
+| **调度混合（scheduled mixing）** | 训练初期用真值，逐步过渡到预测（类似 seq2seq 的 scheduled sampling） | 兼顾两者优点 | 多一个超参调度曲线 |
+
+**[D] 推荐调度混合**：
+
+$$
+p_{\text{gt}}(\text{epoch}) = \max\!\Big(0,\; 1 - \frac{\text{epoch}}{\text{epoch}_{\text{anneal}}}\Big)
+$$
+
+每次训练时以概率 $p_{\text{gt}}$ 用真值未来 4D latent，以 $1 - p_{\text{gt}}$ 用 scene 支的预测。退火期 $\text{epoch}_{\text{anneal}}$ 建议设为总训练轮数的 50–70%，使模型在后期完全适应自己的预测质量。
+
+**此通路的梯度**：$\mathcal{L}_{\text{FM}}$ 对 DiT 参数的梯度是正常的（DiT 不受 sg() 保护）。4D latent 读回本身如果来自 scene 支的预测，$\mathcal{L}_{\text{FM}}$ 的梯度理论上可以流回 scene 支——但**建议对 4D 读回也施加 sg()**，避免动作损失的噪声梯度干扰 scene 支的视频预测质量。scene 支应只由 $\mathcal{L}_{\text{video}}$（通路一）训练。
+
+#### 通路三：预测-观测一致性损失（自监督验证环）
+
+**机制**：4D 世界模型预测"执行动作 $a_t$ 后场景会变成什么样"，训练数据中有**实际的下一帧**——两者之间的差异构成一个自监督一致性损失：
+
+$$
+\mathcal{L}_{\text{consist}} = \left\| z_{\text{predicted}}^{t+1:t+H} - \text{sg}\!\left(z_{\text{observed}}^{t+1:t+H}\right) \right\|^2
+$$
+
+其中 $z_{\text{predicted}}$ 是 scene 支根据当前观测和动作预测的未来 latent，$z_{\text{observed}}$ 是实际未来帧经 encoder 编码的 latent（施加 sg() 使其不受此损失训练，作为固定目标）。
+
+**这条通路的独特价值**：它创造了一个**验证环**——动作的好坏不仅由"是否匹配真值动作"判断（$\mathcal{L}_{\text{FM}}$），还由"执行后世界是否符合预期"判断。这对于 OOD 场景特别有意义：当真值动作是次优的（数据集中的演示并非完美），一致性损失可以提供额外的自监督信号。
+
+**与通路一/二的关系**：通路一（$\mathcal{L}_{\text{video}}$）训练 scene 支的预测能力；通路三（$\mathcal{L}_{\text{consist}}$）把 scene 支的预测质量转化为对动作策略的间接约束——如果预测的未来与真实未来一致，说明动作导致了可预测的结果。
+
+#### §6 辅助损失 vs §7 世界模型分支的训练时监督对比
+
+| 维度 | §6 辅助 4D 监督（P3a/P3b） | §7 世界模型训练时监督 |
+|---|---|---|
+| **监督来源** | 解析真值（FK 关键点、仿真深度） | 自身预测 vs 真值未来帧 |
+| **覆盖范围** | 本体运动学（P3a）+ 场景深度（P3b） | 完整的场景动态（含物体交互、接触变化） |
+| **对共享表征的影响** | 通过辅助 loss 挂在 DiT 上（stop-grad 隔离） | $\mathcal{L}_{\text{video}}$ 直接塑形 VLM 骨干 |
+| **推理时是否保留** | 丢弃辅助解码器 | 可选：保留 scene 支用于候选打分，或屏蔽（UWM） |
+| **独立性** | 与 §7 完全独立，可叠加 | 与 §6 互补——§6 覆盖"本体到哪"，§7 覆盖"场景怎么变" |
+
+### 7.7 测试时候选打分
+
+**[D] 4D 世界模型分支的价值横跨训练和推理**：训练时通过三条通路（§7.6）塑形表征、条件化动作头、自监督验证；推理时通过候选打分参与决策。
 
 流程：
 1. DiT 动作专家采样 $N$ 个候选动作块 $\{a^{(1)}, \ldots, a^{(N)}\}$
@@ -899,8 +986,8 @@ graph TB
 
 | 项 | 内容 |
 |---|---|
-| **动作** | ① 实现 ego 支（解析 FK，复用 Phase 1 代码）；② 实现 scene 支（Cosmos-Predict2-2B，latent diffusion）；③ 实现测试时 best-of-16 候选打分 |
-| **关键实验** | ① 有/无 scene 支的对照；② 有/无候选打分的对照；③ 训练时生成 vs 训练+推理时都生成 |
+| **动作** | ① 实现 ego 支（解析 FK，复用 Phase 1 代码）；② 实现 scene 支（Cosmos-Predict2-2B，latent diffusion）；③ 实现训练时三条监督通路（§7.6：$\mathcal{L}_{\text{video}}$ 表征塑形 + 4D latent 读回条件化 + 一致性损失）；④ 实现测试时 best-of-16 候选打分 |
+| **关键实验** | ① 有/无 scene 支的对照；② 有/无候选打分的对照；③ 训练时生成 vs 训练+推理时都生成；④ 4D 读回的 teacher forcing vs scheduled mixing 对比；⑤ 有/无一致性损失 $\mathcal{L}_{\text{consist}}$ 的对照 |
 | **产出** | 4D 世界模型分支的边际增益；候选打分 vs 无打分的差异；推理延迟实测 |
 | **Go 判据** | 候选打分显著优于无打分 |
 | **回退** | 若 scene 支的 4D 预测质量差（PSNR/SSIM 过低），退化为 ego-only 打分（仅碰撞/可达性检查） |
@@ -1080,6 +1167,86 @@ $$
 ---
 
 > **一句话收尾**：MVPC 的核心逻辑是"站在巨人肩上再往上跳"——选择当前最强的几何感知 VLA 作为起点，然后用互补的 4D 监督、4D 世界模型生成、解析安全层和本体适配四个维度去突破边际递减。**这里最诚实的一点是承认：在 88.7% OOD 的起点上，每一个百分点都可能比从 53.6% 拿 14pp 更难、更贵。但如果目标是部署一个高成功率系统而不是发一篇论文，那么从最强起点出发是唯一正确的方向。**
+
+---
+
+## 附录：相关知识
+
+### A.1 GEAR-VLA 中 VGGT 的梯度来源：stop-gradient 之后谁在训练 3D 编码器？
+
+GEAR-VLA 在 DiT 动作专家的入口处施加了 stop-gradient（§3.1.2），切断了 flow matching 连续动作损失 $\mathcal{L}_{\text{FM}}$ 向 VLM 骨干的反传。一个自然的疑问是：**既然连续动作损失被切断了，连接在 VLM 前端的可训练 VGGT 的梯度从何而来？**
+
+答案在于 VLM 骨干有**两类输出**，stop-gradient 只切断了其中一类：
+
+```mermaid
+graph TB
+    VGGT["VGGT<br/>(🔥 可训练)"] -->|"H_3D"| FUSE["视觉投影器<br/>[W_Qwen ; W_3D]"]
+    VIT["Qwen ViT<br/>(❄️ 冻结)"] -->|"H_2D"| FUSE
+    FUSE -->|"Z_vis"| LLM["LLM 骨干<br/>(🔥 可训练)"]
+    
+    LLM -->|"自回归预测"| FAST["FAST 动作 token<br/>交叉熵 ℒ_CE"]
+    LLM -->|"自回归预测"| LAID["潜在动作 ID<br/>交叉熵 ℒ_CE"]
+    LLM -->|"自回归预测"| VL["VL 任务 token<br/>交叉熵 ℒ_CE"]
+    LLM -->|"h_la (K/V cache)"| SG["sg() 🚫"]
+    SG --> DiT["DiT 动作专家"]
+    DiT --> FM["Flow Matching ℒ_FM"]
+    
+    FAST -.->|"✅ 梯度回传"| LLM
+    LAID -.->|"✅ 梯度回传"| LLM
+    VL -.->|"✅ 梯度回传"| LLM
+    FM -.->|"❌ 梯度被切断"| SG
+    
+    LLM -.->|"✅ 梯度继续回传"| FUSE
+    FUSE -.->|"✅ 经 W_3D 回传"| VGGT
+
+    style SG fill:#ffcccc,stroke:#cc0000
+    style FAST fill:#ccffcc,stroke:#00cc00
+    style LAID fill:#ccffcc,stroke:#00cc00
+    style VL fill:#ccffcc,stroke:#00cc00
+    style FM fill:#ffcccc,stroke:#cc0000
+```
+
+#### 被切断的 vs 保留的梯度通路
+
+**被切断的**：flow matching 连续动作损失 $\mathcal{L}_{\text{FM}}$。这个损失维度高、噪声大（扩散/flow 类损失的固有特性），如果让它回传到 VLM 骨干，会破坏预训练表征。这就是 $\text{sg}(h_{\text{la}})$ 的作用——它**只切断连续动作损失的梯度，不影响离散 token 预测的梯度**。
+
+**保留的**（VGGT 的实际梯度来源）：LLM 骨干同时做三类**离散自回归预测**，每一类都产生标准交叉熵梯度，可以一路回传到 VGGT：
+
+| 监督信号 | 损失类型 | 梯度路径 | 训练阶段 |
+|---|---|---|---|
+| **FAST 动作 token** | 交叉熵 $\mathcal{L}_{\text{CE}}$ | $\mathcal{L} \to \text{LLM} \to W_{\text{vis}} \to \text{VGGT}$ ✅ | 阶段一 + 阶段二 |
+| **潜在动作 ID**（VQ-VAE 码本） | 交叉熵 $\mathcal{L}_{\text{CE}}$ | 同上 ✅ | 阶段一 + 阶段二 |
+| **VL 任务 token**（VQA / grounding / 轨迹推理等） | 交叉熵 $\mathcal{L}_{\text{CE}}$ | 同上 ✅ | 阶段一 + 阶段二（40% 数据保留） |
+
+#### 梯度的具体传播路径
+
+从离散预测损失到 VGGT 参数的完整链式法则：
+
+$$
+\frac{\partial \mathcal{L}_{\text{CE}}}{\partial \theta_{\text{VGGT}}} = \frac{\partial \mathcal{L}_{\text{CE}}}{\partial h_{\text{LLM}}} \cdot \frac{\partial h_{\text{LLM}}}{\partial Z_{\text{vis}}} \cdot \underbrace{\frac{\partial Z_{\text{vis}}}{\partial H_{\text{3D}}}}_{= W_{\text{3D}}} \cdot \frac{\partial H_{\text{3D}}}{\partial \theta_{\text{VGGT}}}
+$$
+
+其中 $W_{\text{3D}}$ 是视觉投影器中 3D 部分的权重。由于零初始化（§3.1.1），$W_{\text{3D}}$ 在训练开始时为 $\mathbf{0}$，这意味着 **VGGT 在训练初期几乎不接收梯度**——它的参与是渐进式的：
+
+1. 训练早期：$W_{\text{3D}} \approx \mathbf{0}$，VGGT 贡献 ≈ 0，LLM 行为 ≈ 原始 VLM
+2. $W_{\text{3D}}$ 通过其自身的梯度缓慢增长（LLM 发现某些 3D 特征对离散 token 预测有帮助，就会增大 $W_{\text{3D}}$ 对应位置的值）
+3. 随着 $W_{\text{3D}}$ 增长，更强的梯度信号传播到 VGGT，VGGT 开始学到与操作相关的几何结构
+4. 最终收敛到 VGGT 与 VLM 语义空间对齐的稳态
+
+#### 为什么这个设计是合理的
+
+**[D] 离散交叉熵梯度 vs 连续 flow matching 梯度的性质差异**：
+
+| 性质 | 离散交叉熵（保留） | 连续 flow matching（切断） |
+|---|---|---|
+| 输出维度 | 低（词表上的 softmax） | 高（30 步 × 动作维度） |
+| 梯度方差 | 低（每个 token 独立采样） | 高（$\epsilon$ 随机采样 + $\tau$ 随机采样） |
+| 与 transformer 的适配性 | 天然适配（自回归预测是 LLM 的原生任务） | 需要额外适配（连续回归不是 LLM 的原生能力） |
+| 训练早期稳定性 | 好（即使预测错误，梯度量级也可控） | 差（随机初始化的 DiT 产出的梯度方向近乎随机） |
+
+**核心设计逻辑**：把 LLM 骨干当作一个**语义瓶颈**。VGGT 必须产出能帮助 LLM 做好**离散预测**（"下一个动作 token 是什么"）的 3D 特征。DiT 则在这些已经语义化的 latent action token 上独立学习连续控制。两侧各自得到适合自己的梯度信号，互不干扰。
+
+**消融佐证 [B]**：解冻 2D ViT（让连续动作梯度也传回 2D 视觉编码器）→ LIBERO-Plus 从 88.7% 掉到 86.6%（−2.1pp）。这间接证明了"阻止不良梯度回传到视觉编码器"这一设计原则的正确性——VGGT 通过只接收离散梯度而避免了同样的退化。
 
 ---
 
