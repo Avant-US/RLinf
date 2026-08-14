@@ -1,0 +1,13 @@
+FROM ubuntu:20.04
+ENV DEBIAN_FRONTEND=noninteractive
+ENV UV_PATH=/opt/venv
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git vim sudo build-essential python3 python3-pip python3-dev cmake pkg-config \
+    iproute2 ethtool curl wget ca-certificates libeigen3-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install uv
+WORKDIR /workspace/RLinf
+COPY . /workspace/RLinf
+RUN LIBFRANKA_VERSION=0.19.0 NO_MIRROR=1 bash requirements/install.sh --platform nvidia embodied \
+    --venv franky-0.19.0 --env franka-franky
+RUN printf '%s\n' '#!/bin/bash' '[ -z "$1" ] && echo "Usage: switch_env <name>" && exit 1' 'source /opt/venv/$1/bin/activate' > /usr/local/bin/switch_env && chmod +x /usr/local/bin/switch_env
