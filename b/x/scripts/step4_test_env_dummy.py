@@ -8,7 +8,7 @@ import gymnasium as gym
 
 REPO = os.environ.get("REPO_PATH", os.path.abspath(os.path.join(__file__, "../../../..")))
 sys.path.insert(0, REPO)
-sys.path.insert(0, os.path.join(REPO, "b", "d"))
+sys.path.insert(0, os.path.join(REPO, "b", "x"))
 
 import franky_ext.tasks.register  # noqa: F401
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -21,6 +22,22 @@ def _skip_camera() -> bool:
 
 class FrankySingleFrankaEnvMixin:
     """Replace ROS FrankaController with FrankyControllerExtended."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        self._in_franka_env_init = True
+        try:
+            super().__init__(*args, **kwargs)  # type: ignore[misc]
+        finally:
+            self._in_franka_env_init = False
+
+    def _interpolate_move(self, pose: np.ndarray, timeout: float = 1.5):
+        if (
+            getattr(self.config, "safe_smoke_hold", False)
+            and getattr(self, "_in_franka_env_init", False)
+        ):
+            self._logger.info("safe_smoke_hold: skip __init__ _interpolate_move")
+            return
+        return super()._interpolate_move(pose, timeout=timeout)  # type: ignore[misc]
 
     def _setup_hardware(self):
         assert self.env_idx >= 0, "env_idx must be set for FrankaEnv."
@@ -79,8 +96,11 @@ class FrankySingleFrankaEnvMixin:
         return super()._get_camera_frames()  # type: ignore[misc]
 
 
+@dataclass
 class FrankySingleFrankaEnvConfig(FrankaRobotConfig):
-    pass
+    """Config for franky single-arm env; safe_smoke_hold skips only __init__ interpolate."""
+
+    safe_smoke_hold: bool = False
 
 
 class FrankySingleFrankaEnv(FrankySingleFrankaEnvMixin, FrankaEnv):

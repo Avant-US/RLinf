@@ -1,7 +1,10 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export REPO_PATH="${REPO_PATH:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
-export PYTHONPATH="${REPO_PATH}:${REPO_PATH}/b/d:${PYTHONPATH:-}"
+export EMBODIED_PATH="${EMBODIED_PATH:-${REPO_PATH}/examples/embodiment}"
+export PYTHONPATH="${REPO_PATH}:${REPO_PATH}/b/x:${PYTHONPATH:-}"
+export PYTHONSTARTUP="${REPO_PATH}/b/x/franky_ext/ray_register_startup.py"
+export RLINF_EXT_MODULE="${RLINF_EXT_MODULE:-franky_ext.runtime_bootstrap}"
 export RLINF_NODE_RANK="${RLINF_NODE_RANK:-0}"
 export RLINF_COMM_NET_DEVICES="${RLINF_COMM_NET_DEVICES:-eno2}"
 export FRANKA_ROBOT_IP="${FRANKA_ROBOT_IP:-172.16.0.2}"
