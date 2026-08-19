@@ -1,7 +1,7 @@
 # 单臂 Franka franky 改造方案（5090 实机 · 扩展优先 · Docker 隔离）
 
 > **目标环境：** Franka Emika Panda · 固件 **5.10.0** · libfranka **0.19.0** · Franka Hand（原生夹爪）  
-> **目标能力：** 在 RLinf 上跑通单臂真机控制链——臂 + 夹爪 + env（第一阶段无相机）；后续再接入数据采集、SFT、RLPD 等工作流  
+> **目标能力：** 在 RLinf 上跑通单臂真机控制链——臂 + 夹爪 + env（Step 0–7）+ **相机（Step 8）** + **EE 球运动（Step 9）**；后续再接入数据采集、SFT、RLPD 等工作流  
 > **本机：** 5090 服务器 · `172.16.0.2`（eno1）· PREEMPT_RT 内核  
 > **修订说明：** 相对 [`franka_2.md`](franka_2.md) 的重写——绑定本机真实软硬件、**Docker 优先**（不污染宿主机 Python）、**扩展大于修改**（不改 `FrankaEnv` 等核心文件）、**逐步改逐步测**
 
@@ -16,9 +16,13 @@
 5. [现状分析（代码实查）](#5-现状分析代码实查)
 6. [总体架构：扩展优先](#6-总体架构扩展优先)
 7. [b/x 代码目录与文档布局](#7-bx-代码目录与文档布局)
-8. [分步实施 Step 0–7（逐步改、逐步测）](#8-分步实施-step-07逐步改逐步测)
+   - [7.1 目标目录树](#71-目标目录树)
+   - [7.2 三类划分：扩展 / 执行 / 验收](#72-三类划分扩展--执行--验收)
+   - [7.3 禁止修改的 RLinf 文件](#73-禁止修改的-rlinf-文件)
+   - [7.4 允许的最小 upstream 触碰](#74-允许的最小-upstream-触碰仅当扩展类方案失败)
+8. [分步实施 Step 0–9（逐步改、逐步测）](#8-分步实施-step-09逐步改逐步测)
    - [8.0 真机依赖总览](#80-真机依赖总览)
-9. [相机 Phase（后续，与 Step 0–7 解耦）](#9-相机-phase后续与-step-07-解耦)
+9. [相机已并入 Step 8](#9-相机已并入-step-8)
 10. [工作流 Step 7+（逐个接入）](#10-工作流-step-7逐个接入)
 11. [扩展代码设计要点（参考实现）](#11-扩展代码设计要点参考实现)
 12. [测试与验收](#12-测试与验收)
@@ -40,8 +44,8 @@
 | **环境绑定** | 占位符 `<FRANKA_NIC>`、`eth0`、泛化多节点 | 写死本机：`eno1` / `eno2` / `172.16.0.2` / 单节点 |
 | **运行环境** | 宿主机 `install.sh --env franka-franky` → `.venv` | **Docker** `agentic-rlinf0.4-franka` + `switch_env franky-0.19.0` |
 | **代码策略** | 改 `FrankaEnv._setup_hardware` 工厂、改 `FrankaConfig.controller_backend` | **不改**上述文件；新建 `b/x/franky_ext/` + 新 Gym ID |
-| **测试粒度** | 6 Phase / 周级 | **Step 0–7** 每步一个脚本 + 独立验收 |
-| **第一阶段范围** | 含相机工作流 | **仅臂 + 夹爪 + env + Step 7 链路 smoke**，无相机 |
+| **测试粒度** | 6 Phase / 周级 | **Step 0–9** 每步一个脚本 + 独立验收 |
+| **第一阶段范围** | 含相机工作流 | **Step 0–7：臂 + 夹爪 + env + dummy SAC**（无相机）；**Step 8 接入相机**；**Step 9 EE 5 cm 球运动 + 拍照**；数据采集起为 Step 10+ |
 
 ### 1.3 franka_3 三条铁律
 
@@ -60,13 +64,13 @@
 | CPU | AMD Ryzen Threadripper 7970X，64 逻辑核 | franky RT 可绑 dedicated core |
 | 内存 | 93 GiB | 单 env + 后续 RL 足够 |
 | 内核 | `5.15.0-1032-realtime` **PREEMPT_RT** | 已满足 franky RT 要求，**无需换内核** |
-| GPU | RTX 5090 | Step 7+ actor/rollout；Step 0–6 可选 |
+| GPU | **RTX 5090 D** 32 GiB · 驱动 **580.173.02** · CUDA **13.0**（2026-08-17 `nvidia-smi` 已通） | Step **7b** 起 actor/rollout 走 GPU；7a 曾因驱动不可用卡在 CPU |
 | 宿主机 Python | 3.10.12 | Step 0–6 **不依赖**宿主机 Python 装 franky |
 | 机器人 IP | **`172.16.0.2`** | 写死 |
 | 机器人网卡 | **`eno1`**（本机 `172.16.0.1/24`，ping ~0.075 ms） | RT 调优、`ethtool` 均针对 eno1 |
 | 管理/外网网卡 | **`eno2`**（`10.229.18.21/24`，default route） | `RLINF_COMM_NET_DEVICES=eno2`（**非**模板 `eth0`） |
 | 夹爪 | Franka Hand（原生） | `FRANKA_GRIPPER_TYPE=franka` |
-| 相机 | USB 未见 RealSense | **Step 0–7 跳过相机/视觉**（dummy 用零图像） |
+| 相机 | 已安装在 Franka 上（用户 2026-08-18 确认）；2026-08-14「USB 未见 RealSense」**已过时** | **Step 8a** 实测类型/serial；Step 0–7 仍 `RLINF_SKIP_CAMERA=1` |
 | franky 环境 | 宿主机未安装 | 使用 Docker `/opt/venv/franky-0.19.0` |
 
 ### 2.1 网络拓扑
@@ -233,7 +237,7 @@ source /workspace/RLinf/b/x/configs/setup_before_ray_5090.sh
 | actor / rollout（GPU） | `agentic-rlinf0.4-maniskill_libero` 或 openpi 相关镜像 |
 | Ray 组网 | 两容器均 `--network host`，同一 `ray start --head` 地址 |
 
-Step 7 **dummy SAC** 拆为 **7a（链路 smoke，✅ PASS）** 与 **7b（完整训练 loop，⏳ 待完成）**；7b 需 GPU 驱动或 §3.7 双容器。
+Step 7 **dummy SAC** 拆为 **7a（链路 smoke，✅ PASS，franky 容器 CPU）** 与 **7b（完整训练 loop，✅ PASS，GPU 容器）**。7b **不要**复用 7a 的 `run_step7_dummy_sac.sh`（会装 CPU torch）。本机 7b 推荐 **单 GPU 容器 collocated**（dummy 不连真机）；双容器留给 **Step 10+** 真机训练（采集/SFT/RLPD）。相机 USB 在 **franky 控制容器** 上测（Step 8–9），不要在 7b GPU 镜像里验真相机。
 
 ### 3.8 明确不做的事
 
@@ -406,7 +410,16 @@ FrankyController.launch_controller(
 
 ## 7. b/x 代码目录与文档布局
 
-> **布局（2026-08-15）：** 方案与日志在 `b/d/frk1/`（`franka_3.md`、`franka_3LOG.md`）；可执行扩展与脚本在 `b/x/`。
+> **布局（2026-08-17）：** 方案与日志在 `b/d/frk1/`（`franka_3.md`、`franka_3LOG.md`）；可执行扩展与脚本在 `b/x/`。  
+> **设计：** 每 Step 一个脚本 + 独立验收——**Step 执行入口和验收脚本大多是同一批文件**，没有单独的 pytest 套件。
+
+`b/x/` 按职责分成三类：
+
+| 类别 | 目录 | 作用 |
+|------|------|------|
+| **A. RLinf 扩展** | `b/x/franky_ext/` + `sitecustomize.py` | 不改 `rlinf/`，用新 Gym ID / 子类 / runtime hook 接入 franky 单臂 |
+| **B. 执行 Step 的环境与入口** | `b/x/configs/`、`b/x/docker/`、部分 `scripts/` | 起容器、调网卡、设环境变量、装依赖、跑训练 |
+| **C. 测试与验收** | `b/x/scripts/step*_*.sh/.py` | 每个 Step 的 PASS/FAIL 检查；§12 检查清单就是这些脚本 |
 
 ### 7.1 目标目录树
 
@@ -430,10 +443,14 @@ b/x/
 │       └── peg_insertion.py             # Step 6：FrankyPegInsertionEnv
 ├── configs/
 │   ├── docker_run_franky_5090.sh        # Step 0/1
-│   ├── setup_before_ray_5090.sh         # Step 1（Step 7 扩展 EMBODIED_PATH 等）
+│   ├── setup_before_ray_5090.sh         # Step 1 / 7a（franky venv）
+│   ├── setup_before_ray_gpu_5090.sh     # Step 7b（CUDA venv，禁止切 franky）
+│   ├── docker_run_gpu_5090.sh           # Step 7b GPU 容器
 │   ├── tune_eno1.sh                     # Step 0（宿主机）
-│   ├── realworld_franky_dummy_sac.yaml  # Step 7
-│   └── realworld_franky_smoke.yaml      # Step 8+（待建）
+│   ├── realworld_franky_dummy_sac.yaml  # Step 7a（CPU placement: 0）
+│   ├── realworld_franky_dummy_sac_gpu.yaml  # Step 7b（GPU placement: 0-0）
+│   ├── realworld_franky_camera.yaml     # Step 8：相机 serial / type 接线
+│   └── realworld_franky_smoke.yaml      # Step 10+ 采集（待建）
 ├── docker/
 │   └── Dockerfile.franky-minimal        # Step 0 fallback 本地构建
 └── scripts/
@@ -444,11 +461,132 @@ b/x/
     ├── step4_test_env_dummy.py
     ├── step5_test_env_robot.py
     ├── step6_test_peg_env_robot.py
-    ├── step7_install_deps.sh            # Step 7a：franky venv 补 embodied 依赖
-    └── run_step7_dummy_sac.sh           # Step 7a/7b：train_async.py 入口（7b 需 GPU）
+    ├── step7_install_deps.sh            # Step 7a only：franky venv + CPU torch
+    ├── run_step7_dummy_sac.sh           # Step 7a only（CPU smoke）
+    ├── run_step7b_dummy_sac_gpu.sh      # Step 7b：GPU train_async.py
+    ├── step8_detect_cameras.py          # Step 8a：枚举 USB / serial / 流参数
+    ├── step8_check_yaml.py              # Step 8b：YAML 对 JSON 验收
+    ├── step8_test_env_camera.py         # Step 8c：真机 env + 相机帧交互
+    ├── step8_checks.py                  # Step 8/9：CHECK / RESULT 公共输出
+    ├── run_step8_accept.sh              # Step 8 一键验收（8a+8b，可选 8c）
+    ├── step9_test_ee_sphere.py          # Step 9：5 cm 球随机运动 + 5 张照片
+    └── run_step9_accept.sh              # Step 9 一键验收（默认数学；`--with-robot` 真机）
 ```
 
-### 7.2 禁止修改的 RLinf 文件
+路径均相对于仓库根。文档与日志在 `b/d/frk1/`，不在 `b/x/`。`camera_detected.json` 由 8a 生成（勿手写假 serial）。`realworld_franky_smoke.yaml`（Step 10+ 采集）**尚未建**。Step 9 照片目录：`b/x/logs/step9_camera/`。
+
+### 7.2 三类划分：扩展 / 执行 / 验收
+
+#### A. 对 RLinf 做扩展的代码
+
+原则：**不改** `FrankaEnv` / `franky_controller.py` / 官方 YAML；新代码全部在扩展包。稳定后再考虑迁入 `rlinf/envs/realworld/franka/franky_single/`（见 §7.4）。
+
+**产品扩展（会进训练 / 真机控制链）**
+
+| 文件 | 对应 Step | 扩展了什么 |
+|------|-----------|------------|
+| `franky_ext/franka_libfranka_gripper.py` | 2 | 原生 Franka Hand（libfranka），补上游 `gripper_type=franka` 的 `NotImplementedError` |
+| `franky_ext/controller_extended.py` | 3 | `FrankyControllerExtended`：补 `move_arm` / `reconfigure_compliance_params` / `move_gripper` / `_build_gripper` |
+| `franky_ext/franky_single_franka_env.py` | 4/5 | `FrankySingleFrankaEnv`：只 override `_setup_hardware`，走 franky 而非 ROS |
+| `franky_ext/tasks/register.py` | 4 | 注册 `FrankyFrankaEnv-v1`、`FrankyPegInsertionEnv-v1` |
+| `franky_ext/tasks/peg_insertion.py` | 6 | `FrankyPegInsertionEnv`：任务逻辑继承官方 PegInsertion，硬件走 franky mixin |
+
+**Runtime 扩展（不改 `rlinf/` 源码，运行时打补丁）**
+
+| 文件 | 对应 Step | 扩展了什么 |
+|------|-----------|------------|
+| `franky_ext/runtime_bootstrap.py` | 7a | `RLINF_EXT_MODULE`：CPU/NO_ACCEL shim、FSDP skip、`pin_memory`、自动 `register()` Gym |
+| `franky_ext/ray_register_startup.py` | 7 | `PYTHONSTARTUP`：Ray worker 新进程里加载 bootstrap |
+| `sitecustomize.py` | 7 | `PYTHONPATH` 含 `b/x` 时自动 import bootstrap |
+
+这些是 **RLinf 运行时扩展**，不是验收脚本。7a 能在无 CUDA 的 franky 容器里跑 dummy SAC，靠的就是它们。
+
+**控制链辅助（扩展包内，主要为真机 smoke 服务）**
+
+| 文件 | 对应 Step | 说明 |
+|------|-----------|------|
+| `franky_ext/tcp_probe.py` | 5/6 | 子进程读 TCP 后释放 FCI；env 与 Step 5/6 脚本共用，偏 **真机安全辅助**，不是独立 Gym API |
+
+`franky_ext/__init__.py`、`franky_ext/tasks/__init__.py` 只是包入口。
+
+#### B. 为执行各 Step 准备的脚本与配置
+
+这些 **不实现新 env/controller**，只保证本机 5090 + Docker + Ray 能按方案跑起来。
+
+**宿主机 / Docker / Ray**
+
+| 文件 | Step | 角色 |
+|------|------|------|
+| `configs/tune_eno1.sh` | 0 | 宿主机：CPU governor、`sched_rt_runtime_us`、eno1 ethtool |
+| `configs/docker_run_franky_5090.sh` | 0/1 | 启动 franky 开发容器（Step 1–6、7a、**8**） |
+| `configs/setup_before_ray_5090.sh` | 1 / 7a | 容器内：`switch_env franky-0.19.0`、`PYTHONPATH`、`RLINF_EXT_MODULE`、网卡/机器人 IP |
+| `configs/docker_run_gpu_5090.sh` | 7b | GPU 训练容器 |
+| `configs/setup_before_ray_gpu_5090.sh` | 7b | CUDA venv，**禁止**切到 franky |
+| `docker/Dockerfile.franky-minimal` | 0 fallback | 官方镜像缺 `franky-0.19.0` 时本地构建 |
+
+**训练配置（Hydra YAML，隔离官方 `examples/`）**
+
+| 文件 | Step | 角色 |
+|------|------|------|
+| `configs/realworld_franky_dummy_sac.yaml` | 7a | dummy SAC CPU smoke，`FrankyFrankaEnv-v1`，placement `0` |
+| `configs/realworld_franky_dummy_sac_gpu.yaml` | 7b | dummy SAC GPU 训练 loop |
+| `configs/realworld_franky_camera.yaml` | 8 | 相机 `camera_serials` / `camera_type` 接线（8a `--write-yaml` 填充） |
+
+**Step 7 执行入口（跑训练，不是单元测试）**
+
+| 文件 | Step | 角色 |
+|------|------|------|
+| `scripts/step7_install_deps.sh` | 7a | 往 franky venv 装 CPU torch / peft 等（**不要给 7b 用**） |
+| `scripts/run_step7_dummy_sac.sh` | 7a | 调 `train_async.py` + CPU YAML，链路 smoke |
+| `scripts/run_step7b_dummy_sac_gpu.sh` | 7b | GPU 容器里跑完整训练 loop |
+
+#### C. 测试与验收脚本
+
+对应 §8.0 汇总表和 §12.1 检查清单。跑这个脚本、打出 PASS = 该 Step 验收通过。
+
+| 脚本 | Step | 真机依赖 | 验什么 |
+|------|------|----------|--------|
+| `scripts/step0_check_env.sh` | 0 | 服务器 + 连通 | PREEMPT_RT、ulimit、ping/eno1、镜像、`import franky` |
+| `scripts/step1_check_ray.sh` | 1 | 服务器 | `switch_env`、`ray start/status/stop` |
+| `scripts/step2_test_gripper.py` | 2 | **真机** | 夹爪 open/close、width（底层，不经 env） |
+| `scripts/step3_test_controller.py` | 3 | **真机** | Controller：home / nudge / grip / impedance |
+| `scripts/step4_test_env_dummy.py` | 4 | 服务器 | dummy `gym.make` / reset / step |
+| `scripts/step5_test_env_robot.py` | 5 | **真机** | 5a probe、5b 臂不动 smoke、5c ~5 mm nudge |
+| `scripts/step6_test_peg_env_robot.py` | 6 | **真机** | 任务 env：probe / reset / random reset |
+| `scripts/step8_detect_cameras.py` | 8a | 服务器 + 相机 USB | 枚举 serial；`CHECK` + `RESULT Step8a PASS` |
+| `scripts/step8_check_yaml.py` | 8b | 服务器 | YAML serial 匹配 JSON、非占位符 |
+| `scripts/step8_test_env_camera.py` | 8c | **真机** + **相机** | `wrist_1` 非零帧；`RESULT Step8c PASS` |
+| `scripts/run_step8_accept.sh` | 8 | 8a+8b 无臂；`--with-robot` 含 8c | 一键跑完，看 exit 与 `RESULT` |
+| `scripts/step9_test_ee_sphere.py` | 9 | `--math-only` 无臂；真机需 **相机** | 5 cm 球 10 s 游走 + 5 张 JPEG；`RESULT Step9 PASS` |
+| `scripts/run_step9_accept.sh` | 9 | 默认数学；`--with-robot` 含真机 | 一键验收 |
+
+Step 7 的验收就是跑 **B** 类的 `run_step7_*.sh`：7a 验 worker 启动 + dummy reset；7b 验 ≥1 epoch 和 `train/` 指标。没有单独的 `step7_test_*.py`。
+
+#### Step 对照
+
+| Step | 扩展代码 (A) | 执行环境 (B) | 验收 (C) |
+|------|----------------|----------------|----------|
+| **0** | — | `tune_eno1` / `docker_run_franky` / `Dockerfile.franky-minimal` | `step0_check_env.sh` |
+| **1** | — | `setup_before_ray_5090.sh` | `step1_check_ray.sh` |
+| **2** | `franka_libfranka_gripper.py` | 沿用 0/1 容器 | `step2_test_gripper.py` |
+| **3** | `controller_extended.py` | 同上 | `step3_test_controller.py` |
+| **4** | `franky_single_franka_env.py`、`tasks/register.py` | 同上 | `step4_test_env_dummy.py` |
+| **5** | `tcp_probe.py` + env 安全 hold | 同上 | `step5_test_env_robot.py` |
+| **6** | `tasks/peg_insertion.py` | 同上 | `step6_test_peg_env_robot.py` |
+| **7a** | `runtime_bootstrap` / `sitecustomize` / `ray_register_startup` | dummy_sac.yaml + `step7_install_deps` + `run_step7_dummy_sac.sh` | 入口即验收 |
+| **7b** | 同 7a Gym 注册；GPU 不用 CPU shim | dummy_sac_gpu.yaml + `docker_run_gpu` / `setup_gpu` + `run_step7b_dummy_sac_gpu.sh` | 入口即验收 ✅ LOG-025 |
+| **8** | 去掉 skip 即走上游 `_open_cameras`（不改 `rlinf/`） | `realworld_franky_camera.yaml` | `run_step8_accept.sh`（8a+8b）；8c 用 `step8_test_env_camera.py` |
+| **9** | —（脚本层球投影，不改 env 盒子裁剪） | 复用 Step 8 相机 JSON | `step9_test_ee_sphere.py` / `run_step9_accept.sh` |
+
+#### 边界说明
+
+1. **A 与 C 成对出现：** 例如 Step 2 先写 `FrankaLibfrankaGripper`，再用 `step2_test_gripper.py` 验收；扩展代码本身不是测试。
+2. **`tcp_probe.py` 两边都用：** env 安全 reset 需要它，Step 5/6/8c/9 脚本也调用它。归在扩展包，职责是 **FCI 探测辅助**。
+3. **`runtime_bootstrap.py` 是扩展不是测试：** 为了在无 CUDA 容器里跑 RLinf actor；7a 脚本只是触发它。
+4. **没有独立 CI / pytest：** 验收就是逐步跑 `scripts/step*`，结果记在 [`franka_3LOG.md`](franka_3LOG.md)。
+5. **Step 10+ 仍待建：** 数据采集 / SFT / RLPD YAML 未落地。Step 8 相机与 Step 9 球运动脚本已在 `b/x/`。
+
+### 7.3 禁止修改的 RLinf 文件
 
 | 文件 | 原因 |
 |------|------|
@@ -459,7 +597,7 @@ b/x/
 | `examples/embodiment/config/*` | 官方示例 YAML |
 | `ray_utils/realworld/setup_before_ray.sh` | 上游模板；本机用 `b/x/configs/` 副本 |
 
-### 7.3 允许的最小 upstream 触碰（仅当扩展类方案失败）
+### 7.4 允许的最小 upstream 触碰（仅当扩展类方案失败）
 
 | 条件 | 可考虑的 upstream PR |
 |------|---------------------|
@@ -470,7 +608,7 @@ b/x/
 
 ---
 
-## 8. 分步实施 Step 0–7（逐步改、逐步测）
+## 8. 分步实施 Step 0–9（逐步改、逐步测）
 
 > **规则：** 每 Step 完成后打勾、记录日志，**未通过不进入下一步**。  
 > **环境：** 标注「宿主机」或「容器内」。容器内先 `source b/x/configs/setup_before_ray_5090.sh`。  
@@ -488,7 +626,9 @@ b/x/
 | **5** | 实机 env smoke | `franky_ext/tcp_probe.py`、`scripts/step5_test_env_robot.py` | `franky_single_franka_env.py`（`safe_smoke_hold`、无相机 stub） | **无** | ✅ 真机 PASS（5a/5b/5c） |
 | **6** | 任务 env | `franky_ext/tasks/peg_insertion.py`、`scripts/step6_test_peg_env_robot.py` | `tasks/register.py`（注册 `FrankyPegInsertionEnv-v1`） | **无** | ✅ 真机 PASS（6a/6b/6c） |
 | **7a** | dummy SAC 链路 smoke | 同 Step 7 文件集（见 §Step 7） | — | **无** | ✅ **PASS**（LOG-024） |
-| **7b** | dummy SAC 完整训练 loop | —（复用 7a 脚本与配置） | 或需扩展 `runtime_bootstrap.py` | **无** | ⏳ **待完成**（阻塞于权重同步 + GPU） |
+| **7b** | dummy SAC 完整训练 loop | `configs/realworld_franky_dummy_sac_gpu.yaml`、`configs/docker_run_gpu_5090.sh`、`configs/setup_before_ray_gpu_5090.sh`、`scripts/run_step7b_dummy_sac_gpu.sh` | `min_buffer_size: 1`（相对初稿 0） | **无** | ✅ **PASS**（LOG-025） |
+| **8** | 相机检测与 RLinf 接入 | `scripts/step8_detect_cameras.py`、`scripts/step8_check_yaml.py`、`scripts/step8_test_env_camera.py`、`scripts/run_step8_accept.sh`、`configs/realworld_franky_camera.yaml` | mixin 已有 `_open_cameras`；本 Step 只关 skip、填真实 serial | **无** | ✅ **PASS**（LOG-026–029） |
+| **9** | EE 球内随机运动 + 拍照 | `scripts/step9_test_ee_sphere.py`、`scripts/run_step9_accept.sh` | 不改 env；脚本层把目标投影进 5 cm 球 | **无** | ✅ **PASS**（LOG-031–037） |
 
 > 上表路径均相对于 `b/x/`；文档与日志在 `b/d/frk1/`。
 
@@ -501,9 +641,9 @@ b/x/
 | **`[服务器]`** | 仅宿主机 / Docker / Ray，**不连 FCI、臂不动** | `import franky`、`ray status`、dummy env |
 | **`[连通]`** | 需机器人**上电且网络可达**，但**不发运动/夹爪指令** | `ping 172.16.0.2`、Desk 查固件 |
 | **`[真机]`** | **必须占用 libfranka 会话**，臂或夹爪**会运动**；需 FCI 激活、操作员在场、Desk 急停可用 | 夹爪开合、`home`、`nudge`、env reset/step |
-| **`[相机]`** | 除真机外还需 RealSense 等（本方案第一阶段不含） | 采集图像、视觉 obs |
+| **`[相机]`** | USB 相机接入 RLinf（RealSense / ZED / Lumos） | 枚举 serial、打开 pipeline、读 `obs['frames']` |
 
-**汇总表（Step 0–12）：**
+**汇总表（Step 0–14）：**
 
 | Step | 名称 | 真机依赖 | 脚本/入口 | 需真机运动的验收项 |
 |------|------|----------|-----------|-------------------|
@@ -515,9 +655,11 @@ b/x/
 | **5** | 实机 env smoke | **`[真机]`** | `b/x/scripts/step5_test_env_robot.py` | 5a 读位姿；5b 安全 smoke（臂不动）；5c micro-nudge（约 5 mm） |
 | **6** | 任务 env | **`[真机]`** | `b/x/scripts/step6_test_peg_env_robot.py` | 6a probe；6b reset（无 random）；6c random reset |
 | **7a** | dummy SAC 链路 smoke | `[服务器]` | `b/x/scripts/run_step7_dummy_sac.sh` | 无（`is_dummy=True`）；验 worker 启动与 dummy reset |
-| **7b** | dummy SAC 完整训练 | `[服务器]` + **GPU** | 同 7a 入口 | ≥1 epoch、`train/` 指标；**⏳ 待完成**（LOG-024） |
-| **8** | 数据采集 | **`[真机]`** + **`[相机]`** | collect 工作流 | 遥操作/采集 episode |
-| **9–12** | SFT / RLPD / DAgger 等 | **`[真机]`**（+ Step 9+ 常需 GPU） | 各 YAML | 部署/训练 loop 中的 env step |
+| **7b** | dummy SAC 完整训练 | `[服务器]` + **GPU** | `b/x/scripts/run_step7b_dummy_sac_gpu.sh` | ≥1 epoch、`train/` 指标；✅ PASS（LOG-025） |
+| **8** | 相机检测与 RLinf 接入 | `[服务器]` / **`[真机]`** + **`[相机]`** | `run_step8_accept.sh` / `step8_test_env_camera.py` | 8a/8b 不连 FCI；8c hold smoke（臂不动）+ 读帧 |
+| **9** | EE 5 cm 球随机运动 + 拍照 | **`[真机]`** + **`[相机]`** | `step9_test_ee_sphere.py` / `run_step9_accept.sh` | 当前 EE 为原点，球内游走 10 s，5 张 JPEG，再回原点 |
+| **10** | 数据采集 | **`[真机]`** + **`[相机]`** | collect 工作流（待建） | 遥操作/采集 episode |
+| **11–14** | Pi0 / RLPD / DAgger / RLT | **`[真机]`** + **`[相机]`**（常需 GPU） | 各 YAML | 部署/训练 loop 中的 env step |
 
 **真机测试前置（Step 2 起每次跑 `[真机]` 前）：**
 
@@ -526,14 +668,14 @@ b/x/
 3. **同一时刻仅一个 libfranka 客户端**（smoke 与 env 勿并行）  
 4. 操作员在场，Desk 急停可用  
 
-**可在无真机时先完成的 Step：** 0（除 ping/Desk 外）、1、4、**7a**（dummy SAC 链路 smoke ✅）。**7b** 需 GPU 或后续补丁，⏳ 待完成。
+**可在无真机时先完成的 Step：** 0（除 ping/Desk 外）、1、4、**7a** ✅、**7b** ✅（dummy + GPU 容器，不连 FCI）、**8a**（仅 USB 枚举）、**9math**（`--math-only`）。
 
-**Step 7 子步骤结论（LOG-024）：**
+**Step 7 子步骤结论：**
 
 | 子 Step | 内容 | 状态 |
 |---------|------|------|
-| **7a** | env / rollout / actor 启动，dummy `FrankyFrankaEnv-v1` reset，ResNet10 加载 | ✅ **PASS** |
-| **7b** | `sync_model_to_rollout` → ≥1 epoch → `train/` 指标落盘 | ⏳ **待完成**（阻塞于 `pin_memory` / `current_stream().synchronize`；需 §3.7 双容器或修复 NVIDIA 驱动） |
+| **7a** | env / rollout / actor 启动，dummy reset，ResNet10 加载（franky 容器、无 CUDA） | ✅ **PASS**（LOG-024） |
+| **7b** | GPU 上 `sync_model_to_rollout` → ≥1 epoch → `train/` 指标 | ✅ **PASS**（LOG-025） |
 
 **Step 2 / 3 / 5 真机链：** 三层分工见 [Step 2 / 3 / 5 分工与差异](#step-2--3--5-分工与差异真机控制链三层验证)（Step 2 夹爪 → Step 3 Controller → Step 5 env；推荐顺序 2→3→4→5a→5b→5c）。
 
@@ -754,6 +896,38 @@ python b/x/scripts/step3_test_controller.py
 ```
 home → getpos → nudge 0 0.1 → open → close → grip 128 → impedance 2000 150 → nudge 2 0.05 → shutdown
 ```
+
+**`HOME_JOINTS` 如何确定：**
+
+脚本 `b/x/scripts/step3_test_controller.py` 第 17 行：
+
+```python
+HOME_JOINTS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+```
+
+这组数 **不是本机标定、也不是当前 TCP 反解**。它从上游 `toolkits/realworld_check/test_franky_controller.py` 原样抄来，注释为 *Franka Emika Panda factory "ready" pose*。单位为 **弧度**，三位小数是 π 分数近似：
+
+| 关节 | 脚本值 | 精确值 | 约等于 |
+|------|--------|--------|--------|
+| J1 | `0.0` | `0` | 基座 0° |
+| J2 | `-0.785` | `-π/4` | 肩约 **-45°** |
+| J3 | `0.0` | `0` | |
+| J4 | `-2.356` | `-3π/4` | 肘约 **-135°** |
+| J5 | `0.0` | `0` | |
+| J6 | `1.571` | `π/2` | 腕约 **90°** |
+| J7 | `0.785` | `π/4` | 法兰约 **45°** |
+
+即 `[0, -π/4, 0, -3π/4, 0, π/2, π/4]`。外观是臂向前抬起、肘弯约 90° 量级的「准备干活」姿态。同一组（更高精度）出现在 `franka_ros` Gazebo `panda.launch` 的 `initial_joint_positions`、MoveIt *move to start / ready*、panda-py IK 默认 `q_init`。
+
+**与 env 复位关节不是同一套：**
+
+| 用途 | 关节目标 |
+|------|----------|
+| Step 3 / franky 交互 smoke | 工厂 ready：`[0, -π/4, 0, -3π/4, 0, π/2, π/4]` |
+| 单臂 env `FrankaEnv.joint_reset_qpos` 默认 | `[0, 0, 0, -1.9, 0, 2, 0]` |
+| GELLO 对齐 home | 另一组，可被 `ALIGN_HOME` 覆盖 |
+
+本 Step 用工厂 ready，只验 **`reset_joint` 整臂到位**，不对齐 Peg-insertion 的任务 rest pose。若台面/夹具会撞到这组 home，改脚本常量或先用交互 `getjoint` 选安全路径，不要假定永远适合本机布局。
 
 **compliance 映射（`reconfigure_compliance_params`）：**
 
@@ -1065,49 +1239,35 @@ python b/x/scripts/step6_test_peg_env_robot.py
 
 **与 Step 5 差异：** Step 5 验通用 env + 可选 micro-nudge；Step 6 验 **PegInsertion 任务 reset/reward**。微动仍可能小于指令（阻抗 tracker，见 LOG-017）；肉眼大幅确认走 Step 3。
 
-**YAML（后续 Step 8+）：** 可复制官方 `realworld_peg_insertion.yaml`，`init_params.id` 改为 `FrankyPegInsertionEnv-v1`，`override_cfg` 写入标定后的 `target_ee_pose`；smoke 阶段以 `step6_test_peg_env_robot.py` 为准。
+**YAML（后续 Step 10+）：** 可复制官方 `realworld_peg_insertion.yaml`，`init_params.id` 改为 `FrankyPegInsertionEnv-v1`，`override_cfg` 写入标定后的 `target_ee_pose`；smoke 阶段以 `step6_test_peg_env_robot.py` 为准。
 
 ---
 
 ### Step 7 — dummy SAC async（`train_async.py`） `[服务器]`
 
-**总目标：** 在 **不连真机**（`is_dummy=True`）前提下，用官方 **async** 训练栈验证 `embodied_sac` 分布式链路，Gym ID 为 **`FrankyFrankaEnv-v1`**。与后续 Step 10 RLPD 同入口 `train_async.py`。
+**总目标：** 在 **不连真机**（`is_dummy=True`）前提下，用官方 **async** 训练栈验证 `embodied_sac` 分布式链路，Gym ID 为 **`FrankyFrankaEnv-v1`**。与后续 Step 12 RLPD 同入口 `train_async.py`。
 
-本 Step 拆为两个子步骤——**7a 已通过**，**7b 待日后完成**：
+本 Step 拆为两个子步骤——**7a / 7b 均已通过**：
 
 | 子 Step | 名称 | 验收范围 | 状态 |
 |---------|------|----------|------|
 | **[7a](#step-7a--链路-smoke-train_async-入口--服务器--pass)** | 链路 smoke | Hydra 解析、三 worker 启动、dummy env reset、actor/rollout 模型构建 | ✅ **PASS**（LOG-024） |
-| **[7b](#step-7b--完整训练-loop--服务器--gpu--待完成)** | 完整训练 loop | 权重同步、`sync_model_to_rollout`、≥1 epoch、`train/` 指标 | ⏳ **待完成** |
+| **[7b](#step-7b--完整训练-loop-服务器--gpu--pass)** | 完整训练 loop | GPU 权重同步、≥1 epoch、`train/` 指标 | ✅ **PASS**（LOG-025） |
 
-**与官方对齐（7a / 7b 共用）：**
+**与官方对齐：**
 
-| 项 | 官方 | 本方案（`b/x`） |
-|----|------|----------------|
-| 训练入口 | `examples/embodiment/train_async.py` | **同左**（`run_step7_dummy_sac.sh` 内调用） |
-| 启动脚本模式 | `examples/embodiment/run_realworld_async.sh <config>` | `b/x/scripts/run_step7_dummy_sac.sh` |
-| 参考配置 | `config/realworld_dummy_franka_sac_cnn.yaml` | `b/x/configs/realworld_franky_dummy_sac.yaml` |
-| Hydra `searchpath` | `file://${EMBODIED_PATH}/config/` | **同左** |
-| `component_placement` | e2e：`actor,env,rollout: 0`（CPU） | **同左** |
-| Env Gym ID | `PegInsertionEnv-v1` | **`FrankyFrankaEnv-v1`** |
+| 项 | 官方 | 7a（已跑） | 7b（已跑） |
+|----|------|-----------|-----------|
+| 训练入口 | `examples/embodiment/train_async.py` | 同左 | 同左 |
+| 启动脚本 | `run_realworld_async.sh` | `run_step7_dummy_sac.sh` | **`run_step7b_dummy_sac_gpu.sh`** |
+| 参考配置 | `realworld_dummy_franka_sac_cnn.yaml` | `realworld_franky_dummy_sac.yaml` | `realworld_franky_dummy_sac_gpu.yaml` |
+| 容器 | GPU 镜像（官方 dummy）或 franky（控制） | **franky、无 CUDA** | **`agentic-rlinf0.4-maniskill_libero` + `--gpus all`** |
+| `component_placement` | `actor/env/rollout: 0-0` | `actor,env,rollout: 0`（CPU 节点） | **`actor/env/rollout: 0-0`（GPU 0）** |
+| Env Gym ID | `PegInsertionEnv-v1` | `FrankyFrankaEnv-v1` | 同 7a |
 
-**涉及文件（7a 新建；7b 复用，无额外文件）：**
+**7a 文件（CPU smoke，7b 不要调用）：** `realworld_franky_dummy_sac.yaml`、`run_step7_dummy_sac.sh`、`step7_install_deps.sh`、`setup_before_ray_5090.sh`。
 
-| 文件 | 作用 |
-|------|------|
-| `b/x/configs/realworld_franky_dummy_sac.yaml` | Hydra 主配置 |
-| `b/x/scripts/run_step7_dummy_sac.sh` | 启动入口（7a/7b 同一命令） |
-| `b/x/scripts/step7_install_deps.sh` | franky venv 补 embodied 依赖 + torch 降级 |
-| `b/x/franky_ext/runtime_bootstrap.py` | CPU shim、FSDP/pin_memory 补丁、Gym 注册 |
-| `b/x/sitecustomize.py` | Ray worker 自动加载 bootstrap |
-| `b/x/franky_ext/ray_register_startup.py` | `PYTHONSTARTUP` 辅助钩子 |
-| `b/x/configs/setup_before_ray_5090.sh` | `EMBODIED_PATH`、`PYTHONPATH`、`RLINF_EXT_MODULE` |
-
-**公共前置（7a / 7b 相同）：**
-
-1. Step 0–1 ✅、Step 4 ✅
-2. ResNet10：`export RLINF_RESNET10_PATH=/home/nvidia/ckpts/RLinf-ResNet10-pretrained`
-3. 容器内：`source b/x/configs/setup_before_ray_5090.sh` → `bash b/x/scripts/run_step7_dummy_sac.sh`
+**公共前置：** Step 0–1 ✅、Step 4 ✅、ResNet10 在 `/home/nvidia/ckpts/RLinf-ResNet10-pretrained/resnet10_pretrained.pt`。
 
 ---
 
@@ -1126,7 +1286,7 @@ python b/x/scripts/step6_test_peg_env_robot.py
 | `runtime_bootstrap.py` + `sitecustomize.py` | Ray worker 不执行 `PYTHONSTARTUP`；`NO_ACCEL` 无 `torch_platform` | Gym 注册 + CPU 上启动 env/rollout/actor |
 | FSDP CPU bypass | 纯 CPU 不支持 CUDA FSDP wrap | actor `setup_model_and_optimizer` 通过 |
 
-**运行（与 7b 相同入口）：**
+**运行（仅 7a / franky 容器）：**
 
 ```bash
 source b/x/configs/setup_before_ray_5090.sh
@@ -1156,109 +1316,487 @@ docker run --rm --privileged --network host --shm-size=10g \
 - [x] Actor `setup_model_and_optimizer`（FSDP CPU bypass）— ✅
 - [x] **臂不动**（`is_dummy=True`）— ✅
 
-**判定：** ✅ **Step 7a PASS** — 可进入 Step 8 规划或并行推进 7b。
+**判定：** ✅ **Step 7a PASS** — 7b 已闭环；下一步为 **Step 8 相机**。
 
 ---
 
-#### Step 7b — 完整训练 loop `[服务器]` + **GPU** ⏳ 待完成
+#### Step 7b — 完整训练 loop `[服务器]` + **GPU** ✅ PASS
 
-> **⏳ 待完成提醒**
+> **⏳ 待跑（不是「还缺驱动」）**
 >
-> - **当前状态：** ❌ **未 PASS**（LOG-024）；日志在 `sync_model_to_rollout` 阶段 traceback 后退出，**未见 ≥1 epoch 完成**。
-> - **阻塞点：** `patch_syncer` 调用 `pin_memory()` / `current_stream().synchronize()`，在 `ACCELERATOR_TYPE=NO_ACCEL`（宿主机 `nvidia-smi` 不可用）时失败。
-> - **推荐路径（官方）：** 修复宿主机 NVIDIA 驱动后，按 §3.7 **双容器**——franky 容器跑 env，GPU 容器跑 actor/rollout（见下文「日后完成步骤」）。
-> - **备选（非官方）：** 继续扩展 `runtime_bootstrap.py` 覆盖 `patch_syncer` 的 CUDA 假设——仅适合开发机 CPU smoke，**不保证与生产 GPU 训练一致**。
-> - **勿误解：** Step 7a ✅ **不等于** Step 7 全部完成；对外汇报或开 Step 8 **真机采集**前，请确认是否依赖完整 SAC 训练验收。
+> - **2026-08-17 本机 GPU 已通：** `nvidia-smi` → **RTX 5090 D** 32607 MiB · Driver **580.173.02** · CUDA **13.0**。LOG-024 的根因（宿主机无驱动 → franky 容器 `0 accelerator` / `NO_ACCEL`）**已经消失**。
+> - **7a 没有「同一脚本换 GPU 就能过」。** `run_step7_dummy_sac.sh` 会 `source setup_before_ray_5090.sh`（切 **franky-0.19.0**）并调用 `step7_install_deps.sh`（**强制装 torch 2.5.1+cpu**）。在 GPU 容器里跑这条命令会把 CUDA torch 打成 CPU，权重同步再次失败。
+> - **本 Step 7b 推荐路径：单 GPU 容器 + collocated `0-0`。** dummy（`is_dummy=True`）不连 FCI、不需要 libfranka。双容器（franky env + GPU actor）留给 **Step 10+** 真机训练（采集/SFT/RLPD），见文末「路径 B」。
+> - **勿误解：** 7a ✅ ≠ 7b ✅。完成前 Step 7 整体视为 **未闭环**。
 
-**目标：** 在同一 `run_step7_dummy_sac.sh` 入口下，跑通 **actor → rollout 权重同步** → replay buffer 填充 → **≥1 个 epoch** → `logs/*-realworld_franky_dummy_sac/` 下出现有限（非 NaN）的 **`train/`** 指标。
+**目标：** 在 **CUDA 可见** 的 Ray 集群上跑通 `train_async.py`：`sync_model_to_rollout` → dummy env 采数 → replay → **≥1 epoch** → `logs/*-realworld_franky_dummy_sac_gpu/` 出现有限（非 NaN）的 **`train/`** 指标。臂仍不动。
 
-**LOG-024 失败点（verbatim）：**
+**为何 7a 在 franky 容器必然卡在 sync（历史，避免重蹈）：**
 
 ```
 RuntimeError: Cannot access accelerator device when none is available.
-  at patch_syncer.py:968 init_sender → snapshot_value.pin_memory()
-
+  patch_syncer.py:968 init_sender → snapshot_value.pin_memory()
 AttributeError: 'NoneType' object has no attribute 'synchronize'
-  at patch_syncer.py:907 _apply_init_weights → current_stream().synchronize()
+  patch_syncer.py:907 _apply_init_weights → current_stream().synchronize()
 ```
 
-**验收（均未满足，待 7b 重跑后打勾）：**
+`weight_syncer.type: patch` 在 `snapshot_device: cpu` 时仍会 `pin_memory()`，这要求 **进程内 CUDA 可用**。franky 镜像基于 **ubuntu:20.04、无 CUDA**（`docker/Dockerfile` `FRANKA_BASE_IMAGE`），`Cluster` 报 `0 accelerator`。GPU 容器里 `ACCELERATOR_TYPE` 应为 NVIDIA，FSDP 走真实 wrap，不再走 7a 的 CPU bypass。
 
-- [ ] 日志 `run_embodiment.log` **全程无 traceback** — ❌ LOG-024 权重同步阶段失败
-- [ ] `sync_model_to_rollout` 成功 — ❌
-- [ ] 至少 **1 个 epoch** 完成 — ❌
-- [ ] `train/` 指标有限（非 NaN）并写入 logger — ❌
+---
 
-**日后完成步骤（推荐：GPU 双容器）：**
+##### 7b.1 本机对照（2026-08-17 实测）
 
-1. **宿主机：** 修复 NVIDIA 驱动，确认 `nvidia-smi` 正常。
-2. **终端 1（franky 容器，env）：**
-   ```bash
-   bash b/x/configs/docker_run_franky_5090.sh
-   source b/x/configs/setup_before_ray_5090.sh
-   ray start --head --port=6379
-   ```
-3. **终端 2（GPU 容器，actor/rollout）：** 见 §3.7、`franka_3.md` §10 双容器示例；`component_placement` 需将 actor/rollout 放到 GPU rank。
-4. **仅在 head 执行训练：**
-   ```bash
-   export RLINF_RESNET10_PATH=/home/nvidia/ckpts/RLinf-ResNet10-pretrained
-   bash b/x/scripts/run_step7_dummy_sac.sh
-   ```
-5. 检查 `logs/*-realworld_franky_dummy_sac/run_embodiment.log` 与 TensorBoard `train/` 曲线。
+| 项 | 值 | 落地含义 |
+|----|-----|----------|
+| GPU | 1× **NVIDIA GeForce RTX 5090 D**，~32 GiB | `component_placement` 只用 **GPU 0** → `0-0` |
+| 驱动 / CUDA | 580.173.02 / 13.0 | 官方 embodied 镜像基座 **CUDA 12.8.1**（`docker/Dockerfile` `CUDA_VER`）；驱动 580 **向前兼容** 12.8 用户态 |
+| 已占用显存 | ~776 MiB（Xorg / gnome / nxnode / firefox） | 训练可用显存充足，不必杀桌面 |
+| 权重 | `/home/nvidia/ckpts/RLinf-ResNet10-pretrained/resnet10_pretrained.pt` | 容器 **只读 bind** `/home/nvidia/ckpts` |
+| 本机已有镜像 | `rlinf/rlinf:agentic-rlinf0.4-franka` ✅；**没有** `agentic-rlinf0.4-maniskill_libero` | 7b **先 pull GPU 镜像** |
+| 网卡 | Ray/NCCL 走 **eno2**（`10.229.18.21`） | `RLINF_COMM_NET_DEVICES=eno2`，与 7a 相同 |
+| dummy | `is_dummy=True`，`robot_ip: 0.0.0.0` | **不占用** `172.16.0.2` FCI |
 
-**判定：** ⏳ **Step 7b 待完成** — 完成前 Step 7 整体视为 **未闭环**。
+**与官方 dummy SAC 配置差：** 官方 `realworld_dummy_franka_sac_cnn.yaml` 用 `PegInsertionEnv-v1` + `actor/env/rollout: 0-0`。本方案只换 Gym ID 为 `FrankyFrankaEnv-v1`，placement 与官方 GPU dummy **对齐**（不要再用 7a 的 `actor,env,rollout: 0`）。
+
+---
+
+##### 7b.2 代码变更（相对 7a）
+
+| 操作 | 文件 | 作用 |
+|------|------|------|
+| **新增** | `b/x/configs/realworld_franky_dummy_sac_gpu.yaml` | 与 7a YAML 同任务/同 Gym ID；**唯一关键差** `cluster.component_placement: actor/env/rollout: 0-0`（GPU rank，不是 CPU 节点 rank `0`） |
+| **新增** | `b/x/configs/docker_run_gpu_5090.sh` | `--gpus all` + CUDA 镜像 + 挂权重；**不要**用 `docker_run_franky_5090.sh` |
+| **新增** | `b/x/configs/setup_before_ray_gpu_5090.sh` | `PYTHONPATH`/`RLINF_EXT_MODULE`/`EMBODIED_PATH`；`switch_env openvla`（或 oft/openpi）；**禁止** `switch_env franky-0.19.0` |
+| **新增** | `b/x/scripts/run_step7b_dummy_sac_gpu.sh` | 检查 `nvidia-smi` + `torch.cuda.is_available()`；杀掉占用 6379 的旧 Ray；`train_async.py --config-name realworld_franky_dummy_sac_gpu` |
+| **不改** | `rlinf/` 上游 | Gym 仍靠 `b/x` + `RLINF_EXT_MODULE`；GPU 路径下 `runtime_bootstrap` 的 FSDP CPU bypass **不会触发**（非 `NO_ACCEL`） |
+| **禁止调用** | `step7_install_deps.sh` / `run_step7_dummy_sac.sh` | 会把 GPU venv 的 torch **换成 CPU wheel** |
+
+**为何 `0` 与 `0-0` 不能混用：** 调度器把 placement 字符串解成 **该节点组内的硬件编号**。无加速卡时节点自身为硬件 0 → 写 `0`（7a）。有 GPU 时硬件编号是 GPU 索引 → 必须写 `0-0` 表示 GPU0。在 GPU 节点上继续写 `0` 会被当成 CPU/错误 rank，Cluster 仍可能落到 `NO_ACCEL`。
+
+---
+
+##### 7b.3 落地步骤（路径 A：单 GPU 容器，推荐）
+
+**Step A0 — 宿主机清理（必做）**
+
+`--network host` 下 franky 容器与 GPU 容器 **抢同一个 6379**。7a 若未 `ray stop`，7b 会连上无 GPU 的旧 head。
+
+```bash
+# 宿主机
+nvidia-smi   # 必须成功，见 7b.1
+docker ps --format '{{.Names}} {{.Image}}'
+# 若仍有 rlinf-franky-5090 / 旧 Ray：
+docker exec rlinf-franky-5090 ray stop --force 2>/dev/null || true
+ray stop --force 2>/dev/null || true
+ss -lptn | grep 6379 || echo "6379 free"
+```
+
+**Step A1 — 拉取 GPU 镜像（本机当前没有）**
+
+```bash
+docker pull rlinf/rlinf:agentic-rlinf0.4-maniskill_libero
+# 国内：
+# docker pull docker.1ms.run/rlinf/rlinf:agentic-rlinf0.4-maniskill_libero
+```
+
+官方 embodied 镜像 CUDA **12.8.1**，与 5090 / 驱动 580 匹配策略见 7b.1。拉完后确认 tag 存在：`docker image inspect rlinf/rlinf:agentic-rlinf0.4-maniskill_libero`。
+
+**Step A2 — 启动 GPU 容器**
+
+```bash
+bash b/x/configs/docker_run_gpu_5090.sh
+```
+
+等价于：
+
+```bash
+docker run -it --rm --gpus all --privileged --network host --shm-size=20g \
+  --name rlinf-gpu-5090 \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e RLINF_RESNET10_PATH=/home/nvidia/ckpts/RLinf-ResNet10-pretrained \
+  -e RLINF_SKIP_CAMERA=1 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf \
+  -v /home/nvidia/ckpts:/home/nvidia/ckpts:ro \
+  -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-maniskill_libero bash
+```
+
+**Step A3 — 容器内自检（未过不要 `ray start`）**
+
+```bash
+source b/x/configs/setup_before_ray_gpu_5090.sh
+# 期望 python 在 /opt/venv/openvla（或 oft/openpi），绝不是 franky-0.19.0
+
+nvidia-smi                  # 容器内也能看到 RTX 5090 D
+which python
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
+python -c "import peft, transformers, timm; print('embodied deps OK')"
+python -c "import franky_ext.tasks.register; import gymnasium as gym; print(gym.spec('FrankyFrankaEnv-v1'))"
+test -f "${RLINF_RESNET10_PATH}/resnet10_pretrained.pt" && echo "ResNet10 OK"
+```
+
+| 自检失败 | 处理 |
+|----------|------|
+| 容器内 `nvidia-smi` 失败 | 缺 `--gpus all` 或 NVIDIA Container Toolkit；回宿主机查 `docker run --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi` |
+| `torch.cuda.is_available()==False` | 用了 franky venv 或 CPU wheel；重新进 GPU 容器，**不要**跑 `step7_install_deps.sh` |
+| `No module named 'peft'` | `source switch_env openvla` 未生效；或该镜像 venv 名不同，`ls /opt/venv` 后改 `setup_before_ray_gpu_5090.sh` |
+| `UnregisteredEnv FrankyFrankaEnv-v1` | `PYTHONPATH` 未含 `/workspace/RLinf/b/x`；确认已 source GPU setup |
+| import `franky` 失败 | **可忽略**：dummy 不连真机，`franky_controller.py` 模块级不 import `franky` |
+
+**Step A4 — 训练（仅 GPU 容器、仅 7b 脚本）**
+
+```bash
+bash b/x/scripts/run_step7b_dummy_sac_gpu.sh
+```
+
+脚本会：校验 CUDA → 注册 Gym → `ray stop` 后 `ray start --head --port=6379` → `python examples/embodiment/train_async.py --config-path b/x/configs --config-name realworld_franky_dummy_sac_gpu`。
+
+**期望日志（相对 LOG-024 的变化）：**
+
+| 阶段 | 7a（失败） | 7b（成功时应看到） |
+|------|-----------|-------------------|
+| Cluster | `1 node and 0 accelerator` | **`1 accelerator`**（NVIDIA），placement `accelerator_type` 非 `NO_ACCEL` |
+| Actor | FSDP CPU bypass | 正常 FSDP wrap（`no_shard`） |
+| `sync_model_to_rollout` | `pin_memory` / `synchronize` 炸 | 无该 traceback |
+| 训练 | 未进入 epoch | `max_epochs: 2` 跑完或至少 epoch 1；TensorBoard `train/` |
+
+日志目录：`logs/<日期>-realworld_franky_dummy_sac_gpu/run_embodiment.log`。
+
+**Step A5 — 看指标**
+
+```bash
+# 宿主机或容器
+ls logs/*-realworld_franky_dummy_sac_gpu/
+# TensorBoard：log_path 下 events
+```
+
+---
+
+##### 7b.4 验收清单
+
+- [x] 宿主机 `nvidia-smi` 显示 RTX 5090 D — `[服务器]` ✅ LOG-025
+- [x] 已 pull `rlinf/rlinf:agentic-rlinf0.4-maniskill_libero` — `[服务器]` ✅
+- [x] 6379 上 **没有** franky 7a 残留 Ray — `[服务器]` ✅
+- [x] 容器内 `torch.cuda.is_available()==True` — `[服务器]` ✅ `2.11.0+cu128`
+- [x] Cluster 日志 **≥1 accelerator**，非 `NO_ACCEL` — `[服务器]` ✅ `NV_GPU`
+- [x] `sync_model_to_rollout` 无 `pin_memory` / `synchronize` traceback — `[服务器]` ✅
+- [x] ≥1 epoch 完成，`train/` 指标有限（非 NaN） — `[服务器]` ✅ **2/2**（`logs/20260818-001209-realworld_franky_dummy_sac_gpu/`）
+- [x] 臂不动（dummy，未连 `172.16.0.2`） — ✅
+
+**判定：** Step 7b **PASS**，Step 7 闭环。过程见 [`franka_3LOG.md`](franka_3LOG.md) LOG-025。
+
+---
+
+##### 7b.5 路径 B：双容器（仅预演 Step 10+，本 dummy **不必做**）
+
+官方真机（`realworld_charger_sac_cnn_async.yaml`）是 **两台逻辑节点**：GPU 组 `actor/rollout: 0-0`，franka 组 `env` + `hardware.type: Franka`。本机是 **一台机器两个容器、host network、同一 IP**，Ray 多 node 需要不同 `--node-ip-address` / 两个 `RLINF_NODE_RANK`，比路径 A 脆。
+
+**仅当** 7b 路径 A 已 PASS、要为真机 RL 预演放置时：
+
+1. GPU 容器：`export RLINF_NODE_RANK=0`，`ray start --head --port=6379 --node-ip-address=10.229.18.21`（eno2）。
+2. franky 容器：`export RLINF_NODE_RANK=1`，`ray start --address=10.229.18.21:6379`（**不要**再 `--head`）。
+3. YAML 改为 `cluster.num_nodes: 2` + `node_groups`（GPU 节点 0，franka 节点 1）；**train 只在 head 跑**。
+4. dummy 阶段 env 仍 `is_dummy=True`，franka 组可不填真实 `robot_ip`。
+
+7b 验收以路径 A 为准；路径 B 失败不否定 7b GPU 训练能力。
+
+---
+
+##### 7b.6 排错
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 又出现 LOG-024 的 `pin_memory` | 连上了无 GPU 的 Ray，或 CPU torch | `ray stop --force`；确认 `nvidia-smi`；确认 python 不是 franky venv |
+| `Cannot connect to Ray` / 连错集群 | 两容器 host 网络共用 6379 | 只留 **一个** head；7b 脚本已尝试 `ray stop` |
+| Cluster 仍 `0 accelerator` | `ray start` 时容器看不到 GPU | `--gpus all` 后再 `ray start`（Ray **启动瞬间**捕获 GPU 列表） |
+| RTX 5090 上 `CUDA error: no kernel image` | 镜像内 torch 未编 sm_120 | 换/重建 CUDA **≥12.8** 的 embodied 镜像；不要降驱动 |
+| Hydra 找不到 `env/realworld_peg_insertion` | 未设 `EMBODIED_PATH` | 必须 source `setup_before_ray_gpu_5090.sh` |
+| OOM | 5090 32G 对本 dummy CNN 极不可能；若发生 | 把 `micro_batch_size`/`global_batch_size` 再降（当前 256） |
+| 误跑 `run_step7_dummy_sac.sh` | 7a 入口 | 立刻停训，**不要**在 GPU 容器 pip 装 CPU torch；必要时重建 GPU 容器 |
 
 ---
 
 **Step 7 常见错漏：**
 
-- ❌ 使用 `train_embodied_agent.py`（同步入口）→ 用 **`train_async.py`**
-- ❌ 仅 `--config-path b/x/configs` 不设 `EMBODIED_PATH` → Hydra 找不到 defaults
-- ❌ 忘记 Gym 注册 → env worker `gym.error.UnregisteredEnv`（7a 已解决）
-- ❌ `component_placement: 0-0` 在无 GPU 的 franky 容器 → 用 **`actor,env,rollout: 0`**
-- ❌ 将 **7a PASS** 误认为 **7b PASS** → 见上文 ⏳ 提醒
-- ❌ 宿主机无 GPU 仍期望 7b 在纯 franky 容器通过 → 需双容器或 CPU shim 扩展
+- ❌ 使用 `train_embodied_agent.py` → 用 **`train_async.py`**
+- ❌ **7b 复用 `run_step7_dummy_sac.sh` / `step7_install_deps.sh`** → 用 **`run_step7b_dummy_sac_gpu.sh`**
+- ❌ 7b 仍用 `component_placement: actor,env,rollout: 0` → GPU 上用 **`0-0`**
+- ❌ 7b 进 franky 镜像（无 CUDA）→ 用 **`agentic-rlinf0.4-maniskill_libero --gpus all`**
+- ❌ 不 `ray stop` 就开 GPU 容器 → 连上 7a 无加速卡 head
+- ❌ 仅 `--config-path b/x/configs` 不设 `EMBODIED_PATH`
+- ❌ 将 **7a PASS** 当成 **7b PASS**
 
 ---
 
-## 9. 相机 Phase（后续，与 Step 0–7 解耦） **`[真机]`** + **`[相机]`**
+### Step 8 — 检测相机并接入 RLinf `[服务器]` / **`[真机]`** + **`[相机]`**
 
-Step 0–7 ** deliberately 不含相机**（Step 7 dummy SAC 用零图像 stub）。待臂+夹爪+env+训练链路稳定后再做：
+**目标：** 摸清本机 Franka 上已安装相机的类型与参数，让 `FrankyFrankaEnv-v1` **真正打开相机**（`RLINF_SKIP_CAMERA=0`），并确认 `reset`/`step` 拿到的 `obs["frames"]` 不是零图 stub。
 
-| 子 Step | 内容 | 真机 | 相机 |
-|---------|------|------|------|
-| C0 | `lsusb` / RealSense SDK 摸底 serial | 否 | 摸底 |
-| C1 | 去掉 `skip_camera`，恢复 `_open_cameras` | 否 | 否 |
-| C2 | 单帧采集验证 | **是** | **是** |
-| C3 | 接入 `realworld_collect_data.yaml` 副本 | **是** | **是** |
-| C4 | Pi0 SFT / eval 副本 | **是** | **是** |
+本机已装相机（2026-08-18 确认）。§2 里 2026-08-14「USB 未见 RealSense」**已过时**；8a **不得写死品牌**，按 `realsense` / `zed` / `lumos` 枚举。
 
-相机 env 仍用 `Franky*` Gym ID，仅 YAML 增加 `camera_serials`。
+原「相机 Phase」C0–C2 并入本 Step；C3 数据采集 → **Step 10**，C4 Pi0 → **Step 11**。Step 9 是相机接通后的小范围运动 + 拍照，**不是**采集。
+
+| 子 Step | 内容 | 真机 | 相机独占 |
+|---------|------|------|----------|
+| **8a** | `lsusb`、`/dev/video*`、`FrankaRobot.enumerate_cameras`；打印 serial / 固件 / USB / 流（分辨率·fps·format） | 否 | 关闭宿主机 `realsense-viewer` 等占用 |
+| **8b** | 把 serial / `camera_type` / 可选 `camera_names` 写入 YAML；`RLINF_SKIP_CAMERA=0` | 否 | 否 |
+| **8c** | `gym.make(FrankyFrankaEnv-v1)`，`is_dummy=False`，`safe_smoke_hold=True`；检查 `obs["frames"]` | **是**（占 FCI，臂 hold） | **是** |
+
+**涉及文件：**
+
+| 文件 | 本 Step 变更 | 作用 |
+|------|-------------|------|
+| `b/x/scripts/step8_detect_cameras.py` | **新增** | 8a：枚举 + `CHECK`/`RESULT`；`--write-yaml` |
+| `b/x/scripts/step8_check_yaml.py` | **新增** | 8b：YAML 对 JSON 验收 |
+| `b/x/scripts/step8_test_env_camera.py` | **新增** | 8c：真机帧检查 + `RESULT Step8c` |
+| `b/x/scripts/run_step8_accept.sh` | **新增** | 一键 8a+8b（`--with-robot` 含 8c） |
+| `b/x/scripts/step8_checks.py` | **新增** | 统一 `CHECK` / `RESULT` / `STEP8_RESULT=` |
+| `b/x/configs/realworld_franky_camera.yaml` | **新增** | 8b 接线：`camera_serials` / `camera_type` |
+| `b/x/franky_ext/franky_single_franka_env.py` | 无改 | `RLINF_SKIP_CAMERA=0` 时走上游 `_open_cameras` |
+| `rlinf/` | **禁止修改** | `create_camera` / `FrankaRobot.enumerate_cameras` 已支持三种后端 |
+
+**为何不改 `franka_env.py`：** 单臂相机已由 `FrankaRobotConfig.camera_serials` / `camera_type` 驱动。扩展 mixin 只在 skip 时 stub 零图；关掉 skip 即接入。`is_dummy=True` **不会** `camera.open()`，所以 8c 必须真机 env，不能在 dummy / 7b GPU 容器里验真相机（USB 在 **franky 控制容器**）。
+
+默认 `CameraInfo`：`(640, 480)` @ 15 fps；env obs 帧为 `128×128×3` `uint8`。franky 容器已 `--privileged --network host`，USB 可进容器。
+
+**本 Step 明确不做：** EE 球运动（Step 9）、数据采集（Step 10）、Pi0/RLPD、改 `rlinf/`、改 Step 5–7 的 `RLINF_SKIP_CAMERA=1` 默认。
+
+---
+
+**如何判断通过：** 每个脚本打印 `CHECK <项> OK|FAIL`，最后一行级是：
+
+```
+RESULT Step8a PASS
+STEP8_RESULT={"step": "8a", "pass": true, ...}
+```
+
+- **看 `RESULT Step8x PASS` + 进程 exit 0** → 该项如预期。
+- **`RESULT ... FAIL` 或 exit ≠ 0** → 失败；向上找第一条 `CHECK ... FAIL`。
+- `STEP8_RESULT=` 是 JSON，便于记日志。
+
+一键（franky 容器）：
+
+```bash
+source b/x/configs/setup_before_ray_5090.sh
+bash b/x/scripts/run_step8_accept.sh              # 8a+8b，不连臂
+bash b/x/scripts/run_step8_accept.sh --with-robot # +8c，Desk FCI，臂 hold
+```
+
+---
+
+#### Step 8a — 检测相机与参数 `[服务器]` + `[相机]`
+
+**前置：** 相机 USB 插在 5090；**不要**同时开 `realsense-viewer`。在 **franky** 容器内跑。
+
+```bash
+source b/x/configs/setup_before_ray_5090.sh
+python b/x/scripts/step8_detect_cameras.py --write-yaml
+```
+
+**测试用例（成功时必须出现）：**
+
+| CHECK | 期望 |
+|-------|------|
+| `rlinf_enumerate_nonempty` | `OK`（realsense/zed/lumos 至少一类非空） |
+| `primary_serials_nonempty` | `OK` |
+| `serials_not_placeholder` | `OK`（禁止 `0123456789` / `REPLACE_AFTER_STEP8A` 等） |
+| `realsense_sdk_devices` | 主类型为 realsense 时 `OK` |
+| `json_written` | `OK` → `b/x/configs/camera_detected.json` |
+| `yaml_written` | `--write-yaml` 时 `OK` |
+| **`RESULT Step8a PASS`** | 末行；**exit 0** |
+
+失败例：无 USB / viewer 占用 / 无 `pyrealsense2` → `RESULT Step8a FAIL`，exit 1。
+
+---
+
+#### Step 8b — 写入并验收 RLinf 相机配置 `[服务器]`
+
+`--write-yaml` 填 [`realworld_franky_camera.yaml`](../../x/configs/realworld_franky_camera.yaml) 后，**必须**跑验收脚本（不要只靠肉眼）：
+
+```bash
+python b/x/scripts/step8_check_yaml.py
+```
+
+未跑 8a 时（无 JSON）当前会：
+
+```
+CHECK json_exists FAIL
+RESULT Step8b FAIL
+```
+
+**测试用例（接线成功）：**
+
+| CHECK | 期望 |
+|-------|------|
+| `json_exists` / `yaml_exists` | `OK` |
+| `json_serials_not_placeholder` | `OK` |
+| `yaml_serials_not_placeholder` | `OK`（不再是 `REPLACE_AFTER_STEP8A`） |
+| `yaml_serials_match_json` | YAML 与 8a JSON **同一列表** |
+| `yaml_camera_type_match_json` | `OK` |
+| `yaml_is_dummy_false` | `OK` |
+| `yaml_gym_id_franky` | `FrankyFrankaEnv-v1` |
+| **`RESULT Step8b PASS`** | **exit 0** |
+
+运行 8c 前：`export RLINF_SKIP_CAMERA=0`（8c 脚本会强制设为 `0`）。
+
+---
+
+#### Step 8c — RLinf 与相机交互 `[真机]` + `[相机]`
+
+**真机前置：** 同 Step 5（Desk FCI、`tune_eno1.sh`、单一 libfranka、急停）。先停 Step 5/6/**9**。**默认臂 hold，不飞。**
+
+```bash
+source b/x/configs/setup_before_ray_5090.sh
+export FRANKA_ROBOT_IP=172.16.0.2
+export RLINF_SKIP_CAMERA=0
+ray start --head --port=6379
+python b/x/scripts/step8_test_env_camera.py
+python b/x/scripts/step8_test_env_camera.py --save-jpeg
+python b/x/scripts/step8_test_env_camera.py --require-live   # 帧必须跨 step 变化
+ray stop
+```
+
+**测试用例（交互成功）：**
+
+| CHECK | 期望 |
+|-------|------|
+| `skip_camera_is_0` | `OK` |
+| `serials_not_placeholder` | `OK` |
+| `safe_smoke_hold` | `OK`（不要加 `--unsafe-full-reset`） |
+| `tcp_probe` | `OK`（6D 位姿） |
+| `env_reset` | `OK` |
+| `obs_frames_nonempty` | `OK` |
+| `wrist_1_present` | `OK`（charger/peg 主视角键） |
+| `frame_wrist_1_uint8_128` | shape `(128,128,3)` dtype uint8 |
+| `frame_wrist_1_nonzero` | **非全零**（否则仍是 skip stub） |
+| `live_frames_changed` | 有噪声/运动则 `OK`；全静可 `SKIP`；`--require-live` 时静图 → FAIL |
+| **`RESULT Step8c PASS`** | **exit 0** |
+
+全零图 / 假 serial / 仍 skip → `CHECK frame_wrist_1_nonzero FAIL` 或 `uncaught FAIL`，`RESULT Step8c FAIL`，exit 1。
+
+**验收状态：** ✅ **PASS**（LOG-026–029）：8a/8b/8c、`run_step8_accept.sh --with-robot`、`--save-jpeg --require-live` 均为 `RESULT PASS` exit 0。
+
+---
+
+### Step 9 — 当前 EE 为原点的 5 cm 球随机运动 + 拍照 `[真机]` + `[相机]`
+
+**目标：** 以探测到的**当前 TCP** 为原点，末端只在半径 **5 cm** 的球内随机游走约 **10 s**，同时拍摄 **5** 张 `wrist_1` 照片到 [`b/x/logs/step9_camera/`](../../x/logs/step9_camera/)。结束后小步回到原点。
+
+**本 Step 不是数据采集。** 采集工作流是 **Step 10**。
+
+**安全（硬限制）：**
+
+- `safe_smoke_hold=True`，**禁止** `--unsafe-full-reset`（不得插值飞向远处 rest pose）
+- 只动 **xyz**；**RPY 锁在原点姿态**（`action[3:6]=0`）；夹爪不动（`no_gripper=True`）
+- env 的 `_clip_position_to_safety_box` 是 **轴对齐盒子**。若只设 `ee_pose_limit = origin ± 5 cm`，立方体角点距原点约 **8.7 cm**，且阻抗过冲会把实测 TCP 顶在盒面，回程指令进不去。落地默认盒子为 **origin ± 0.08 m**（`--safety-margin`），RPY 窄窗；**球约束必须在脚本里投影**
+- 每步 L2 `|Δxyz| ≤ 5 mm`；运动环墙钟 **>12 s** 强制停
+- 全程 `||p - origin|| > 0.058 m`（5 cm + 8 mm 阻抗余量）→ **FAIL 并停步回原点**
+- 工作区：当前 EE 周围半径 **≥ 5 cm 无障碍**
+- 操作前置同 Step 5/8c：Desk FCI、`tune_eno1.sh`、**单一 libfranka**、人在急停旁；先停 Step 5/6/8c
+
+**运动语义：** 10 Hz × 100 步 ≈ 10 s；约每 2 s 换一个球内均匀 waypoint（单位方向 × `R * u^{1/3}`），折线游走。照片在第 0 / 25 / 50 / 75 / 100 步（约 0、2.5、5、7.5、10 s）。
+
+**涉及文件：**
+
+| 文件 | 本 Step 变更 | 作用 |
+|------|-------------|------|
+| `b/x/scripts/step9_test_ee_sphere.py` | **新增** | `--math-only` 几何自测；真机球运动 + 5 张 JPEG + `RESULT Step9` |
+| `b/x/scripts/run_step9_accept.sh` | **新增** | 默认数学验收；`--with-robot` 含真机 |
+| `b/x/scripts/step8_checks.py` | 复用 | `CHECK` / `RESULT`（真机 JSON 键 `STEP9_RESULT=`） |
+| `rlinf/` | **禁止修改** | 不把盒子裁剪改成球 |
+
+```bash
+source b/x/configs/setup_before_ray_5090.sh
+export FRANKA_ROBOT_IP=172.16.0.2
+export RLINF_SKIP_CAMERA=0
+
+# 无臂：几何测试（exit 0 + RESULT Step9math PASS）
+python b/x/scripts/step9_test_ee_sphere.py --math-only
+bash b/x/scripts/run_step9_accept.sh
+
+# 真机（Desk FCI；清扫当前 EE 周围 5 cm 球）
+ray start --head --port=6379
+python b/x/scripts/step9_test_ee_sphere.py
+# 或一键：
+bash b/x/scripts/run_step9_accept.sh --with-robot
+ray stop
+```
+
+默认 seed=`9`（可 `--seed`）。照片：`wrist_1_t00s.jpg` … `wrist_1_t10s.jpg`。
+
+**测试用例（真机成功）：**
+
+| CHECK | 期望 |
+|-------|------|
+| `skip_camera_is_0` | `OK` |
+| `serials_not_placeholder` | `OK` |
+| `safe_smoke_hold` | `OK`（不要加 `--unsafe-full-reset`，加了直接 FAIL） |
+| `tcp_probe` | `OK`（6D 位姿，作为原点） |
+| `env_reset` | `OK` |
+| `obs_frames_nonempty` / `wrist_1_present` | `OK` |
+| `frame_wrist_1_uint8_128` | shape `(128,128,3)` dtype uint8 |
+| `motion_duration_s` | 约 10 s（允许 9–12）且满 100 步 |
+| `tcp_inside_sphere` | 全程 `||p-origin|| ≤ 0.058` |
+| `orientation_locked` | RPY 相对原点每轴小于 0.15 rad |
+| `photos_count_5` | `step9_camera/` 恰好 5 个非空 JPEG（指定文件名） |
+| `frame_wrist_1_nonzero` | 照片非全零 stub |
+| `return_to_origin` | 结束后 `||p-origin|| ≤ 8 mm` |
+| **`RESULT Step9 PASS`** | **exit 0** |
+
+无臂几何：`CHECK math_* OK` + **`RESULT Step9math PASS`**。
+
+**验收状态：** ✅ **PASS**（LOG-031–037）：`RESULT Step9math PASS`；真机 `run_step9_accept.sh --with-robot` → `RESULT Step9 PASS`、`RESULT Step9 accept PASS (math+robot)` exit 0。max_r=51.8 mm；回原点 final_r=4.1 mm；`b/x/logs/step9_camera/` 五张非空 JPEG。回程用 `2× remaining` 过冲 + settle（不发零动作），以抵消阻抗 ~10 mm 稳态误差。未改 `rlinf/`。
+
+---
+
+## 9. 相机已并入 Step 8
+
+原独立「相机 Phase（C0–C4）」已并入实施步骤，不再与 Step 0–7 解耦：
+
+| 原编号 | 现归属 |
+|--------|--------|
+| C0 枚举 serial | **Step 8a** |
+| C1 去掉 skip | **Step 8b**（`RLINF_SKIP_CAMERA=0`） |
+| C2 单帧 / env 交互 | **Step 8c** |
+| C3 `realworld_collect_data.yaml` | **Step 10** 数据采集 |
+| C4 Pi0 SFT / eval | **Step 11** |
+
+相机 env 仍用 `Franky*` Gym ID，YAML 增加实测 `camera_serials`（见 `realworld_franky_camera.yaml`）。**Step 9** 在 8c 之后做当前 EE 为原点的 5 cm 球运动 + 拍照，仍不是数据采集。
 
 ---
 
 ## 10. 工作流 Step 7+（逐个接入）
 
-每步：**复制官方 YAML → `b/x/configs/` → 改 `init_params.id` → 用 `train_async.py` + 独立启动脚本测试**（Step 7a 已 PASS；**7b 待完成**；Step 8+ 待建）。
+每步：**复制官方 YAML → `b/x/configs/` → 改 `init_params.id` → 用 `train_async.py` + 独立启动脚本测试**（Step 7a/7b ✅；Step 8 相机 ✅；Step 9 球运动脚本已建；Step 10+ 采集待建）。
 
 | Step | 工作流 | 真机依赖 | 基于官方配置 | 环境要求 |
 |------|--------|----------|-------------|----------|
 | **7a** | dummy SAC 链路 smoke | `[服务器]` | `realworld_dummy_franka_sac_cnn.yaml` | franky 容器；✅ PASS（LOG-024） |
-| **7b** | dummy SAC 完整训练 | `[服务器]` + **GPU** | 同 7a | ⏳ **待完成**（双容器或修复驱动） |
-| 8 | 数据采集 | **`[真机]`** + **`[相机]`** | `realworld_collect_data.yaml` | Step 6 + 相机 Phase |
-| 9 | Pi0 SFT 部署 | **`[真机]`** + **`[相机]`** | `realworld_eval.yaml` | GPU 双容器 + 真机 rollout |
-| 10 | RLPD | **`[真机]`** + **`[相机]`** | `realworld_peginsertion_rlpd_cnn_async.yaml` | GPU 双容器 + `train_async.py` |
-| 11 | HG-DAgger | **`[真机]`** + **`[相机]`** | `realworld_pnp_dagger_openpi.yaml` | GPU + openpi + 遥操作/干预 |
-| 12 | RLT / RTC | **`[真机]`** + **`[相机]`** | 各对应 YAML | 按需 |
+| **7b** | dummy SAC 完整训练 | `[服务器]` + **GPU** | `realworld_franky_dummy_sac_gpu.yaml` | ✅ PASS（LOG-025）；`run_step7b_dummy_sac_gpu.sh` |
+| **8** | 相机检测与 RLinf 接入 | `[服务器]` / **`[真机]`** + **`[相机]`** | `realworld_franky_camera.yaml` | franky 容器 + USB；8c 占 FCI |
+| **9** | EE 5 cm 球随机运动 + 拍照 | **`[真机]`** + **`[相机]`** | `step9_test_ee_sphere.py` | Step 8 相机 JSON；当前 EE 为原点 |
+| **10** | 数据采集 | **`[真机]`** + **`[相机]`** | `realworld_collect_data.yaml` | Step 6 + Step 8 + Step 9 |
+| **11** | Pi0 SFT 部署 | **`[真机]`** + **`[相机]`** | `realworld_eval.yaml` | GPU 双容器 + 真机 rollout |
+| **12** | RLPD | **`[真机]`** + **`[相机]`** | `realworld_peginsertion_rlpd_cnn_async.yaml` | GPU 双容器 + `train_async.py` |
+| **13** | HG-DAgger | **`[真机]`** + **`[相机]`** | `realworld_pnp_dagger_openpi.yaml` | GPU + openpi + 遥操作/干预 |
+| **14** | RLT / RTC | **`[真机]`** + **`[相机]`** | 各对应 YAML | 按需 |
 
-**Step 7 启动（7a / 7b 同一入口；7b 需 GPU 环境）：**
+**Step 7a 启动（franky 容器，CPU smoke）：**
 
 ```bash
 source b/x/configs/setup_before_ray_5090.sh
 bash b/x/scripts/run_step7_dummy_sac.sh
 ```
 
-脚本内部调用 `examples/embodiment/train_async.py`，`--config-path b/x/configs`，`--config-name realworld_franky_dummy_sac`；Hydra `searchpath` 仍指向 `${EMBODIED_PATH}/config/`（官方 env/model 子配置）。权重路径默认 `${REPO_PATH}/models/RLinf-ResNet10-pretrained`（可用环境变量 `RLINF_RESNET10_PATH` 覆盖）。
+**Step 7b 启动（GPU 容器，完整训练）：**
+
+```bash
+bash b/x/configs/docker_run_gpu_5090.sh   # 宿主机
+source b/x/configs/setup_before_ray_gpu_5090.sh
+bash b/x/scripts/run_step7b_dummy_sac_gpu.sh
+```
+
+7a 使用 `--config-name realworld_franky_dummy_sac`；7b 使用 `--config-name realworld_franky_dummy_sac_gpu`。Hydra `searchpath` 均指向 `${EMBODIED_PATH}/config/`。权重：`${RLINF_RESNET10_PATH:-/home/nvidia/ckpts/RLinf-ResNet10-pretrained}`。
 
 **官方对照命令（ROS PegInsertion，非 Franky）：**
 
@@ -1267,7 +1805,7 @@ cd examples/embodiment
 bash run_realworld_async.sh realworld_dummy_franka_sac_cnn
 ```
 
-**双容器 GPU（Step 9+ 参考）：**
+**双容器 GPU（Step 10+ 参考）：**
 
 ```bash
 # 终端 1：franky 容器 — env + 控制
@@ -1361,7 +1899,7 @@ class FrankyPegInsertionEnv(FrankySingleFrankaEnvMixin, PegInsertionEnv):
 
 ## 12. 测试与验收
 
-### 12.1 Step 0–7 检查清单
+### 12.1 Step 0–9 检查清单
 
 | Step | 验收项 | 真机依赖 |
 |------|--------|----------|
@@ -1379,17 +1917,24 @@ class FrankyPegInsertionEnv(FrankySingleFrankaEnvMixin, PegInsertionEnv):
 | 5c | `--micro-nudge`：约 5 mm 伸出回退 + drift | **`[真机]`** |
 | 6 | FrankyPegInsertionEnv 6a/6b/6c reset/reward | **`[真机]`** |
 | **7a** | dummy SAC 链路 smoke：三 worker + dummy reset + 模型构建 | `[服务器]` ✅ LOG-024 |
-| **7b** | dummy SAC：权重同步 + ≥1 epoch + `train/` 指标 | `[服务器]` + **GPU** ⏳ 待完成 |
+| **7b** | dummy SAC：GPU 权重同步 + ≥1 epoch + `train/` 指标 | `[服务器]` + **GPU** ✅ LOG-025 |
+| **8a** | `CHECK` 枚举 + JSON；`RESULT Step8a PASS` | `[服务器]` + `[相机]` |
+| **8b** | `step8_check_yaml.py`：YAML 匹配 JSON；`RESULT Step8b PASS` | `[服务器]` |
+| **8c** | `wrist_1` 非零 128×128；`RESULT Step8c PASS` | **`[真机]`** + **`[相机]`**（臂 hold） |
+| **9math** | `step9_test_ee_sphere.py --math-only`；`RESULT Step9math PASS` | `[服务器]` ✅ LOG-031+ |
+| **9** | 5 cm 球 10 s + 5 张 JPEG + 回原点；`RESULT Step9 PASS` | **`[真机]`** + **`[相机]`** ✅ LOG-037 |
 
 ### 12.2 工作流验收（Step 7+，后续）
 
 | 工作流 | 通过标准 | 真机依赖 |
 |--------|----------|----------|
 | dummy SAC 链路 smoke | 三 worker 启动、dummy reset、模型构建 | `[服务器]` ✅ 7a |
-| dummy SAC 完整训练 | ≥1 epoch、loss/`train/` 有限 | `[服务器]` + GPU ⏳ **7b 待完成** |
-| collect_data | >= 10 成功 episode | **`[真机]`** + **`[相机]`** |
-| Pi0 deploy | >= 100 step 无 exception | **`[真机]`** + **`[相机]`** |
-| RLPD | >= 100 env steps | **`[真机]`** + **`[相机]`** |
+| dummy SAC 完整训练 | ≥1 epoch、loss/`train/` 有限 | `[服务器]` + GPU ✅ **7b** |
+| 相机接入 | 8a/8b `RESULT PASS`；8c `wrist_1` 非零帧 | **`[真机]`** + **`[相机]`** |
+| EE 球运动（Step 9） | 10 s 内 `||p-origin||≤5.8 cm`；5 张非空 JPEG；回原点 | **`[真机]`** + **`[相机]`** ✅ LOG-037 |
+| collect_data（Step 10） | >= 10 成功 episode | **`[真机]`** + **`[相机]`** |
+| Pi0 deploy（Step 11） | >= 100 step 无 exception | **`[真机]`** + **`[相机]`** |
+| RLPD（Step 12） | >= 100 env steps | **`[真机]`** + **`[相机]`** |
 
 ### 12.3 负向测试
 
@@ -1424,9 +1969,10 @@ source switch_env franka-0.15.0
 | M1 | Step 2–3 夹爪 + controller smoke | **是** | 3–5 天 |
 | M2 | Step 4–5 dummy + 实机 env | 4 否 / 5 **是** | 3–5 天 |
 | M3 | Step 6 任务 env smoke | **是** | 2–3 天 |
-| M4 | 相机 Phase | **是** + 相机 | 按需 |
-| M5 | Step 7+ 工作流 | 7a ✅ / **7b ⏳** / 8+ **是** | 按需 |
-| M6 | upstream 合入评估 | — | M3 稳定 2 周后 |
+| M4 | Step 8 相机检测与 RLinf 接入 | **是** + 相机 | 按需 |
+| M5 | Step 9 EE 球运动 + 拍照 | **是** + 相机 | ✅ LOG-037 |
+| M6 | Step 10+ 工作流 | 7a/7b ✅ / 8 相机 / 9 球运动 / 10+ 采集·SFT·RLPD **是** | 按需 |
+| M7 | upstream 合入评估 | — | M3 稳定 2 周后 |
 
 ---
 
@@ -1440,8 +1986,8 @@ source switch_env franka-0.15.0
 | 运行环境 | 宿主机 venv | 宿主机 venv | **Docker franky-0.19.0** |
 | 修改 rlinf/ 核心 | 多文件 | franka_env + franka.py 等 | **零修改**（扩展包） |
 | 本机绑定 | 无 | 无 | **eno1/eno2/172.16.0.2** |
-| 第一阶段 | 含相机 | 含相机 | **无相机** |
-| 测试粒度 | 粗 | 6 Phase | **Step 0–7 独立脚本** |
+| 第一阶段 | 含相机 | 含相机 | **Step 0–7 无相机；Step 8 接入；Step 9 球运动** |
+| 测试粒度 | 粗 | 6 Phase | **Step 0–9 独立脚本** |
 
 ### 14.2 控制器 API 对齐总表（扩展后目标）
 
@@ -1459,10 +2005,12 @@ source switch_env franka-0.15.0
 | 工作流 | 官方配置 | b/x 副本 | Gym ID |
 |--------|----------|----------|--------|
 | dummy SAC 链路 smoke | `realworld_dummy_franka_sac_cnn.yaml` | `realworld_franky_dummy_sac.yaml` ✅ **7a** | `FrankyFrankaEnv-v1` |
-| dummy SAC 完整训练 | 同左 | 同左 ⏳ **7b 待完成** | 同左 |
-| collect | `realworld_collect_data.yaml` | `realworld_collect_data_franky.yaml`（待建） | `FrankyPegInsertionEnv-v1` |
-| Pi0 eval | `realworld_eval.yaml` | `realworld_eval_franky.yaml` | `FrankyFrankaEnv-v1` |
-| RLPD | `realworld_peginsertion_rlpd_cnn_async.yaml` | `..._franky_async.yaml` | `FrankyPegInsertionEnv-v1` |
+| dummy SAC 完整训练 | 同左 | `realworld_franky_dummy_sac_gpu.yaml` ✅ **7b** | 同左 |
+| 相机接入 | — | `realworld_franky_camera.yaml` **8** | `FrankyFrankaEnv-v1` |
+| EE 球运动（Step 9） | — | `step9_test_ee_sphere.py` | `FrankyFrankaEnv-v1` |
+| collect（Step 10） | `realworld_collect_data.yaml` | `realworld_collect_data_franky.yaml`（待建） | `FrankyPegInsertionEnv-v1` |
+| Pi0 eval（Step 11） | `realworld_eval.yaml` | `realworld_eval_franky.yaml` | `FrankyFrankaEnv-v1` |
+| RLPD（Step 12） | `realworld_peginsertion_rlpd_cnn_async.yaml` | `..._franky_async.yaml` | `FrankyPegInsertionEnv-v1` |
 
 ### 14.4 常见问题
 
@@ -1473,7 +2021,10 @@ A: 那需要改 `FrankaEnv` 和 scheduler config。franka_3 用新 Gym ID 在扩
 A: `train_async.py` 的 env 在 Ray 子进程里 `gym.make("FrankyFrankaEnv-v1")`。扩展 Gym ID 在 `b/x/franky_ext/tasks/register.py`，须在 worker 启动时 import。**Ray worker 不执行 `PYTHONSTARTUP`**，因此主机制是：`PYTHONPATH` 含 `b/x` → `sitecustomize.py` → `runtime_bootstrap.py`；辅以 `RLINF_EXT_MODULE=franky_ext.runtime_bootstrap`。在 `ray start` 前 `source setup_before_ray_5090.sh`。
 
 **Q: Step 7 能否跳过 ResNet10 下载？**  
-A: 不能。`cnn_policy` backbone 需要 `resnet10_pretrained.pt`；`run_step7_dummy_sac.sh` 默认检查 `${RLINF_RESNET10_PATH:-/home/nvidia/ckpts/RLinf-ResNet10-pretrained}/`。
+A: 不能。`cnn_policy` backbone 需要 `resnet10_pretrained.pt`；7a/7b 脚本检查 `${RLINF_RESNET10_PATH:-/home/nvidia/ckpts/RLinf-ResNet10-pretrained}/`。
+
+**Q: 7b 能否继续用 7a 的 `run_step7_dummy_sac.sh`？**  
+A: 不能。该脚本会切 franky venv 并 `pip install torch==2.5.1+cpu`。7b 用 `run_step7b_dummy_sac_gpu.sh` + CUDA 镜像。
 
 **Q: 能否在宿主机装 franky 方便调试？**  
 A: 不推荐。若必须，用独立 venv 路径且勿与系统 Python 混用；Team 标准仍是 Docker。
@@ -1490,6 +2041,24 @@ A: 那是 ROS 路径 + 固件 < 5.9.0。本机 5.10.0 用 **`switch_env franky-0
 **Q: RLINF_COMM_NET_DEVICES 用 eno1 还是 eno2？**  
 A: **eno2**（管理网/集群通信）。机器人流量走 eno1 内核路由，与 Ray 通信用网卡无关。
 
+**Q: Step 8 相机打不开 / 全零图？**  
+A: 在 **franky** 容器跑（不要 7b GPU 镜像）；关掉 `realsense-viewer`；`RLINF_SKIP_CAMERA=0`；`is_dummy=False`；serial 必须是 8a 实测值，不能用 `0123456789` / `000000000000`。venv 缺 `pyrealsense2` 时 8a 的 realsense 列表为空。看 `CHECK ... FAIL` 与 `RESULT Step8x FAIL`（exit ≠ 0）。
+
+**Q: 怎么从输出判断 Step 8 过没过？**  
+A: 只看 **`RESULT Step8a/8b/8c PASS` 且 exit 0**。失败时向上找第一条 `CHECK <name> FAIL`。也可 `grep STEP8_RESULT=`。一键：`bash b/x/scripts/run_step8_accept.sh`（加 `--with-robot` 才跑 8c）。
+
+**Q: dummy / 7b 容器能测真相机吗？**  
+A: 不能。`is_dummy=True` 不会 `camera.open()`；相机 USB 在控制（franky）容器。Step 8c 必须真机 env + `safe_smoke_hold`。
+
+**Q: Step 9 会飞向 rest pose 或随机拧姿态吗？**  
+A: 不会。原点是当前 TCP；`safe_smoke_hold`；只动 xyz，RPY 锁定；脚本把目标投影进 5 cm 球（env 盒子裁剪不够）。加 `--unsafe-full-reset` 会 `RESULT Step9 FAIL`。
+
+**Q: 怎么判断 Step 9 过没过？**  
+A: 无臂看 **`RESULT Step9math PASS`**（`python b/x/scripts/step9_test_ee_sphere.py --math-only` 或 `run_step9_accept.sh`）。真机看 **`RESULT Step9 PASS` 且 exit 0**，并确认 `b/x/logs/step9_camera/` 有 5 张非空 JPEG。失败时向上找第一条 `CHECK <name> FAIL`。
+
+**Q: Step 8 会改 `rlinf/envs/realworld/franka/franka_env.py` 吗？**  
+A: 不会。关掉 skip 后走上游 `_open_cameras` / `create_camera`。
+
 ---
 
-*文档版本：franka_3 · 2026-08-15 · 5090 实机方案 · 代码在 `b/x/`，文档在 `b/d/frk1/`*
+*文档版本：franka_3 · 2026-08-18 · 5090 实机方案 · 代码在 `b/x/`，文档在 `b/d/frk1/`*

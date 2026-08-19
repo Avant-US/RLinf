@@ -1605,3 +1605,661 @@ bash b/x/scripts/run_step7_dummy_sac.sh
 **当前状态：** Step 0–6 ✅；**Step 7 ⚠️ 部分 PASS（env/rollout/actor 构建 OK；训练 loop 未完成）**。
 
 ---
+
+### LOG-025 | Step 7b | 路径 A 单 GPU 容器 dummy SAC | 进行中
+
+**操作：** 按 `franka_3.md` §7b.3 路径 A 落地执行，边跑边记。目标：`sync_model_to_rollout` + ≥1 epoch + `train/` 指标。
+
+**本机基线（2026-08-17 14:36）：** RTX 5090 D 可用；7a 残留 Ray 不存在；GPU 镜像尚未 pull。
+
+---
+
+#### A0 宿主机清理
+
+**命令：**
+```bash
+nvidia-smi
+docker ps --format '{{.Names}} {{.Image}}'
+docker exec rlinf-franky-5090 ray stop --force 2>/dev/null || true
+ray stop --force 2>/dev/null || true
+ss -lptn | grep 6379 || echo "6379 free"
+docker image inspect rlinf/rlinf:agentic-rlinf0.4-maniskill_libero
+ls -la /home/nvidia/ckpts/RLinf-ResNet10-pretrained/resnet10_pretrained.pt
+```
+
+**结果：**
+| 项 | 值 | 判定 |
+|----|-----|------|
+| GPU | RTX 5090 D, 32607 MiB, Driver 580.173.02, CUDA 13.0 | ✅ |
+| 占用显存 | ~866 MiB（Xorg/gnome/nxnode/firefox/realsense-viewer） | 可接受 |
+| 运行中容器 | postgres/minio/drone-*，**无** rlinf-franky-5090 / rlinf-gpu-5090 | ✅ |
+| 6379 | free | ✅ 无 7a 残留 Ray |
+| GPU 镜像 | **缺失** `agentic-rlinf0.4-maniskill_libero` | 进入 A1 pull |
+| ResNet10 | 21689153 bytes @ `/home/nvidia/ckpts/RLinf-ResNet10-pretrained/` | ✅ |
+
+**文件变更：** 无。
+
+**下一步：** A1 拉取 `rlinf/rlinf:agentic-rlinf0.4-maniskill_libero`。
+
+---
+
+#### A1 拉取 GPU 镜像（进行中）
+
+**命令：** `docker pull rlinf/rlinf:agentic-rlinf0.4-maniskill_libero`
+
+**开始：** 2026-08-17 ~14:37。镜像体积大（embodied CUDA 12.8），拉取/解压中。本机此前无该 tag。
+
+**A1 Error 1：** `docker pull rlinf/rlinf:agentic-rlinf0.4-maniskill_libero` 跑了约 46 分钟仍未完成。多数小 layer `Download complete`，大 layer 长时间无新输出；进程仍在但无明显传输。
+
+**根因分析：** Docker Hub 跨海拉取大体积 CUDA embodied 镜像（十余 GB）易卡住；并非本机磁盘或 daemon 挂死（`docker system df` 正常，registry-1.docker.io HTTP 401 可达）。
+
+**Fix：** 中止官方 pull，改用文档写明的国内镜像 `docker.1ms.run/rlinf/rlinf:agentic-rlinf0.4-maniskill_libero`，成功后再 `docker tag` 为官方名供脚本使用。
+
+**A1 Error 2：** `docker pull docker.1ms.run/rlinf/rlinf:agentic-rlinf0.4-maniskill_libero` 约 17s 失败：
+
+```
+failed to copy: httpReadSeeker: failed open: could not fetch content descriptor
+sha256:2e9d63c046dcf3a89742fde92670f6270db930439943b3affecf6256b8bb735b
+(application/vnd.docker.image.rootfs.diff.tar.gzip) from remote: not found
+```
+
+**根因：** 国内镜像站缺少该 tag 的某一 layer blob（manifest 能解析，blob 404）。多数 layer 已在第一次官方 pull 中缓存（`Already exists`）。
+
+**Fix：** 继续官方 `docker pull rlinf/rlinf:agentic-rlinf0.4-maniskill_libero`（断点续传缓存 layer）。若再卡住，改走本机已有 `nvidia/cuda:13.1.1-cudnn-devel-ubuntu22.04` + `install.sh embodied` 作为 GPU 训练环境（更贴 5090 / CUDA 13）。
+
+
+**A1 结果（用户侧完成，2026-08-18）：** 镜像已拉成功。
+
+```
+docker image inspect rlinf/rlinf:agentic-rlinf0.4-maniskill_libero
+# sha256:9cb1a8514b157b3623fcf943e9ff3b27406005b0fb7b6f61846c126a44f7c809
+# Size ≈ 17.96 GiB
+```
+
+**判定：** A1 ✅。6379 仍空闲；无 rlinf-gpu-5090 容器。进入 A2。
+
+---
+
+#### A2 启动 GPU 容器
+
+**说明：** `docker_run_gpu_5090.sh` 使用 `-it` 交互 bash，自动化改为同等参数的一次性 `docker run --rm`（无 TTY），容器名仍为 `rlinf-gpu-5090`。
+
+**命令（A3 自检，一次性）：**
+```bash
+docker run --rm --gpus all --privileged --network host --shm-size=20g \
+  --name rlinf-gpu-5090 \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e RLINF_RESNET10_PATH=/home/nvidia/ckpts/RLinf-ResNet10-pretrained \
+  -e RLINF_SKIP_CAMERA=1 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf \
+  -v /home/nvidia/ckpts:/home/nvidia/ckpts:ro \
+  -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-maniskill_libero \
+  bash -lc '...'
+```
+
+
+#### A3 容器内自检
+
+**结果：**
+| 项 | 值 | 判定 |
+|----|-----|------|
+| 镜像 CUDA | 12.8.1 | ✅ |
+| `/opt/venv` | openvla, openvla-oft, openpi, gr00t, …（无 franky） | ✅ |
+| python | `/opt/venv/openvla/bin/python` | ✅ 非 franky |
+| 容器 nvidia-smi | RTX 5090 D | ✅ |
+| torch | `2.11.0+cu128`，`cuda.is_available()==True`，device=RTX 5090 D | ✅ |
+| peft/transformers/timm | OK | ✅ |
+| Gym `FrankyFrankaEnv-v1` | 已注册 | ✅ |
+| ResNet10 | OK | ✅ |
+
+**文件变更：** 无。`runtime_bootstrap` 在 GPU 路径下仅作 Gym 注册；FSDP CPU bypass 不应触发。
+
+**判定：** A3 ✅。进入 A4。
+
+---
+
+#### A4 训练（`run_step7b_dummy_sac_gpu.sh`）
+
+**命令：** 同上 GPU `docker run`，入口改为 `bash b/x/scripts/run_step7b_dummy_sac_gpu.sh`。
+
+
+**A4 第一轮（GPU 链路已过，训练未过）：**
+
+| 阶段 | 结果 |
+|------|------|
+| CUDA / torch | ✅ `2.11.0+cu128` RTX 5090 D |
+| Cluster | ✅ `1 node and 1 accelerator`，`accelerator_type='NV_GPU'`（非 NO_ACCEL） |
+| Placement | ✅ `local_accelerator_rank=0`，`visible_accelerators=['0']` |
+| FSDP | ✅ 真实 wrap（`AMP is disabled`），**无** CPU bypass |
+| `sync_model_to_rollout` / `pin_memory` | ✅ **未再出现** LOG-024 的 CUDA 同步错误 |
+| 训练 epoch | ❌ 见 Error 3 |
+
+**A4 Error 3：**
+```
+RuntimeError: Cannot sample from an empty buffer.
+  at rlinf/data/storage/replay/buffer.py:565 sample_chunks
+  called from AsyncEmbodiedSACFSDPPolicy.run_training → update_one_epoch
+```
+
+Env/rollout 随后 `ActorDiedError` 是连锁杀死，不是根因。
+
+**根因：** `algorithm.replay_buffer.min_buffer_size: 0`。async actor 的 `_wait_for_replay_buffer_ready` 用 `size >= min_size`，`0 >= 0` 立即为真，在 rollout 写入任何 trajectory 之前就 `sample()`。官方 dummy `realworld_dummy_franka_sac_cnn.yaml` 为 **`min_buffer_size: 1`**。7a CPU YAML 抄了 e2e 的 `0`，GPU YAML 一并继承。
+
+**Fix：** 改 `b/x/configs/realworld_franky_dummy_sac_gpu.yaml`：`min_buffer_size: 0` → `1`（与官方 dummy 对齐）。**不改**上游 `rlinf/`。
+
+**文件变更：**
+| 操作 | 文件 | 原因 |
+|------|------|------|
+| 修改 | `b/x/configs/realworld_franky_dummy_sac_gpu.yaml` | 等至少 1 条 trajectory 再 sample，避免空 buffer |
+
+**下一步：** 重跑 A4。
+
+
+**A4 第二轮（`min_buffer_size: 1`）：** ✅ PASS
+
+**命令：** 同 A2 GPU `docker run --rm --gpus all ... bash -lc 'bash b/x/scripts/run_step7b_dummy_sac_gpu.sh'`
+
+**日志目录：** `logs/20260818-001209-realworld_franky_dummy_sac_gpu/`
+- `run_embodiment.log`：无 `Traceback` / `pin_memory` / `Cannot sample`
+- TensorBoard：`logs/20260818-001209-realworld_franky_dummy_sac_gpu/tensorboard/events.out.tfevents.*`
+
+**Cluster：** `1 node and 1 accelerator`，python=`/opt/venv/openvla/bin/python`，`accelerator_type=NV_GPU`。
+
+**Metric Table（verbatim 摘要）：**
+
+| Global Step | 关键指标 | 判定 |
+|-------------|----------|------|
+| **1/2** | `sync_model_to_rollout=0.099`；replay `num_trajectories=1` `total_samples=100`；`sac/actor_loss=0.202` `sac/critic_loss=0.017` `sac/alpha=0.0100`；env `episode_len=100` `reward=0.0`（dummy） | 有限、非 NaN |
+| **2/2** | `sync_model_to_rollout=0.033`；`sac/actor_loss=0.180` `sac/critic_loss=0.0038`；Progress 100% | 有限、非 NaN |
+
+**进程退出：** `exit_code: 0`，约 73s。
+
+**臂：** dummy、`is_dummy=True`、未连 `172.16.0.2` → 不动。
+
+---
+
+#### A5 看指标
+
+```bash
+ls logs/20260818-001209-realworld_franky_dummy_sac_gpu/
+# run_embodiment.log  tensorboard/events.out.tfevents...
+```
+
+**判定：** A5 ✅。
+
+---
+
+#### Step 7b 验收对照（7b.4）
+
+| 验收项 | 结果 |
+|--------|------|
+| 宿主机 `nvidia-smi` RTX 5090 D | ✅ |
+| 已 pull `agentic-rlinf0.4-maniskill_libero` | ✅ 用户拉完；sha256:9cb1a851… ≈18GB |
+| 6379 无 7a 残留 Ray | ✅ |
+| 容器内 `torch.cuda.is_available()==True` | ✅ 2.11.0+cu128 |
+| Cluster ≥1 accelerator，非 NO_ACCEL | ✅ `NV_GPU` |
+| `sync_model_to_rollout` 无 pin_memory traceback | ✅ |
+| ≥1 epoch，`train/`/`sac/` 指标有限 | ✅ **2/2 epochs** |
+| 臂不动 | ✅ dummy |
+
+**判定：Step 7b PASS。Step 7 闭环（7a 链路 smoke + 7b 完整 dummy SAC）。**
+
+**本轮文件变更汇总：**
+
+| 操作 | 路径 | 为什么 |
+|------|------|--------|
+| 修改 | `b/x/configs/realworld_franky_dummy_sac_gpu.yaml` | `min_buffer_size` 0→1，对齐官方 dummy，避免空 replay 立刻 sample |
+| 无改 | `rlinf/` 上游 | 扩展包 + 配置隔离 |
+| 无改 | `run_step7b_dummy_sac_gpu.sh` | 入口可用；自动化用不带 `-it` 的同等 `docker run` |
+
+**当前状态：** Step 0–6 ✅；**Step 7a ✅；Step 7b ✅**。
+
+
+---
+
+## 2026-08-18 — Step 8 相机检测与 RLinf 接入
+
+### LOG-026 | Step 8 | 开始 | 宿主机基线 + 计划
+
+**时间：** 2026-08-18 09:45 CST
+
+**操作：** 按 `franka_3.md` Step 8 执行 8a 检测 → 8b YAML 验收 → 8c 真机 env 开相机。边跑边记。验收看 `CHECK`/`RESULT` 与 exit 0。
+
+**命令：**
+```bash
+date
+docker ps -a
+lsusb
+ls -l /dev/video* /dev/v4l/by-id
+ping -c 2 172.16.0.2
+pgrep -a -i realsense
+docker images | grep rlinf
+python3 -c 'import pyrealsense2'
+```
+
+**结果：**
+| 项 | 值 | 判定 |
+|----|-----|------|
+| 时间 | 2026-08-18 09:45:12 CST | — |
+| 机器人 ping `172.16.0.2` | 0% loss, ~0.09 ms, eno1 | ✅ 连通 |
+| `lsusb` | `8086:0b3a Intel(R) RealSense(TM) Depth Camera 435i`（Bus 007 Dev 013） | ✅ USB 可见 |
+| V4L | `/dev/video0`–`video5`；by-id 指向 435i index0–3 | ✅ |
+| realsense-viewer | 无进程 | ✅ 无独占 |
+| 宿主机 `pyrealsense2` | `ModuleNotFoundError` | 预期：8a 必须在 **franky 容器** 跑 |
+| franky 镜像 | `rlinf/rlinf:agentic-rlinf0.4-franka` fd527e5b6295 ~17.9GB | ✅ |
+| 运行中 franky 容器 | 无（`rlinf-franky-5090` 未起） | 需 `docker run --privileged` |
+| GPU 镜像 | `agentic-rlinf0.4-maniskill_libero` 在，**不用于 Step 8** | — |
+
+**文件变更：** 无（仅探测）
+
+**下一步：** `docker run --privileged --network host` 进 franky 镜像，`source setup_before_ray_5090.sh`，跑 `run_step8_accept.sh`（8a+8b）。
+
+
+### LOG-027 | Step 8a | FAIL | 容器无 `lsusb` 导致 FileNotFoundError
+
+**时间：** 2026-08-18 09:45+ CST
+
+**操作：** 无 `-it` 启动官方 franky 镜像，source `setup_before_ray_5090.sh`，跑 `run_step8_accept.sh`（8a+8b）。
+
+**命令：**
+```bash
+docker run --rm --privileged --network host --name rlinf-franky-step8 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-franka \
+  bash -lc 'source b/x/configs/setup_before_ray_5090.sh && bash b/x/scripts/run_step8_accept.sh'
+```
+
+**结果（部分成功、8a 崩溃）：**
+- `switch_env franky-0.19.0` → python=`/opt/venv/franky-0.19.0/bin/python` ✅
+- `pyrealsense2 2.58.3`，serial **`['420122070525']`** ✅ SDK 已看见 D435i
+- 容器内 **`lsusb: command not found`**
+- 8a traceback：`FileNotFoundError: [Errno 2] No such file or directory: 'lsusb'` 在 `_run(["lsusb"])`，未打出 `RESULT`
+
+**根因：** franky 镜像未装 `usbutils`；`subprocess.run(["lsusb"])` 在缺二进制时抛 `FileNotFoundError`，未当软失败。8a 把 `lsusb` 当摸底打印，**不应作为硬依赖**（真正枚举走 `FrankaRobot.enumerate_cameras` / pyrealsense2）。
+
+**Fix：**
+1. `_run()` 捕获 `FileNotFoundError`，返回 `(missing binary) lsusb`
+2. `usb_or_v4l_present` 不把 `(missing …)` 当成 USB 成功（仍可靠 `/dev/video*` / SDK）
+
+**文件变更：**
+| 操作 | 文件 | 原因 |
+|------|------|------|
+| 修改 | `b/x/scripts/step8_detect_cameras.py` | 容器无 lsusb 时不崩溃；USB CHECK 不误报 OK |
+
+**下一步：** 重跑 `run_step8_accept.sh`。
+
+
+### LOG-028 | Step 8a + 8b | **PASS** ✅
+
+**时间：** 2026-08-18 ~09:47 CST
+
+**操作：** 应用 LOG-027 fix 后重跑 `run_step8_accept.sh`（无 `--with-robot`）。
+
+**命令：** 同 LOG-027 的 `docker run ... run_step8_accept.sh`
+
+**8a CHECK：**
+| CHECK | 结果 |
+|-------|------|
+| usb_or_v4l_present | OK（`/dev/video0`–`5`；lsusb 仍 missing，不挡） |
+| rlinf_enumerate_nonempty | OK `realsense=['420122070525']`；lumos 列出 video0–5（V4L 别名，未作主后端） |
+| primary_serials_nonempty | OK |
+| serials_not_placeholder | OK |
+| realsense_sdk_devices | OK n=1 |
+| json_written | OK `b/x/configs/camera_detected.json` |
+| yaml_written | OK |
+| **RESULT Step8a** | **PASS** exit 0 |
+
+**探测到的相机参数：**
+| 项 | 值 |
+|----|-----|
+| 类型 | Intel RealSense **D435I**（`camera_type=realsense`） |
+| serial | **`420122070525`** |
+| firmware | 5.13.0.55 |
+| USB | **2.1**（物理口 `usb7/7-5`；非 USB3，带宽可能偏紧但仍支持 640×480@15 color） |
+| 默认流 | `supports_default_640x480_15: true`（RGB `bgr8`） |
+| 主视角名 | `wrist_1`（8b YAML `camera_names`） |
+
+**8b CHECK：** 全部 OK（JSON/YAML serial 一致、`is_dummy=false`、Gym `FrankyFrankaEnv-v1`、`wrist_1`）。**RESULT Step8b PASS**。
+
+**一键脚本：** `RESULT Step8 accept PASS (8a+8b; skip 8c, …)` exit 0。
+
+**文件变更：**
+| 操作 | 文件 | 原因 |
+|------|------|------|
+| 生成 | `b/x/configs/camera_detected.json` | 8a 输出，供 8b/8c 读 serial |
+| 修改 | `b/x/configs/realworld_franky_camera.yaml` | `--write-yaml` 写入实测 serial；PyYAML dump 会丢掉原注释 |
+
+**下一步：** `--with-robot` 跑 8c（Desk FCI、臂 hold、开相机读帧）。
+
+
+### LOG-029 | Step 8c | 真机 env + 相机 | **PASS** ✅
+
+**时间：** 2026-08-18 09:47–09:49 CST
+
+**操作：**
+1. `run_step8_accept.sh --with-robot`（8a+8b 再 8c 默认 smoke）
+2. 单独再跑 `step8_test_env_camera.py --save-jpeg --require-live`（文档列出的附加验收）
+
+**前置：** Desk FCI 已可用（TCP probe 成功）；未跑 `tune_eno1.sh`（sudo 要密码，未挡 8c）。6379 空闲。
+
+**命令：**
+```bash
+# 1) 全套含 8c
+docker run --rm --privileged --network host --name rlinf-franky-step8 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-franka \
+  bash -lc 'source b/x/configs/setup_before_ray_5090.sh && bash b/x/scripts/run_step8_accept.sh --with-robot'
+
+# 2) JPEG + require-live
+docker run --rm --privileged --network host --name rlinf-franky-step8 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-franka \
+  bash -lc 'source b/x/configs/setup_before_ray_5090.sh
+    export RLINF_SKIP_CAMERA=0 FRANKA_ROBOT_IP=172.16.0.2
+    ray start --head --port=6379 --disable-usage-stats
+    python b/x/scripts/step8_test_env_camera.py --save-jpeg --require-live
+    ray stop --force'
+```
+
+**8c CHECK（两轮均 OK）：**
+| CHECK | 结果 |
+|-------|------|
+| skip_camera_is_0 | OK |
+| serials_not_placeholder | OK `420122070525` |
+| safe_smoke_hold | OK（未 interpolate） |
+| tcp_probe | OK 约 xyz=(0.57, -0.037, 0.53) |
+| env_reset | OK；日志 `safe_smoke_hold: skip __init__ _interpolate_move` |
+| wrist_1_present | OK |
+| frame_wrist_1_uint8_128 | OK `(128,128,3)` uint8 |
+| frame_wrist_1_nonzero | OK mean≈32, max=255（非 stub 零图） |
+| live_frames_changed | OK abs_delta 约 1.8 / 13.6 / 22.3 |
+| jpeg_wrist_1 | 第二轮 OK |
+| **RESULT Step8c** | **PASS** exit 0 |
+| `run_step8_accept.sh --with-robot` | `RESULT Step8 accept PASS (8a+8b+8c)` |
+
+**硬件侧确认：**
+- `FrankyControllerExtended` 连上 `172.16.0.2`
+- `FrankaLibfrankaGripper connected (max_width=0.080m)`
+- 阻抗 tracker 启动；**未发非零动作**（zero-step）
+
+**非阻断告警（未当 FAIL）：**
+- Ray `/dev/shm` 仅 64MB → 用 `/tmp/ray`（可加 `--shm-size`；不影响验收）
+- gymnasium: obs float64 vs space float32、`not within observation space`（Step 5 同类包装告警）
+- `env.close() warning: 'VideoPlayer' object has no attribute 'stop'`：`enable_camera_player=False` 时 player 未完整构造。**未改 `rlinf/`**；close 仍释放相机与 FCI
+
+**文件变更：**
+| 操作 | 文件 | 原因 |
+|------|------|------|
+| 生成 | `b/x/logs/step8_camera/wrist_1_{reset,step1,step2,step3}.jpg` | `--save-jpeg` 存 RGB 帧作人工抽查 |
+
+**判定：Step 8c PASS。臂 hold，相机 live 帧进入 `obs["frames"]["wrist_1"]`。**
+
+---
+
+### LOG-030 | Step 8 | 闭环汇总
+
+**判定：Step 8 全部验收通过（8a 检测 + 8b YAML + 8c 真机交互 + JPEG/live）。**
+
+| 子步 | 入口 | 结果 |
+|------|------|------|
+| 8a | `step8_detect_cameras.py --write-yaml` | PASS serial `420122070525` D435I |
+| 8b | `step8_check_yaml.py` | PASS YAML=JSON |
+| 8c | `step8_test_env_camera.py` | PASS wrist_1 非零 + live |
+| 8c 附加 | `--save-jpeg --require-live` | PASS 4 张 JPEG |
+| 一键 | `run_step8_accept.sh --with-robot` | PASS |
+
+**本轮 error → fix：**
+| Error | 根因 | Fix |
+|-------|------|-----|
+| `FileNotFoundError: lsusb` | franky 镜像无 `usbutils`；`_run` 未捕获缺二进制 | `step8_detect_cameras.py`：`FileNotFoundError` → `(missing binary)`；CHECK 不把 missing 当 USB OK |
+
+**本轮文件变更汇总：**
+| 操作 | 路径 | 为什么 |
+|------|------|--------|
+| 修改 | `b/x/scripts/step8_detect_cameras.py` | 容器无 lsusb 不崩溃 |
+| 生成 | `b/x/configs/camera_detected.json` | 8a 实测参数 |
+| 修改 | `b/x/configs/realworld_franky_camera.yaml` | 写入 serial / `wrist_1` |
+| 生成 | `b/x/logs/step8_camera/*.jpg` | 8c 存帧 |
+| 修改 | `b/d/frk1/franka_3.md` | Step 8 验收状态 → PASS |
+| 无改 | `rlinf/` | 扩展包 + 脚本 |
+
+**当前状态：** Step 0–7 ✅；**Step 8 ✅**。下一步为 **Step 9 EE 5 cm 球随机运动 + 拍照**（不是数据采集；采集已后移为 Step 10）。
+
+---
+
+## 2026-08-18 — Step 9 EE 球运动 + 拍照
+
+### LOG-031 | Step 9 | 开始 | 宿主机基线 + 无臂数学
+
+**时间：** 2026-08-18 10:56 +08
+
+**操作：** 执行 `franka_3.md` Step 9。先记基线，再在 franky 容器跑 `--math-only` / `run_step9_accept.sh`（无 FCI）。真机 `--with-robot` 另记。文档已插入 Step 9；采集/SFT 为 Step 10+。**不改 `rlinf/`。**
+
+**命令：**
+```bash
+date -Iseconds
+uname -r
+ping -c 2 172.16.0.2
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+docker images | grep franka
+
+docker run --rm --privileged --network host --name rlinf-franky-step9math \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-franka \
+  bash -lc 'source b/x/configs/setup_before_ray_5090.sh && bash b/x/scripts/run_step9_accept.sh'
+```
+
+**结果：**
+| 项 | 值 | 判定 |
+|----|-----|------|
+| 内核 | `5.15.0-1032-realtime` | ✅ |
+| ping `172.16.0.2` | 0% loss, ~0.1 ms | ✅ 机器人网可达 |
+| 冲突 franky 容器 | 无（仅 postgres/minio/drone） | ✅ 可占 libfranka |
+| 镜像 | `rlinf/rlinf:agentic-rlinf0.4-franka` `fd527e5b6295` | ✅ 同 Step 8 |
+| `CHECK math_sample_in_ball` | OK max=0.0500 mean=0.0377 | ✅ 均匀球 |
+| `math_project_to_ball` | OK | ✅ |
+| `math_clipped_delta` | OK 首步 5 mm、边界不穿出 | ✅ |
+| `math_rpy_wrap` | OK | ✅ |
+| `math_photo_slots` | 5 个文件名 | ✅ |
+| **RESULT Step9math** | **PASS** | ✅ |
+| `run_step9_accept.sh` | `RESULT Step9 accept PASS (math-only)` exit 0 | ✅ |
+
+**文件变更：** 无（脚本此前已落地）。
+
+**下一步：** Desk FCI 下 `run_step9_accept.sh --with-robot`。工作区需当前 EE 周围 ≥5 cm 无障碍；臂会动。
+
+---
+
+### LOG-032 | Step 9 真机 | FAIL | `tcp_pose` 当四元数解析
+
+**时间：** 2026-08-18 10:57 +08
+
+**操作：** franky 容器跑 `run_step9_accept.sh --with-robot`。数学段先 PASS；随后连 FCI、`safe_smoke_hold`、相机帧 OK；在第一帧记录 TCP 时崩溃。臂未进入 10 s 球运动（reset 后 hold）。
+
+**命令：**
+```bash
+docker run --rm --privileged --network host --name rlinf-franky-step9 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-franka \
+  bash -lc 'source b/x/configs/setup_before_ray_5090.sh && bash b/x/scripts/run_step9_accept.sh --with-robot'
+```
+
+**结果（到失败为止）：**
+| CHECK | 结果 |
+|-------|------|
+| Step9math | PASS |
+| skip_camera_is_0 / safe_smoke_hold / json / serials | OK `420122070525` |
+| tcp_probe | OK xyz≈(0.567, -0.037, 0.519) |
+| env_reset / wrist_1 / uint8_128 | OK |
+| **uncaught** | **FAIL** `ValueError: Expected quat to have shape (..., 4), got (3,)` |
+| **RESULT Step9** | **FAIL** |
+| 验收脚本末行 | 误报 `RESULT Step9 accept PASS (math+robot)` EXIT:0（见下） |
+
+**根因：**
+1. `apply_single_arm_wrappers` **总是**套 `Quat2EulerWrapper`，`obs["state"]["tcp_pose"]` 为 **6D xyz+euler**。Step 5 已按 `tcp[:3]` / `tcp[3:6]` 用。Step 9 脚本把 `[3:7]` 当四元数送给 `Rotation.from_quat`。
+2. 验收脚本只看 python `$?`。本轮 python 打印了 `RESULT Step9 FAIL` 但进程退出码仍为 0（Ray/atexit 可能冲掉码），于是外壳误报 PASS。
+
+**Fix（已改代码，真机尚未复测）：**
+| 文件 | 改动 | 为什么 |
+|------|------|--------|
+| `b/x/scripts/step9_test_ee_sphere.py` | `_tcp_quat` → `_tcp_rpy`：6D 用 euler，7D 才从 quat 转 | 对齐 wrapper 后的观测 |
+| `b/x/scripts/run_step9_accept.sh` | `tee` 到 `b/x/logs/step9_robot.out`；`grep RESULT Step9 FAIL` 或无 `PASS` 则外壳 FAIL；打印 `PYTHON_RC=` | 不以误导性 exit 0 当过 |
+
+**非阻断：** `/dev/shm` 64MB → `/tmp/ray`；`env.close()` VideoPlayer 无 `stop`（同 Step 8c）。未改 `rlinf/`。
+
+**判定：Step 9 真机未过。** 无 JPEG。FCI 已释放（容器 `--rm` + `ray stop`）。
+
+---
+
+### LOG-033 | Step 9 | 用户暂停
+
+**时间：** 2026-08-18 11:00 +08
+
+**操作：** 用户要求先暂停。不跑第二轮 `--with-robot`，不把 Step 9 标 PASS。
+
+**已完成：** 9math ✅；真机第一轮 FAIL 已修脚本。
+
+**恢复时：** Desk FCI、EE 周围 5 cm 无障碍、急停在旁后执行 LOG-032 同一 `docker run ... --with-robot`。成功条件：`RESULT Step9 PASS`、`PYTHON_RC=0`、`b/x/logs/step9_camera/` 五张非空 JPEG。
+
+---
+
+### LOG-034 | Step 9 | 恢复真机复测（quat/euler fix 后）
+
+**时间：** 2026-08-18 11:09 +08
+
+**操作：** 用户要求恢复 Step 9。确认 `_tcp_rpy` 与验收 `grep RESULT Step9 FAIL` 已在仓库；`ping 172.16.0.2` OK，无占用 FCI 的 franky 容器。复跑 `--with-robot`。
+
+**命令：**
+```bash
+date -Iseconds
+ping -c 2 172.16.0.2
+docker ps --format '{{.Names}}' | grep -iE 'franky|franka' || true
+
+docker run --rm --privileged --network host --name rlinf-franky-step9 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-franka \
+  bash -lc 'source b/x/configs/setup_before_ray_5090.sh && bash b/x/scripts/run_step9_accept.sh --with-robot'
+```
+
+**结果：** 运动与拍照成功，**回原点 FAIL**。验收脚本正确报 FAIL（`grep RESULT Step9 FAIL`，尽管 `PYTHON_RC=0`）。
+
+| CHECK | 结果 |
+|-------|------|
+| 9math | PASS |
+| tcp_probe / env_reset / wrist_1 | OK；obs `tcp_pose dim=6`（euler fix 生效） |
+| motion_duration_s | OK 11.68 s，100/100 步 |
+| tcp_inside_sphere | OK max_r=**55.1 mm** ≤ 58 mm |
+| orientation_locked | OK max_rpyΔ=0.092 rad |
+| photos_count_5 | OK 五张 JPEG 已写入 `b/x/logs/step9_camera/` |
+| frame_wrist_1_nonzero | OK |
+| **return_to_origin** | **FAIL** 结束仍 r=55.1 mm（40 步几乎没往回走） |
+| **RESULT Step9** | **FAIL** |
+| 外壳 | `RESULT Step9 accept FAIL (python_rc=0)` EXIT:1 ✅ 不再误报 PASS |
+
+**根因：** `ee_pose_limit` 盒子为 origin **±50 mm**。阻抗把实测 TCP 送到球外 ~55 mm（仍 ≤58 mm 验收带）。此后 `step()` 把目标 **clip 到盒面 ~50 mm**，再发「往原点 5 mm」也只是反复命令盒面，臂停在 ~55 mm。`clipped_delta` 在球外还会一次投影出 >5 mm 的弦（末步 `|cmd|=5.77 mm`）。
+
+**Fix（随后 LOG-035 复测）：**
+| 文件 | 改动 | 为什么 |
+|------|------|--------|
+| `step9_test_ee_sphere.py` | `--safety-margin` 默认 **0.08 m** | 盒子包住球+过冲，回程指令能进内部 |
+| 同上 | `clipped_delta` 先 cap 再投影，禁止一步弹回球面 | 避免 |Δ|>5 mm 和弦跳跃 |
+| 同上 | `RETURN_MAX_STEPS=120` + 每 10 步打印 | 阻抗滞后仍能走完 ~55 mm |
+
+**复测命令：** 同 LOG-034 的 `docker run ... --with-robot`。
+
+**结果：** 盒子已加宽（max_r=50.5 mm，不再顶 58 mm 带），运动+5 张照片仍 OK；**回程 120 步 r 卡在 50.2 mm**（`|cmd|=5.00 mm` 不变）。
+
+**根因补充：** 5 mm 回程目标相对 `CartesianImpedanceTracker.translational_error_clip=0.05 m`（`RLINF_CART_ERR_CLIP_M`）过小，阻抗在球面上几乎不往原点走。10 s 游走的 5 mm 步进仍保留。
+
+**Fix：** `_return_home` 改为每步最多 **5 cm** 朝向探测原点（不再走球面 `clipped_delta`）。`RETURN_MAX_STEPS=80`。
+
+---
+
+### LOG-036 | Step 9 | 回程 5 cm 步长后复测
+
+**时间：** 2026-08-18 11:19 +08
+
+**操作：** 代码已改为回程每步最多 5 cm（不再走球面 `clipped_delta`）。先 `--math-only`，再同一 `docker run ... --with-robot`。
+
+**命令：**
+```bash
+python3 b/x/scripts/step9_test_ee_sphere.py --math-only
+docker run --rm --privileged --network host --name rlinf-franky-step9 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-franka \
+  bash -lc 'source b/x/configs/setup_before_ray_5090.sh && bash b/x/scripts/run_step9_accept.sh --with-robot; echo EXIT:$?'
+```
+
+**结果：** 9math PASS。真机运动+5 张照片 OK，**回原点仍 FAIL**。验收外壳 `EXIT:1`。
+
+| CHECK | 结果 |
+|-------|------|
+| 9math | PASS |
+| tcp_probe | OK origin `[0.5300, -0.0167, 0.4224]`；reset 后 `radius_now=0.00 mm`（probe 与 gym obs 一致） |
+| motion_duration_s | OK 11.79 s，100/100 |
+| tcp_inside_sphere | OK max_r=**50.3 mm** ≤ 58 mm |
+| orientation_locked | OK max_rpyΔ=0.074 rad |
+| photos_count_5 / nonzero | OK，`b/x/logs/step9_camera/` 五张 JPEG |
+| **return_to_origin** | **FAIL** 第一步 45.5→10.6 mm（`|cmd|=50 mm`），之后 80 步卡在 **r=10.2 mm**（容差 8 mm） |
+| **RESULT Step9** | **FAIL**（`PYTHON_RC=0`，靠 grep FAIL） |
+
+**根因：** Cartesian impedance `K_t=500 N/m` 约有 **10 mm 稳态误差**（约 5 N 残差力：`e=F/K`）。`franka_env.step` 每步用**实测 TCP** 加 delta 作为下一目标，因此回程第 2 步起 `delta=remaining` 把 setpoint **钉回原点**，阻抗相对原点的 ~10 mm 下垂永远收不进 8 mm。禁止对回程发 **zero action**：那会把目标设成当前实测位，过冲 setpoint 被清掉。未改 `rlinf/`。
+
+**Fix（随后 LOG-037 复测）：**
+| 文件 | 改动 | 为什么 |
+|------|------|--------|
+| `b/x/scripts/step9_test_ee_sphere.py` | 回程 `delta = 2 × remaining`（过原点镜像），`|Δ|≤5 cm` | 把 setpoint 设到 `origin - sag`，实测落到原点 |
+| 同上 | `step` 后 `sleep 0.4 s` + `get_tcp_pose` 刷新，**不**发零动作 | 让 tracker 保持过冲目标 |
+| 同上 | 每步打印 `dxyz`；`RETURN_MAX_STEPS=20` | 看残差轴；一步 round-trip 足够 |
+
+**判定：Step 9 真机未过。** 照片已有。FCI 已释放。
+
+---
+
+### LOG-037 | Step 9 | 回程 2× 过冲 + settle 后复测
+
+**时间：** 2026-08-18 11:24 +08
+
+**操作：** 回程改为 `delta = 2 × remaining`（过原点镜像）、`step` 后 sleep 0.4 s、用 `get_tcp_pose` 刷新且不发零动作。先 `--math-only`，再 `--with-robot`。
+
+**命令：**
+```bash
+python3 b/x/scripts/step9_test_ee_sphere.py --math-only
+docker run --rm --privileged --network host --name rlinf-franky-step9 \
+  -v /home/nvidia/bt/s/RLinf:/workspace/RLinf -w /workspace/RLinf \
+  rlinf/rlinf:agentic-rlinf0.4-franka \
+  bash -lc 'source b/x/configs/setup_before_ray_5090.sh && bash b/x/scripts/run_step9_accept.sh --with-robot; echo EXIT:$?'
+```
+
+**关键路径：** `b/x/scripts/step9_test_ee_sphere.py` `_return_home` / `_refresh_tcp`；验收 `b/x/scripts/run_step9_accept.sh --with-robot`；照片 `b/x/logs/step9_camera/`。未改 `rlinf/`。
+
+**结果：** **`RESULT Step9 PASS`**，外壳 **`RESULT Step9 accept PASS (math+robot)` EXIT:0**。
+
+| CHECK | 结果 |
+|-------|------|
+| 9math | PASS |
+| tcp_probe / env_reset / wrist_1 | OK；新原点 `[0.5215, -0.0142, 0.4170]`（上轮回程停在旧原点外 ~10 mm） |
+| motion_duration_s | OK 11.72 s，100/100 |
+| tcp_inside_sphere | OK max_r=**51.8 mm** ≤ 58 mm |
+| orientation_locked | OK max_rpyΔ=0.078 rad |
+| photos_count_5 / nonzero | OK；五张 JPEG 7530–9350 bytes |
+| **return_to_origin** | **OK** 第 1 步 r=14.6 mm（`|cmd|=50 mm`，dxyz=[12.0,-3.8,7.4]）；第 2 步 **r=4.1 mm**（`|cmd|=29.21 mm`）≤ 8 mm |
+| **RESULT Step9** | **PASS** |
+| 外壳 | PASS EXIT:0 |
+
+**照片：**
+- `b/x/logs/step9_camera/wrist_1_t00s.jpg` (7530)
+- `wrist_1_t02s.jpg` (9294)
+- `wrist_1_t05s.jpg` (9298)
+- `wrist_1_t07s.jpg` (9281)
+- `wrist_1_t10s.jpg` (9350)
+
+**本轮为何过：** 2× remaining 把 Cartesian setpoint 设到原点镜像侧，阻抗 ~10 mm 下垂后实测落到 4.1 mm；settle 期间不发零动作，过冲目标得以保持。
+
+**文档：** `franka_3.md` Step×文件表、Step 9 验收状态、§12.1/12.2、M5 标 ✅ PASS（LOG-031–037）。盒子说明改为默认 ±0.08 m。
+
+**判定：Step 9 真机通过。** FCI 已释放（容器 `--rm`）。下一步为方案中的 Step 10（采集），本任务不自动开跑。
+
+
+

@@ -10,6 +10,8 @@ from rlinf.envs.realworld.franka import franky_controller as fc
 from rlinf.envs.realworld.franka.franky_controller import FrankyController
 from rlinf.scheduler import Cluster, NodePlacementStrategy
 
+from franky_ext.tcp_probe import describe_robot_mode, require_motion_ready
+
 
 class FrankyControllerExtended(FrankyController):
     """Adds move_arm, compliance reconfig, move_gripper, Franka Hand gripper."""
@@ -57,6 +59,61 @@ class FrankyControllerExtended(FrankyController):
     def move_arm(self, position: np.ndarray) -> None:
         self.move_tcp_pose(np.asarray(position, dtype=np.float64))
 
+    def move_tcp_pose(self, pose: np.ndarray) -> None:
+        """``super`` + fail loudly when the impedance control thread is gone.
+
+        franky 0.19 ``CartesianImpedanceTracker.__init__`` starts
+        ``robot.move(motion, asynchronous=True)``. If that thread dies it stores
+        the exception and returns; ``set_target`` then writes to a dead
+        reference handle, so the arm silently stops following (``dz=0.0000``
+        across a whole interpolate). ``stop()`` -> ``join_motion()`` re-raises
+        the real cause, so surface it here instead of moving on.
+        """
+        super().move_tcp_pose(pose)
+        if self._cart_tracker is None or self._cart_tracker.is_running:
+            return
+        cause = "unknown (join_motion did not raise)"
+        try:
+            self._cart_tracker.stop()
+        except Exception as exc:
+            cause = f"{type(exc).__name__}: {exc}"
+        mode = str(self._robot.state.robot_mode)
+        self._cart_tracker = None
+        self._prev_cart_target_xyz = None
+        self._prev_cart_target_quat = None
+        self._logger.error(
+            "cartesian impedance control thread died (mode=%s has_errors=%s tcp=%s): %s",
+            mode,
+            self._robot.has_errors,
+            np.round(
+                np.asarray(self._robot.state.O_T_EE.translation, dtype=np.float64), 4
+            ).tolist(),
+            cause,
+        )
+        raise RuntimeError(
+            f"cartesian impedance tracking stopped: {cause}; "
+            f"{describe_robot_mode(mode)}"
+        )
+
+    def close_gripper(self) -> None:
+        """Gentle grasp (force/speed capped in FrankaLibfrankaGripper)."""
+        self._gripper.close(speed=0.05)
+
+    def close_gripper_force(self, force: float) -> None:
+        self._gripper.close(speed=0.05, force=float(force))
+
+    def stop_gripper(self) -> None:
+        stop = getattr(self._gripper, "stop", None)
+        if callable(stop):
+            stop()
+            return
+        inner = getattr(self._gripper, "_gripper", None)
+        inner_stop = getattr(inner, "stop", None) if inner is not None else None
+        if callable(inner_stop):
+            inner_stop()
+            return
+        raise RuntimeError("gripper has no stop()")
+
     def move_gripper(self, position: int, speed: float = 0.3) -> None:
         assert 0 <= position <= 255
         self._gripper.move(position=float(position), speed=speed)
@@ -77,6 +134,12 @@ class FrankyControllerExtended(FrankyController):
         self._compliance_trans_k = trans_k
         self._compliance_rot_k = rot_k
         self._compliance_tc = tc
+        # translational_clip_* / rotational_clip_* are ROS
+        # cartesian_impedance_controller keys and are not franky's
+        # translational_error_clip; keep franky's own default authority.
+        # Rebuild the tracker with the new gains. ROS dynamic_reconfigure keeps
+        # impedance.launch running; franky has to recreate, and PegInsertionEnv
+        # then seeds ``_move_action(current)`` so it restarts at the live pose.
         self._stop_cart_tracking_motion()
 
     def _ensure_cart_tracking_motion(self) -> None:
@@ -85,6 +148,10 @@ class FrankyControllerExtended(FrankyController):
         self._stop_tracking_motion()
         self._safe_join()
         self._robot.recover_from_errors()
+        # A tracker started outside RobotMode.Idle dies within one control
+        # cycle; set_target then writes to a dead handle and the arm silently
+        # holds still. Say why up front instead.
+        require_motion_ready(str(self._robot.state.robot_mode))
         nullspace_target = np.asarray(self._robot.state.q, dtype=np.float64).copy()
         trans_clip = np.full(3, fc._CART_TRANS_ERROR_CLIP_M, dtype=np.float64)
         rot_clip = np.full(3, fc._CART_ROT_ERROR_CLIP_RAD, dtype=np.float64)
@@ -100,10 +167,13 @@ class FrankyControllerExtended(FrankyController):
             gains_time_constant=self._compliance_tc,
         )
         self._logger.info(
-            "Cartesian impedance tracker started (K_t=%.0f K_r=%.1f tc=%.3f)",
+            "Cartesian impedance tracker started (K_t=%.0f K_r=%.1f tc=%.3f "
+            "clip=%s is_running=%s)",
             self._compliance_trans_k,
             self._compliance_rot_k,
             self._compliance_tc,
+            np.round(trans_clip, 4).tolist(),
+            self._cart_tracker.is_running,
         )
 
     def command_end_effector(self, action: np.ndarray) -> bool:

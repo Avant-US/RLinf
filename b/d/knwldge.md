@@ -565,6 +565,251 @@ bash examples/embodiment/run_realworld_async.sh realworld_pnp_dagger_openpi
 
 ---
 
+# 5. 笛卡尔阻抗控制模式（相对关节阻抗 / 关节运动）
+
+### 文档与代码语境
+
+`b/d/frk1/franka_3.md` Step 3 验收写「臂（关节 home、**单关节 nudge**、笛卡尔阻抗）」；底层实现在 `rlinf/envs/realworld/franka/franky_controller.py` 与扩展包 `b/x/franky_ext/controller_extended.py`。
+
+franky 栈里**不是**「阻抗 vs 完全不阻抗」，而是至少三条控制路径：
+
+| 模式 | 底层 | 入口 API | 控制量 |
+|------|------|----------|--------|
+| **关节阻抗** | `JointImpedanceTracker` | `move_joints(q)` | 7 个关节角目标 |
+| **笛卡尔阻抗** | `CartesianImpedanceTracker` | `move_tcp_pose` / `move_arm` | TCP 位姿 `[x, y, z, quat]` |
+| **关节位置运动**（一次性） | `JointMotion` | `reset_joint(home)` | 绝对关节角，走完后结束 |
+
+切换逻辑：
+
+- 调 `move_joints` → 先停掉笛卡尔 tracker，启动 **关节阻抗** tracker
+- 调 `move_tcp_pose` / `move_arm` → 先停掉关节 tracker，启动 **笛卡尔阻抗** tracker
+- 调 `reset_joint` → **两种 tracker 都停掉**，用 `JointMotion` 做一次到位运动
+
+同一时刻 franky 栈里**只跑一种 tracker**，避免两套控制打架。
+
+文档里的「笛卡尔阻抗」主要指 `CartesianImpedanceTracker` 这一路；Step 3 的「关节 nudge」走的是 `JointImpedanceTracker`（或 home 时的 `JointMotion`），**不是**笛卡尔阻抗。
+
+---
+
+### 5.1 Step 3 里两个术语分别指什么
+
+#### 关节 nudge（单关节微动）
+
+在**关节空间**里，给某一个关节加一个很小的角度增量，验证 Controller 能否正确下发 `move_joints`。
+
+`b/x/scripts/step3_test_controller.py`：读当前 7 个关节角，只改 **J1**：`target[0] += 0.05`（约 **+0.05 rad ≈ 2.9°**），再 `ctrl.move_joints(target)`。
+
+交互版 `toolkits/realworld_check/test_franky_controller.py` 对应命令：`nudge <关节编号 1..7> <增量 rad>`，例如 `nudge 2 0.05`。
+
+| | Step 3 关节 nudge | Step 5 micro-nudge |
+|--|-------------------|---------------------|
+| 控制空间 | **关节角**（可指定单个关节） | **TCP 笛卡尔**（末端位姿增量） |
+| 典型幅度 | J1 +0.05 rad | Δx ≈ 5 mm |
+| 关节行为 | 主要动一个关节 | 7 关节**协同**实现末端微动 |
+
+Step 5 **不能替代** Step 3 的关节 nudge：Step 5 测的是 env 的 TCP action，测不到「单关节 `move_joints` 是否正常」。
+
+#### 笛卡尔阻抗（Cartesian impedance / compliance）
+
+把机械臂切到**笛卡尔阻抗控制模式**——末端（TCP）在 x/y/z 和姿态方向上有「弹簧-阻尼」般的柔顺性，而不是硬位置跟踪。RL 里 `env.step` 发的是 TCP 位姿/增量，`FrankaEnv` 的 `move_arm` 依赖的就是这种模式。
+
+Step 3 调用 `reconfigure_compliance_params`，设置平移/旋转刚度，底层启动 franky 的 `CartesianImpedanceTracker`：
+
+```python
+ctrl.reconfigure_compliance_params(
+    {"translational_stiffness": 2000.0, "rotational_stiffness": 150.0}
+)
+```
+
+对应文档里的 `impedance 2000 150`。`FrankaEnv.reset()` 会调 `reconfigure_compliance_params`；之后 `move_arm` → `move_tcp_pose` 要在笛卡尔阻抗模式下工作。Step 3 验证的是：扩展 Controller 能把 ROS 侧的 compliance 参数接到 franky，且不会 `AttributeError`。
+
+**和关节 nudge 的关系：**
+
+- **关节 nudge** → 关节空间跟踪（`move_joints` / `JointImpedanceTracker`）
+- **笛卡尔阻抗** → 末端空间柔顺控制（`move_arm` / `CartesianImpedanceTracker`）
+
+Step 3 要两种都过，因为 env 训练链里两种 API 都会用到。
+
+| 术语 | 测什么 | Step 3 里对应动作 |
+|------|--------|-------------------|
+| **关节 home** | 能否回到标准 home 姿态 | `reset_joint(HOME_JOINTS)` |
+| **单关节 nudge** | 关节空间小步运动是否正常 | J1 +0.05 rad，`move_joints` |
+| **笛卡尔阻抗** | compliance / 阻抗模式能否配置 | `reconfigure_compliance_params(2000, 150)` |
+
+三者都在 **Ray Worker 上的 `FrankyControllerExtended`** 里测，**不经过 Gym env**；Step 5 只测 env 全链路，且 5c 只是 TCP 毫米级微动，覆盖不了上面这三项。
+
+---
+
+### 5.2 原理：共同点与空间差异
+
+#### 共同点：都是「阻抗 / 柔顺」思想
+
+阻抗控制的直觉是：**末端（或关节）像连在一根弹簧 + 阻尼器上**。
+
+- 离目标越远 → 控制器产生越大的力/力矩去拉回
+- 外力推过来 → 允许一定位移，力与位移大致成正比（刚度 K）
+- K 越大 → 越「硬」，越像 rigid position control
+- K 越小 → 越「软」，越容易被人/环境推开（适合接触、插孔）
+
+这和纯位置控制（无限大刚度、误差必须为 0）不同；Franka 的 impedance 是**有限刚度**，兼顾跟踪和接触安全。
+
+#### 关节空间 vs 笛卡尔空间
+
+```
+关节阻抗 (move_joints)
+  你指定：q1…q7 各多少 rad
+  控制器：在关节空间里用 7 组刚度/阻尼跟踪
+  末端轨迹：由正运动学决定，一般不是直线
+
+笛卡尔阻抗 (move_arm / move_tcp_pose)
+  你指定：TCP 在基座坐标系下 x,y,z + 姿态
+  控制器：在笛卡尔空间里用平移/旋转刚度跟踪
+  关节怎么动：由逆解 + 冗余度（nullspace）算出来
+  末端轨迹：更符合「手在空间某方向移动/保持姿态」的直觉
+```
+
+**RL 真机 env 为什么用笛卡尔阻抗：**  
+`FrankaEnv.step` 的 action 是 **TCP 增量**（Δx, Δy, Δz, Δr, Δp, Δy, gripper），每次调用的是 `move_arm` → 必须在 **笛卡尔空间** 跟踪目标，而不是直接给 7 个关节角。
+
+```python
+# rlinf/envs/realworld/franka/franka_env.py
+def _move_action(self, position: np.ndarray):
+    self._controller.move_arm(position.astype(np.float32)).wait()
+```
+
+`reset()` 时还会先配 compliance，再 `go_to_rest`：
+
+```python
+self._controller.reconfigure_compliance_params(
+    self.config.compliance_param
+).wait()
+```
+
+---
+
+### 5.3 使用场景
+
+| 场景 | 更合适的方式 | 原因 |
+|------|--------------|------|
+| 回 home、大范围关节复位 | `reset_joint`（`JointMotion`） | 一次性轨迹，不依赖持续 tracker |
+| Step 3 测单关节小动 | `move_joints`（关节阻抗） | 直接验「关节指令链」 |
+| 日常 RL / 遥操作 step | `move_arm`（笛卡尔阻抗） | action 本来就是 TCP 空间 |
+| 插孔、贴面、轻触 | 笛卡尔阻抗 + **较低**平移刚度 | 允许沿接触方向柔顺，减少顶死、过力 |
+| 需要精确走直线/固定姿态 | 笛卡尔阻抗 + **较高**刚度 | 跟踪紧，但接触时力也大 |
+
+Step 3 里 `reconfigure_compliance_params(2000, 150)` 是在验：**env reset 时要用的那套笛卡尔刚度参数，扩展 Controller 能正确设进去**，而不是为了配合后面的关节 nudge（关节 nudge 走 `move_joints`，会切到关节 tracker）。
+
+---
+
+### 5.4 程序操控
+
+#### 你发什么指令
+
+```python
+# 关节空间 — Step 3 nudge
+ctrl.move_joints(target_q)          # shape (7,)
+
+# 笛卡尔空间 — env / RL
+ctrl.move_arm(tcp_pose)             # shape (7,) [x,y,z, quat_xyzw]
+# FrankyControllerExtended 内部 → move_tcp_pose
+
+# 配刚度 — env reset 前
+ctrl.reconfigure_compliance_params({
+    "translational_stiffness": 2000.0,
+    "rotational_stiffness": 150.0,
+})
+```
+
+#### 内部会发生什么
+
+1. **`move_joints`**
+   - `_stop_cart_tracking_motion()`
+   - 创建 `JointImpedanceTracker`（每关节一组 `stiffness` / `damping`）
+   - `set_target(q, dq=...)`
+
+2. **`move_arm` / `move_tcp_pose`**
+   - `_stop_tracking_motion()`（停关节 tracker）
+   - 创建 `CartesianImpedanceTracker`（用 `translational_stiffness` / `rotational_stiffness`）
+   - `set_target(Affine(T))`
+
+3. **`reconfigure_compliance_params`**（扩展类）
+   - 更新 `_compliance_trans_k` / `_compliance_rot_k`
+   - `_stop_cart_tracking_motion()` — 下次 `move_arm` 会用新刚度重建笛卡尔 tracker
+
+4. **`reset_joint`**
+   - 两个 tracker 都停
+   - 单次 `JointMotion`，不属于持续阻抗跟踪
+
+---
+
+### 5.5 「平移刚度」和「旋转刚度」
+
+这两个参数只作用于 **笛卡尔阻抗模式**（`CartesianImpedanceTracker`）。默认值在 `franky_controller.py`：
+
+```python
+_CART_TRANS_STIFFNESS = float(os.environ.get("RLINF_CART_K_T", 500.0))  # N/m
+_CART_ROT_STIFFNESS = float(os.environ.get("RLINF_CART_K_R", 40.0))      # Nm/rad
+```
+
+#### 平移刚度 `translational_stiffness`（N/m）
+
+TCP 在 x / y / z 方向偏离目标位置时，控制器沿该方向产生的恢复力，大致 **F ≈ K_t × 位置误差(m)**。
+
+- K_t = 500 N/m：偏 1 cm → 约 5 N 恢复力
+- K_t = 2000 N/m：偏 1 cm → 约 20 N，**更硬**，更贴目标，但顶到障碍物时力更大
+
+管的是末端**在空间平移**上有多「硬」，不管关节角单独怎么变。
+
+#### 旋转刚度 `rotational_stiffness`（N·m/rad）
+
+TCP 姿态（roll/pitch/yaw）偏离目标时，产生的恢复力矩，大致 **τ ≈ K_r × 角度误差(rad)**。
+
+- K_r 大 → 姿态锁得紧，不容易被拧歪
+- K_r 小 → 手腕方向更「软」，适合需要顺应接触姿态的任务
+
+管的是末端**朝向**有多硬，和平移刚度是分开的两组参数。
+
+#### 和「关节刚度」的对比
+
+关节阻抗用的是 **7 个关节各自的刚度**（`_JOINT_STIFFNESS`，单位 N·m/rad，按关节）：
+
+```python
+_JOINT_STIFFNESS = [103.75, 265.734, 227.273, 221.445, 13.5, 12.818, 5.134]
+```
+
+| | 关节阻抗 | 笛卡尔阻抗 |
+|--|----------|------------|
+| 刚度定义在 | 每个关节 q1…q7 | TCP 的 x,y,z + 姿态 |
+| 参数个数 | 7 个关节 K（+ 阻尼） | 平移 1 个 K_t + 旋转 1 个 K_r（+ nullspace 等） |
+| 你关心的量 | 「第 3 关节多转 0.05 rad」 | 「手尖往前 5 mm、姿态不变」 |
+
+Step 3 文档里的 `impedance 2000 150` 指的是 **笛卡尔** 的平移/旋转刚度。交互脚本里 ROS 风格的 `impedance <k1…k7>` 是另一套（7 关节）；本方案 Step 3 自动化脚本用的是 **translational / rotational** 这一对。
+
+---
+
+### 5.6 Step 3 串起来看在测什么
+
+```
+reset_joint(HOME)     → JointMotion，大复位，不是阻抗 tracker
+open/close/grip       → 夹爪，与臂控制模式无关
+reconfigure(2000,150) → 为后续 env 准备笛卡尔刚度（停掉旧 cart tracker）
+move_joints(J1+0.05)  → 切到关节阻抗，验关节链
+```
+
+- **关节 nudge**：验 **关节空间 + JointImpedanceTracker**
+- **笛卡尔阻抗配置**：验 **TCP 空间 + CartesianImpedanceTracker 的参数能设、能用于 env 的 `move_arm`**
+
+Step 5 的 `micro-nudge` 只在 **env 已处于笛卡尔控制链** 上发 TCP 增量，不会替 Step 3 测关节 `move_joints`，也不会单独验 `reconfigure_compliance_params`。
+
+#### 调参时怎么记
+
+- **任务要稳、跟踪紧、不太接触** → 提高平移/旋转刚度（如 2000 / 150）
+- **任务要插孔、贴面、怕顶死** → 降低平移刚度（尤其接触方向），旋转刚度视是否要保持工具朝向而定
+- **只动一个关节做诊断** → 用 `move_joints`，看关节链
+- **和 RL action 一致** → 必须用 `move_arm` + 合适的笛卡尔刚度
+
+---
+
 # 关键源码与文档索引
 
 | 主题 | 路径 |
@@ -581,6 +826,10 @@ bash examples/embodiment/run_realworld_async.sh realworld_pnp_dagger_openpi
 | 目标位姿测试脚本 | `toolkits/realworld_check/test_franka_controller.py` |
 | Peg-insertion 环境 | `rlinf/envs/realworld/franka/tasks/peg_insertion_env.py` |
 | Franka 环境 / 奖励 | `rlinf/envs/realworld/franka/franka_env.py` |
+| Franky 关节/笛卡尔阻抗 tracker | `rlinf/envs/realworld/franka/franky_controller.py` |
+| 扩展 Controller（compliance / move_arm） | `b/x/franky_ext/controller_extended.py` |
+| Step 3 Controller smoke | `b/x/scripts/step3_test_controller.py` |
+| 交互 Controller smoke | `toolkits/realworld_check/test_franky_controller.py` |
 | OpenPI SFT 配置 | `examples/sft/config/realworld_sft_openpi.yaml` |
 | HG-DAgger 训练配置 | `examples/embodiment/config/realworld_pnp_dagger_openpi.yaml` |
 

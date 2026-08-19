@@ -1,0 +1,30 @@
+cluster:
+  num_nodes: 1
+  node_groups:
+  - label: franka
+    node_ranks:
+    - 0
+    hardware:
+      type: Franka
+      configs:
+      - robot_ip: 172.16.0.2
+        node_rank: 0
+        camera_type: realsense
+        camera_serials:
+        - '420122070525'
+env:
+  eval:
+    init_params:
+      id: FrankyFrankaEnv-v1
+    override_cfg:
+      is_dummy: false
+      robot_ip: 172.16.0.2
+      camera_type: realsense
+      camera_serials:
+      - '420122070525'
+      enable_camera_player: false
+      enable_random_reset: false
+      safe_smoke_hold: true
+      gripper_type: franka
+      camera_names:
+        '420122070525': wrist_1
