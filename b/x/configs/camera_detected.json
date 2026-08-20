@@ -1,20 +1,28 @@
 {
   "camera_type": "realsense",
   "camera_serials": [
+    "250222073513",
     "420122070525"
   ],
   "enumerated": {
     "realsense": [
+      "250222073513",
       "420122070525"
     ],
     "zed": [],
     "lumos": [
       "video0",
       "video1",
+      "video10",
+      "video11",
       "video2",
       "video3",
       "video4",
-      "video5"
+      "video5",
+      "video6",
+      "video7",
+      "video8",
+      "video9"
     ]
   },
   "realsense_details": [
@@ -668,6 +676,657 @@
           "fps": 6
         }
       ]
+    },
+    {
+      "serial": "250222073513",
+      "name": "RealSense D435I",
+      "firmware": "5.13.0.55",
+      "product_line": "D400",
+      "usb_type": "2.1",
+      "physical_port": "/sys/devices/pci0000:40/0000:40:03.6/0000:46:00.0/0000:47:0c.0/0000:48:00.0/usb7/7-8/7-8:1.0/video4linux/video6",
+      "supports_default_640x480_15": true,
+      "streams": [
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 1280,
+          "height": 720,
+          "fps": 6
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 848,
+          "height": 480,
+          "fps": 10
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 848,
+          "height": 480,
+          "fps": 8
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 848,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 640,
+          "height": 480,
+          "fps": 15
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 640,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 640,
+          "height": 360,
+          "fps": 30
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 480,
+          "height": 270,
+          "fps": 60
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 480,
+          "height": 270,
+          "fps": 30
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 480,
+          "height": 270,
+          "fps": 15
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.infrared",
+          "format": "format.y8",
+          "width": 480,
+          "height": 270,
+          "fps": 6
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 1280,
+          "height": 720,
+          "fps": 6
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 848,
+          "height": 480,
+          "fps": 10
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 848,
+          "height": 480,
+          "fps": 8
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 848,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 640,
+          "height": 480,
+          "fps": 15
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 640,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 640,
+          "height": 360,
+          "fps": 30
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 480,
+          "height": 270,
+          "fps": 60
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 480,
+          "height": 270,
+          "fps": 30
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 480,
+          "height": 270,
+          "fps": 15
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 480,
+          "height": 270,
+          "fps": 6
+        },
+        {
+          "sensor": "Stereo Module",
+          "stream": "stream.depth",
+          "format": "format.z16",
+          "width": 256,
+          "height": 144,
+          "fps": 90
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 1920,
+          "height": 1080,
+          "fps": 8
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 1920,
+          "height": 1080,
+          "fps": 8
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 1920,
+          "height": 1080,
+          "fps": 8
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 1920,
+          "height": 1080,
+          "fps": 8
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 1920,
+          "height": 1080,
+          "fps": 8
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 1280,
+          "height": 720,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 1280,
+          "height": 720,
+          "fps": 10
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 1280,
+          "height": 720,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 1280,
+          "height": 720,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 1280,
+          "height": 720,
+          "fps": 10
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 1280,
+          "height": 720,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 1280,
+          "height": 720,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 1280,
+          "height": 720,
+          "fps": 10
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 1280,
+          "height": 720,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 1280,
+          "height": 720,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 1280,
+          "height": 720,
+          "fps": 10
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 1280,
+          "height": 720,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 1280,
+          "height": 720,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 1280,
+          "height": 720,
+          "fps": 10
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 1280,
+          "height": 720,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 640,
+          "height": 480,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 640,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 640,
+          "height": 480,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 640,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 640,
+          "height": 480,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 640,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 640,
+          "height": 480,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 640,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 640,
+          "height": 480,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 640,
+          "height": 480,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 424,
+          "height": 240,
+          "fps": 60
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 424,
+          "height": 240,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 424,
+          "height": 240,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgb8",
+          "width": 424,
+          "height": 240,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 424,
+          "height": 240,
+          "fps": 60
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 424,
+          "height": 240,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 424,
+          "height": 240,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgra8",
+          "width": 424,
+          "height": 240,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 424,
+          "height": 240,
+          "fps": 60
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 424,
+          "height": 240,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 424,
+          "height": 240,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.rgba8",
+          "width": 424,
+          "height": 240,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 424,
+          "height": 240,
+          "fps": 60
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 424,
+          "height": 240,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 424,
+          "height": 240,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.bgr8",
+          "width": 424,
+          "height": 240,
+          "fps": 6
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 424,
+          "height": 240,
+          "fps": 60
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 424,
+          "height": 240,
+          "fps": 30
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 424,
+          "height": 240,
+          "fps": 15
+        },
+        {
+          "sensor": "RGB Camera",
+          "stream": "stream.color",
+          "format": "format.yuyv",
+          "width": 424,
+          "height": 240,
+          "fps": 6
+        }
+      ]
     }
   ],
   "realsense_error": null,
@@ -675,10 +1334,16 @@
   "video_nodes": [
     "/dev/video0",
     "/dev/video1",
+    "/dev/video10",
+    "/dev/video11",
     "/dev/video2",
     "/dev/video3",
     "/dev/video4",
-    "/dev/video5"
+    "/dev/video5",
+    "/dev/video6",
+    "/dev/video7",
+    "/dev/video8",
+    "/dev/video9"
   ],
   "v4l_by_id": [],
   "default_camera_info": {

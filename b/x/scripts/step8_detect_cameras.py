@@ -162,14 +162,21 @@ def _write_yaml(path: str, serials: list[str], camera_type: str) -> None:
             cfg["camera_type"] = camera_type
             cfg["camera_serials"] = list(serials)
 
-    override = data.get("env", {}).get("eval", {}).get("override_cfg")
-    if isinstance(override, dict):
-        override["camera_type"] = camera_type
-        override["camera_serials"] = list(serials)
-        names = override.get("camera_names") or {}
-        for index, serial in enumerate(serials, start=1):
-            names.setdefault(serial, f"wrist_{index}")
-        override["camera_names"] = names
+    # Sync every env scope that exists: the cube-place carrier
+    # (realworld_cube_place_camera.yaml) has both train and eval, and an
+    # eval-only update would leave them disagreeing about the serial.
+    for scope in ("train", "eval"):
+        override = data.get("env", {}).get(scope, {}).get("override_cfg")
+        if isinstance(override, dict):
+            override["camera_type"] = camera_type
+            override["camera_serials"] = list(serials)
+            # Rebuild names from the serials just written. setdefault onto
+            # existing keys leaves stale serials behind and can map two
+            # serials to the same wrist_i (LOG-031).
+            override["camera_names"] = {
+                serial: f"wrist_{index}"
+                for index, serial in enumerate(serials, start=1)
+            }
 
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(data, handle, sort_keys=False, allow_unicode=True)
@@ -191,6 +198,13 @@ def parse_args() -> argparse.Namespace:
         "--yaml-out",
         default=DEFAULT_YAML,
         help=f"YAML to update with --write-yaml (default: {DEFAULT_YAML})",
+    )
+    parser.add_argument(
+        "--serials",
+        nargs="+",
+        default=None,
+        help="keep only these serials from enumeration (e.g. a second camera "
+        "is plugged in but unused); each must still be physically present",
     )
     return parser.parse_args()
 
@@ -225,6 +239,18 @@ def main() -> int:
     print("--- RLinf enumerate_cameras ---")
     for camera_type, serials in enumerated.items():
         print(f"  {camera_type}: {serials or '(none)'}")
+
+    if args.serials:
+        wanted = [str(s).strip() for s in args.serials if str(s).strip()]
+        present = {s for serials in enumerated.values() for s in serials}
+        missing = [s for s in wanted if s not in present]
+        if not check("requested_serials_present", not missing, f"missing={missing}"):
+            failed = True
+        enumerated = {
+            camera_type: [s for s in serials if s in wanted]
+            for camera_type, serials in enumerated.items()
+        }
+        print(f"--- filtered by --serials -> {wanted} ---")
 
     rs_details, rs_error = _realsense_details()
     if rs_error:

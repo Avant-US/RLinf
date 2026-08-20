@@ -33,7 +33,9 @@ import numpy as np
 import ray
 from scipy.spatial.transform import Rotation as R
 
-REPO = os.environ.get("REPO_PATH", os.path.abspath(os.path.join(__file__, "../../..")))
+REPO = os.environ.get(
+    "REPO_PATH", os.path.abspath(os.path.join(__file__, "../../../.."))
+)
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "b", "x"))
 

@@ -1,3 +1,23 @@
+# Camera-serial carrier for the Step 8 camera checks. NOT a runnable robot config.
+#
+# It used to also set `is_dummy: false`, `robot_ip: 172.16.0.2`,
+# `enable_random_reset` and `safe_smoke_hold` -- i.e. it looked like a real-robot
+# config while supplying no `target_ee_pose`, no `reset_ee_pose` and no
+# `ee_pose_limit_*`. FrankySingleFrankaEnvConfig does not derive those (unlike the
+# PegInsertion line), so they stayed at their zeros(6) defaults, which means:
+#
+#   * `_reset_pose` becomes the base origin (0, 0, 0);
+#   * the motion guard has no box to fence -- it now REFUSES to construct on
+#     hardware rather than warning, but that refusal is the only thing standing
+#     between this file and an arm commanded into its own pedestal;
+#   * `step()` would clip every commanded target into Box(zeros, zeros), i.e.
+#     exactly the origin.
+#
+# Its only two consumers (`step8_detect_cameras.py`, `step8_check_yaml.py`) read
+# camera fields and never build an env, so those keys were dead weight -- and the
+# obvious thing to copy-paste. Removed. If a real-robot single-arm config is
+# wanted, it must carry target_ee_pose / reset_ee_pose / ee_pose_limit_* or it will
+# be refused at construction.
 cluster:
   num_nodes: 1
   node_groups:
@@ -17,14 +37,10 @@ env:
     init_params:
       id: FrankyFrankaEnv-v1
     override_cfg:
-      is_dummy: false
-      robot_ip: 172.16.0.2
       camera_type: realsense
       camera_serials:
       - '420122070525'
       enable_camera_player: false
-      enable_random_reset: false
-      safe_smoke_hold: true
       gripper_type: franka
       camera_names:
         '420122070525': wrist_1

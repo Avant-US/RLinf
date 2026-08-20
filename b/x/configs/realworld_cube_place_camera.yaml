@@ -1,0 +1,97 @@
+# Camera-serial carrier for the cube-place link, mirroring
+# realworld_franky_camera.yaml (the Step 8 carrier) but for
+# FrankyCubePlaceEnv-v1 instead of FrankyFrankaEnv-v1.
+#
+# Unlike realworld_franky_camera.yaml, this file DOES carry `is_dummy: false`
+# and a full H1 six-tuple (target_ee_pose + clip_*): CubePlaceConfig inherits
+# PegInsertionConfig.__post_init__, which derives reset_ee_pose and
+# ee_pose_limit_min/max from target_ee_pose + clip_* (see
+# b/x/franky_ext/tasks/cube_place.py, CubePlaceConfig.__post_init__), so
+# giving those two is enough for a constructible real-robot config -- the
+# FrankyFrankaEnv-v1 line does NOT derive those and would need to be given
+# them directly (that is why realworld_franky_camera.yaml carries neither and
+# stays a serial-only carrier).
+#
+# Used by the cube-place link self-check described in dmo_place_2.md S3.3:
+#   bash b/x/scripts/run_cube_place_phase2.sh reset --with-camera
+# and can also be pointed at by a `gym.make` call directly for ad-hoc camera
+# debugging on this env.
+#
+# NOTE: `step8_detect_cameras.py --write-yaml` rewrites this file with
+# yaml.safe_dump, which STRIPS these comments and, without `--serials`,
+# writes back ALL detected serials. The serial set must match
+# realworld_cube_place_sac.yaml (8b's --expect-serials-from enforces it);
+# run_cube_place_camera_accept.sh passes --serials from the training YAML
+# automatically, so an extra plugged-in camera is ignored (LOG-031/032).
+cluster:
+  num_nodes: 1
+  node_groups:
+    - label: franka
+      node_ranks:
+        - 0
+      hardware:
+        type: Franka
+        configs:
+          - robot_ip: 172.16.0.2
+            node_rank: 0
+            camera_type: realsense
+            camera_serials:
+              - "420122070525"
+env:
+  train:
+    init_params:
+      id: FrankyCubePlaceEnv-v1
+    override_cfg:
+      is_dummy: false
+      robot_ip: 172.16.0.2
+      camera_type: realsense
+      camera_serials:
+        - "420122070525"
+      camera_names:
+        "420122070525": wrist_1
+      enable_camera_player: false
+      gripper_type: franka
+      # H1: keep in sync with b/x/configs/cube_place_target_ee_pose.yaml.
+      target_ee_pose:
+        [
+          0.726857066,
+          0.0249468647,
+          0.250846744,
+          -3.13747483,
+          0.0354833569,
+          -0.00268804519,
+        ]
+      clip_x_range: 0.05
+      clip_y_range: 0.05
+      clip_z_range_low: 0.005
+      clip_z_range_high: 0.08
+      clip_rz_range: 0.35
+      reset_z_lift_m: 0.03
+  eval:
+    init_params:
+      id: FrankyCubePlaceEnv-v1
+    override_cfg:
+      is_dummy: false
+      robot_ip: 172.16.0.2
+      camera_type: realsense
+      camera_serials:
+        - "420122070525"
+      camera_names:
+        "420122070525": wrist_1
+      enable_camera_player: false
+      gripper_type: franka
+      target_ee_pose:
+        [
+          0.726857066,
+          0.0249468647,
+          0.250846744,
+          -3.13747483,
+          0.0354833569,
+          -0.00268804519,
+        ]
+      clip_x_range: 0.05
+      clip_y_range: 0.05
+      clip_z_range_low: 0.005
+      clip_z_range_high: 0.08
+      clip_rz_range: 0.35
+      reset_z_lift_m: 0.03

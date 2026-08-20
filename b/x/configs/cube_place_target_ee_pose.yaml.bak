@@ -1,10 +1,10 @@
 # Auto-written by write_cube_place_pose.py. Do not use all-zero placeholders for robot reset.
 calibrated: true
 target_ee_pose:
-- 0.726857066
-- 0.0249468647
-- 0.250846744
-- -3.13747483
-- 0.0354833569
-- -0.00268804519
+- 0.67129487
+- -0.00806926
+- 0.2294566
+- -3.10852762
+- 0.07677764
+- 0.15125061
 notes: ''

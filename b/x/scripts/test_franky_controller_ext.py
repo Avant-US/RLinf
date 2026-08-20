@@ -28,24 +28,35 @@ if not ray.is_initialized():
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-REPO = os.environ.get("REPO_PATH", os.path.abspath(os.path.join(__file__, "../../..")))
+# Four "..": the first only strips the filename (LOG-023 finding 4).
+REPO = os.environ.get(
+    "REPO_PATH", os.path.abspath(os.path.join(__file__, "../../../.."))
+)
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "b", "x"))
 
 from franky_ext.controller_extended import FrankyControllerExtended
+from franky_ext.motion_limits import describe_authority
 
 HOME_JOINTS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+
+#: Per-call joint step cap for ``nudge``. ``stream`` already capped its *total*
+#: displacement at 0.5 rad while ``nudge`` had no cap at all, so a mistyped
+#: ``nudge 2 1.5`` would swing the shoulder 86 degrees in one blocking motion.
+MAX_NUDGE_RAD = 0.2
 
 
 def _print_help() -> None:
     print(
-        "commands: q | getpos | getpos_euler | getjoint | home | "
-        "nudge <i> <d> | stream <i> <d> <n> | hold <secs> | "
-        "open | close [N] | stop | grip <0-255> | impedance <k_trans k_rot>"
+        "commands: q | getpos | getpos_euler | getjoint | mode | health | "
+        "home yes | nudge <i> <d> | stream <i> <d> <n> | hold <secs> | "
+        "open [yes] | close [N] | stop | grip <0-255> | impedance <k_trans k_rot>"
     )
     print("H1 标定: open → 放方块 → close → 引导贴住标记 → getpos_euler → q")
     print("close 为轻力抓取（默认约 20 N，上限 40 N），不是死夹。异常立刻 stop 或急停。")
-    print("标定过程不要敲 home。")
+    print("标定过程不要敲 home。home 会从当前任意位形横扫到工厂关节位，需写成 `home yes`。")
+    print(f"nudge 单次上限 {MAX_NUDGE_RAD} rad；stream 总位移上限 0.5 rad。")
+    print("夹着方块时 open 会让方块掉下来，需写成 `open yes`。")
 
 
 def main() -> int:
@@ -104,7 +115,21 @@ def main() -> int:
             elif cmd == "getjoint":
                 state = controller.get_state().wait()[0]
                 print(state.arm_joint_position)
+            elif cmd == "mode" or cmd == "health":
+                print(controller.motion_health().wait()[0])
             elif cmd == "home":
+                # A blocking JointMotion from wherever the arm happens to be to
+                # the factory pose. Near the table, holding a cube, that is a
+                # long unplanned sweep -- and the calibration procedure explicitly
+                # says not to use it, so require the intent to be spelled out.
+                if len(parts) != 2 or parts[1].lower() != "yes":
+                    print(
+                        "home sweeps from the CURRENT pose to the factory joint "
+                        "position in one blocking motion. It will drag a grasped "
+                        "cube across the table and it invalidates the H1 start "
+                        "pose. Type `home yes` if that is really what you want."
+                    )
+                    continue
                 print(f"Resetting to home: {HOME_JOINTS}")
                 controller.reset_joint(HOME_JOINTS).wait()
                 print("Home reached")
@@ -115,6 +140,12 @@ def main() -> int:
                 idx = int(parts[1]) - 1
                 delta = float(parts[2])
                 assert 0 <= idx < 7, "joint index must be 1..7"
+                if abs(delta) > MAX_NUDGE_RAD:
+                    print(
+                        f"refusing nudge: |{delta:.4f}| rad > {MAX_NUDGE_RAD} rad "
+                        f"per-call cap (use several smaller nudges, or `stream`)"
+                    )
+                    continue
                 current = controller.get_state().wait()[0].arm_joint_position
                 target = current.copy()
                 target[idx] += delta
@@ -164,6 +195,20 @@ def main() -> int:
                     f"{np.sqrt(np.mean(state.arm_joint_velocity**2)):.5f} rad/s"
                 )
             elif cmd == "open":
+                # Opening while holding drops the cube. During H1 that is the
+                # intended first step (hand empty), but after the cube is grasped
+                # and the arm guided above the mark it is how you lose it.
+                holding = False
+                try:
+                    holding = bool(controller.gripper_holding().wait()[0])
+                except Exception as exc:
+                    print(f"could not read gripper state ({exc}); proceeding")
+                if holding and not (len(parts) == 2 and parts[1].lower() == "yes"):
+                    print(
+                        "gripper is currently HOLDING something; opening will drop "
+                        "it. Type `open yes` to open anyway."
+                    )
+                    continue
                 controller.open_gripper().wait()
                 print("gripper opened")
             elif cmd == "close":
@@ -193,7 +238,14 @@ def main() -> int:
                             "rotational_stiffness": kr,
                         }
                     ).wait()
-                    print(f"impedance updated to K_t={kt} K_r={kr}")
+                    # The controller clamps the stiffness and derives the error
+                    # clip from it, so the commanded FORCE ceiling stays put. The
+                    # tracker's next start log prints the resulting products;
+                    # read that rather than assuming kt landed verbatim.
+                    print(
+                        f"impedance requested K_t={kt} K_r={kr}; "
+                        f"resulting authority -> {describe_authority(kt, kr)}"
+                    )
                 elif len(parts) == 8:
                     print(
                         "7-int Kq form is upstream ROS-style; "

@@ -38,6 +38,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Step 8b: validate camera YAML")
     parser.add_argument("--json-in", default=DEFAULT_JSON)
     parser.add_argument("--yaml-in", default=DEFAULT_YAML)
+    parser.add_argument(
+        "--expect-gym-id",
+        default="FrankyFrankaEnv-v1",
+        help="expected env.eval.init_params.id (default: FrankyFrankaEnv-v1; "
+        "the cube-place carrier uses FrankyCubePlaceEnv-v1)",
+    )
+    parser.add_argument(
+        "--expect-serials-from",
+        default=None,
+        help="second YAML whose camera serials must equal the detected set, "
+        "order included (e.g. the training config realworld_cube_place_sac.yaml); "
+        "catches 'detected 2 cameras but training expects 1' (LOG-031)",
+    )
     return parser.parse_args()
 
 
@@ -90,12 +103,36 @@ def main() -> int:
     )
     check(
         "yaml_gym_id_franky",
-        str(gym_id) == "FrankyFrankaEnv-v1",
-        str(gym_id),
+        str(gym_id) == args.expect_gym_id,
+        f"{gym_id} (expected {args.expect_gym_id})",
     )
     names = override.get("camera_names") or {}
     wrist_ok = (not names) or ("wrist_1" in names.values())
     check("yaml_wrist_1_name", wrist_ok, str(names))
+    dup_names = len(set(names.values())) != len(names.values())
+    check("yaml_camera_names_unique", not dup_names, str(names))
+    if dup_names:
+        failed = True
+
+    if args.expect_serials_from:
+        train_ok = os.path.isfile(args.expect_serials_from)
+        check("train_yaml_exists", train_ok, args.expect_serials_from)
+        if not train_ok:
+            failed = True
+        else:
+            train_data = yaml.safe_load(
+                Path(args.expect_serials_from).read_text(encoding="utf-8")
+            )
+            _, t_serials = collect_yaml_serials(train_data or {})
+            # Order matters: the first serial becomes wrist_1.
+            match_train = list(t_serials) == list(det_serials)
+            check(
+                "train_yaml_serials_match",
+                match_train,
+                f"train={t_serials} detected={det_serials}",
+            )
+            if not match_train:
+                failed = True
 
     if not y_serials or ph_yaml or not match or dummy or not type_ok:
         failed = True

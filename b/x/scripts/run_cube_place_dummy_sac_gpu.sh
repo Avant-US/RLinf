@@ -36,7 +36,19 @@ PY
 python -c "import franky_ext.tasks.register; import gymnasium as gym; print('gym', gym.spec('FrankyCubePlaceEnv-v1').id)"
 
 if ray status >/dev/null 2>&1; then
-  echo "WARNING: existing Ray cluster; stopping it."
+  # `ray stop --force` is SIGKILL to every worker. A live FrankyControllerExtended
+  # actor may be mid-_interpolate_move with a 1 kHz torque motion running; killing
+  # it hands the arm to libfranka's comms-timeout stop -- a hard brake carrying
+  # whatever momentum it had, instead of the guided deceleration
+  # freeze_at_current() exists to provide. Refuse rather than warn-and-proceed.
+  if ray list actors --filter "class_name=FrankyControllerExtended" \
+       --filter "state=ALIVE" 2>/dev/null | grep -q ALIVE; then
+    echo "ERROR: a live FrankyControllerExtended actor holds the robot." >&2
+    echo "       It may be mid-motion. Stop it deliberately (let the smoke script" >&2
+    echo "       finish, or Ctrl+C it and confirm the arm is still), then re-run." >&2
+    exit 1
+  fi
+  echo "WARNING: existing Ray cluster (no robot controller in it); stopping it."
   ray stop --force || true
   sleep 2
 fi

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys as _sys
+
 import os
 
 import torch.library
@@ -205,7 +207,16 @@ def register() -> None:
     try:
         import franky_ext.tasks.register  # noqa: F401
     except Exception:
-        pass
+        # Reported, not swallowed: an unregistered gym id fails safe (it cannot
+        # command a robot), but the failure used to surface much later as an
+        # unrelated gym.make error.
+        import traceback as _tb
+
+        print(
+            "runtime_bootstrap: franky gym registration FAILED inside the worker "
+            "env patch:\n" + _tb.format_exc(),
+            file=_sys.stderr,
+        )
 
 
 _patch_no_accel_platform()
@@ -219,4 +230,10 @@ except Exception:
 try:
     import franky_ext.tasks.register  # noqa: F401
 except Exception:
-    pass
+    import traceback as _tb
+
+    print(
+        "runtime_bootstrap: franky gym registration FAILED at import:\n"
+        + _tb.format_exc(),
+        file=_sys.stderr,
+    )

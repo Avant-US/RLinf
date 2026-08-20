@@ -8,9 +8,13 @@ import time
 import numpy as np
 import ray
 
-REPO = os.environ.get("REPO_PATH", os.path.abspath(os.path.join(__file__, "../../..")))
+REPO = os.environ.get(
+    "REPO_PATH", os.path.abspath(os.path.join(__file__, "../../../.."))
+)
 sys.path.insert(0, REPO)
-sys.path.insert(0, os.path.join(REPO, "b", "d"))
+# b/x, not b/d: the extension package moved and this line was never updated. It
+# went unnoticed because setup_before_ray_5090.sh puts b/x on PYTHONPATH anyway.
+sys.path.insert(0, os.path.join(REPO, "b", "x"))
 
 from franky_ext.controller_extended import FrankyControllerExtended
 

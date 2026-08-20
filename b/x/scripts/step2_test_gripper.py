@@ -5,7 +5,9 @@ import os
 import sys
 import time
 
-REPO = os.environ.get("REPO_PATH", os.path.abspath(os.path.join(__file__, "../../..")))
+REPO = os.environ.get(
+    "REPO_PATH", os.path.abspath(os.path.join(__file__, "../../../.."))
+)
 sys.path.insert(0, os.path.join(REPO, "b", "x"))
 
 from franky_ext.franka_libfranka_gripper import FrankaLibfrankaGripper

@@ -11,8 +11,42 @@ group_size: 1
 use_fixed_reset_state_ids: False
 max_steps_per_rollout_epoch: 100
 max_episode_steps: 100
-use_spacemouse: True
+# False, not True: this task is not teleoperated in either split, and the leaf
+# configs only overrode it for env.train -- so env.eval kept True. Harmless while
+# is_dummy, but the moment that flips, eval instantiates SpacemouseIntervention
+# (needs an HID device) and injects human deltas into a run nobody expects to be
+# teleoperated.
+use_spacemouse: False
 main_image_key: wrist_1
+
+# no_gripper is what makes "the gripper never opens" structural: it selects
+# GripperCloseEnv, which zeroes action[6] so _binary_gripper_action's open branch
+# is unreachable. It held only because the upstream default happens to be True --
+# pinned here so it is a decision rather than a coincidence.
+no_gripper: True
+
+override_cfg:
+  # Safe-by-default, so a leaf config has to deliberately opt IN to the robot.
+  # is_dummy was previously duplicated in four places across the two leaf configs
+  # (env.train and env.eval in each) with the dataclass default being the
+  # dangerous one, and is_dummy is the only thing keeping the 1A regression off
+  # the hardware. robot_ip is the second layer: with a placeholder, flipping
+  # is_dummy alone still fails at franky.Robot() before any motion, and
+  # CubePlaceConfig.__post_init__ now asserts the two agree.
+  is_dummy: True
+  robot_ip: 0.0.0.0
+  # Skip FrankaEnv.__init__'s own _interpolate_move(self._reset_pose) -- an arm
+  # motion during construction, from wherever the arm happens to be. reset() still
+  # moves the arm, so nothing is lost: go_to_rest goes to hover anyway.
+  safe_smoke_hold: True
+  # FrankaRobotConfig.use_dense_reward defaults to False, and _calc_step_reward
+  # returns 0.0 whenever it is False -- there is no other reward code in this
+  # task. The charger config this task imitates sets it explicitly
+  # (realworld_charger_sac_cnn_async.yaml). Without it every zero/approach step in
+  # the smoke script prints reward=0.0000, indistinguishable from a broken reward
+  # path, and phase-3 SAC would be trained on an always-zero signal (round-2 audit
+  # finding 8).
+  use_dense_reward: True
 
 video_cfg:
   save_video: False
