@@ -127,11 +127,19 @@ class RealworldRLTRoute(RLTRoute):
         ref_actions = result["forward_inputs"]["ref_chunk"].to(
             device=actions.device, dtype=actions.dtype
         )
-        routed_actions = torch.where(
-            rlt_switch_flags,
-            actions,
-            ref_actions[:, : actions.shape[1], : actions.shape[2]],
-        ).contiguous()
+        if not rlt_switch_flags.any():
+            # Deliberately keeps the reference model's full horizon rather than
+            # truncating to the actor's shorter chunk: with no actor driving,
+            # the reference plan is executed as it was predicted. The mixed
+            # branch below must truncate instead, because there the two
+            # policies' outputs are combined element-wise.
+            routed_actions = ref_actions[:, :, : actions.shape[2]].contiguous()
+        else:
+            routed_actions = torch.where(
+                rlt_switch_flags,
+                actions,
+                ref_actions[:, : actions.shape[1], : actions.shape[2]],
+            ).contiguous()
         result["forward_inputs"]["action"] = routed_actions.reshape(
             routed_actions.shape[0], -1
         ).contiguous()

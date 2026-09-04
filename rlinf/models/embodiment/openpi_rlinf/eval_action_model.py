@@ -384,6 +384,25 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             {"actions": model_actions, "state": observation.state}
         )["actions"]
 
+        import logging as _logging
+        _rlt_log = _logging.getLogger("rlt_vla_debug")
+        if not _rlt_log.handlers:
+            _rlt_log.setLevel(_logging.WARNING)
+        _ma = model_actions[0, 0, :7].detach().cpu().numpy()
+        _rc = ref_chunk[0, 0, :7].detach().cpu().numpy()
+        _st = observation.state[0, :19].detach().cpu().numpy()
+        _grip_all = ref_chunk[0, :, 6].detach().cpu().numpy()
+        _grip_str = ",".join(f"{g:.3f}" for g in _grip_all)
+        _xyz_all = ref_chunk[0, :, :3].detach().cpu().numpy()
+        _rlt_log.warning(
+            "[VLA_DEBUG] model_raw_step0=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f] "
+            "ref_chunk_step0=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f] "
+            "state_norm[:7]=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f] "
+            "gripper_all_20=[%s] "
+            "xyz_step0=[%.4f,%.4f,%.4f]",
+            *_ma, *_rc, *_st[:7], _grip_str, *_xyz_all[0],
+        )
+
         raw_proprio = self._select_configured_state(env_obs["states"])
         if "maniskill" in self.config_name.lower():
             state_dim = (

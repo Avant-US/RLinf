@@ -67,6 +67,15 @@ class RLTACLossMixin:
         )
         return ref_chunk[:, :chunk_len].reshape(ref_chunk.shape[0], -1)
 
+    def _truncate_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Truncate replay actions to actor chunk_len when VLA ref uses more steps."""
+        chunk_len, action_dim = self._chunk_shape()
+        expected = chunk_len * action_dim
+        flat = self._flatten_chunk(actions)
+        if flat.shape[-1] > expected:
+            flat = flat[..., :expected]
+        return flat
+
     @staticmethod
     def _require_twin_q(all_q_values: torch.Tensor) -> None:
         if all_q_values.shape[-1] < 2:
@@ -230,7 +239,7 @@ class RLTACLossMixin:
 
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
-        actions = batch["actions"]
+        actions = self._truncate_actions(batch["actions"])
         rewards = batch["rewards"]
         done_source = batch["terminations"]
         if use_simulator_transition_replay(self.cfg):
@@ -340,7 +349,7 @@ class RLTACLossMixin:
         ref_chunk = self._ref_chunk(curr_obs)
         bc_loss, rlt_metrics = self._bc_metrics(
             pi=pi,
-            actions=batch["actions"],
+            actions=self._truncate_actions(batch["actions"]),
             ref_chunk=ref_chunk,
             intervene_flags=batch.get("intervene_flags", None),
         )
@@ -454,6 +463,16 @@ class RLTACReplayMixin:
         if idx >= record_transition.shape[0]:
             return False
         return bool(record_transition[idx].detach().to(torch.bool).reshape(-1).all())
+
+    @staticmethod
+    def _trajectory_has_record(traj: Trajectory) -> bool:
+        fi = getattr(traj, "forward_inputs", None)
+        if not isinstance(fi, dict):
+            return False
+        rt = fi.get("record_transition")
+        if not isinstance(rt, torch.Tensor):
+            return False
+        return bool(rt.detach().to(torch.bool).any())
 
     def _transition_replay_trajectories(
         self,
@@ -634,11 +653,15 @@ class RLTACReplayMixin:
 
             return len(replay_list), completed
 
-        self.replay_buffer.add_trajectories(recv_list)
+        recorded_list = [
+            traj for traj in recv_list if self._trajectory_has_record(traj)
+        ]
+
+        self.replay_buffer.add_trajectories(recorded_list)
 
         if self.demo_buffer is not None:
             intervene_traj_list = []
-            for traj in recv_list:
+            for traj in recorded_list:
                 assert isinstance(traj, Trajectory)
                 intervene_trajs = traj.extract_intervene_traj()
                 if intervene_trajs is not None:
@@ -647,8 +670,8 @@ class RLTACReplayMixin:
             if len(intervene_traj_list) > 0:
                 self.demo_buffer.add_trajectories(intervene_traj_list)
 
-        added = sum(self._trajectory_transition_count(traj) for traj in recv_list)
-        completed = sum(self._trajectory_completed_episodes(traj) for traj in recv_list)
+        added = sum(self._trajectory_transition_count(traj) for traj in recorded_list)
+        completed = sum(self._trajectory_completed_episodes(traj) for traj in recorded_list)
         self._last_replay_metrics = collect_trajectory_replay_metrics(
             recv_list, reducer=all_reduce_dict
         )

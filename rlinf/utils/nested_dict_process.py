@@ -148,6 +148,13 @@ def concat_batch(data1, data2):
     return batch
 
 
+def _align_and_stack_tensors(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    min_dim = min(t.shape[-1] for t in tensors)
+    if all(t.shape[-1] == min_dim for t in tensors):
+        return torch.stack(tensors, dim=dim)
+    return torch.stack([t[..., :min_dim] for t in tensors], dim=dim)
+
+
 def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
     if len(list_of_dict) == 0:
         return {}
@@ -158,7 +165,7 @@ def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
         _v0 = list_of_dict[0][key]
         if isinstance(_v0, torch.Tensor):
             v_list = [d[key] for d in list_of_dict]
-            ret[key] = torch.stack(v_list, dim=dim)
+            ret[key] = _align_and_stack_tensors(v_list, dim=dim)
         elif isinstance(_v0, dict):
             v_list = [d[key] for d in list_of_dict]
             ret[key] = stack_list_of_dict_tensor(v_list)

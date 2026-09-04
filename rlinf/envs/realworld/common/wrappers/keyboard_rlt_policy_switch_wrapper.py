@@ -59,11 +59,28 @@ class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
                 if not self._rlt_switch_flags:
                     event = "enter_actor"
                     self._rlt_switch_flags = True
-                    self._log_info(
-                        "Pedal 'b' pressed; switching RLT rollout to Stage2 actor."
+                    print(
+                        "\n>>> [KEY] 'b' pressed — switched to Stage2 actor <<<\n",
+                        flush=True,
                     )
                 else:
                     event = "actor_already_active"
+            elif key == "c":
+                event = "success"
+                reward = 1.0
+                truncated = True
+                print(
+                    "\n>>> [KEY] 'c' pressed — SUCCESS (reward=1), episode ending <<<\n",
+                    flush=True,
+                )
+            elif key == "a":
+                event = "failure"
+                reward = 0.0
+                truncated = True
+                print(
+                    "\n>>> [KEY] 'a' pressed — FAILURE (reward=0), episode ending <<<\n",
+                    flush=True,
+                )
 
         info["rlt_switch_flags"] = self._rlt_switch_flags
         info["rlt_policy_switch_event"] = event

@@ -117,6 +117,21 @@ class FrankaRobotConfig:
     # Max per-step change for hand joints (set to inf to disable).
     hand_max_delta_per_step: float = float("inf")
 
+    # Integrate translation deltas into a persistent desired pose instead of
+    # re-basing on the measured TCP every step. Re-basing caps the impedance
+    # controller's position error at one step's delta, so sub-millimetre
+    # commands never generate enough force to break static friction and are
+    # silently dropped. Integrating lets unexecuted motion accumulate.
+    use_persistent_desired_pose: bool = False
+    # Cap on ``|desired - measured|`` (metres) when integrating, which bounds
+    # the commanded force to ``translational_stiffness * max_desired_pose_lag``.
+    # Keep below any downstream per-step slew budget so the two never fight.
+    max_desired_pose_lag: float = 0.008
+
+    # When True, action[:6] is an absolute TCP target [x,y,z,roll,pitch,yaw]
+    # instead of a delta.  action_scale is ignored for arm DOFs.
+    use_absolute_action: bool = False
+
     def __post_init__(self):
         """Convert list fields from YAML/Hydra to numpy arrays."""
         if self.camera_names is not None:
@@ -182,6 +197,7 @@ class FrankaEnv(gym.Env):
         next(self._joint_reset_cycle)  # Initialize the cycle
 
         self._success_hold_counter = 0  # Initialize the success hold counter
+        self._desired_xyz: np.ndarray | None = None
         self._last_hand_command: np.ndarray | None = None
         self._reward_worker = None
 
@@ -325,25 +341,52 @@ class FrankaEnv(gym.Env):
         start_time = time.time()
 
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        xyz_delta = action[:3]
 
         self.next_position = self._franka_state.tcp_pose.copy()
-        self.next_position[:3] = (
-            self.next_position[:3] + xyz_delta * self.config.action_scale[0]
-        )
+
+        if self.config.use_absolute_action:
+            self.next_position[:3] = action[:3]
+        else:
+            xyz_delta = action[:3]
+            scaled_xyz_delta = xyz_delta * self.config.action_scale[0]
+            if self.config.use_persistent_desired_pose:
+                measured_xyz = self._franka_state.tcp_pose[:3]
+                if self._desired_xyz is None:
+                    self._desired_xyz = measured_xyz.copy()
+                desired_xyz = self._desired_xyz + scaled_xyz_delta
+
+                lag = desired_xyz - measured_xyz
+                lag_norm = float(np.linalg.norm(lag))
+                if lag_norm > self.config.max_desired_pose_lag:
+                    desired_xyz = measured_xyz + lag * (
+                        self.config.max_desired_pose_lag / lag_norm
+                    )
+
+                self._desired_xyz = desired_xyz
+                self.next_position[:3] = desired_xyz
+            else:
+                self.next_position[:3] = self.next_position[:3] + scaled_xyz_delta
 
         is_ee_action_effective = True
         if not self.config.is_dummy:
-            self.next_position[3:] = (
-                R.from_euler("xyz", action[3:6] * self.config.action_scale[1])
-                * R.from_quat(self._franka_state.tcp_pose[3:].copy())
-            ).as_quat()
+            if self.config.use_absolute_action:
+                self.next_position[3:] = R.from_euler(
+                    "xyz", action[3:6]
+                ).as_quat()
+            else:
+                self.next_position[3:] = (
+                    R.from_euler("xyz", action[3:6] * self.config.action_scale[1])
+                    * R.from_quat(self._franka_state.tcp_pose[3:].copy())
+                ).as_quat()
 
             # --- End-effector action ---
             ee_action = action[6:]
             is_ee_action_effective = self._end_effector_action(ee_action)
 
-            self._move_action(self._clip_position_to_safety_box(self.next_position))
+            clipped_position = self._clip_position_to_safety_box(self.next_position)
+            if self.config.use_persistent_desired_pose:
+                self._desired_xyz = clipped_position[:3].copy()
+            self._move_action(clipped_position)
 
         self._num_steps += 1
         step_time = time.time() - start_time
@@ -497,6 +540,7 @@ class FrankaEnv(gym.Env):
         self._clear_error()
         self._num_steps = 0
         self._franka_state = self._controller.get_state().wait()[0]
+        self._desired_xyz = self._franka_state.tcp_pose[:3].copy()
         observation = self._get_observation()
 
         return observation, {}
@@ -569,10 +613,18 @@ class FrankaEnv(gym.Env):
         # Arm DOF (xyz + rpy) = 6; end-effector DOF depends on type
         ee_action_dim = 6 if self._is_hand else 1
         total_action_dim = 6 + ee_action_dim
-        self.action_space = gym.spaces.Box(
-            np.ones((total_action_dim,), dtype=np.float32) * -1,
-            np.ones((total_action_dim,), dtype=np.float32),
-        )
+        if self.config.use_absolute_action:
+            # Absolute mode: euler angles can reach ±π, so widen bounds.
+            bound = float(np.pi + 0.2)
+            self.action_space = gym.spaces.Box(
+                np.ones((total_action_dim,), dtype=np.float32) * -bound,
+                np.ones((total_action_dim,), dtype=np.float32) * bound,
+            )
+        else:
+            self.action_space = gym.spaces.Box(
+                np.ones((total_action_dim,), dtype=np.float32) * -1,
+                np.ones((total_action_dim,), dtype=np.float32),
+            )
 
         obs_tcp_pose_dim = 7
         # End-effector state key and dimension

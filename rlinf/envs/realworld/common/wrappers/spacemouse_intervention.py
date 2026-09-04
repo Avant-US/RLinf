@@ -60,7 +60,7 @@ class SpacemouseIntervention(gym.ActionWrapper):
         - action: spacemouse action if nonezero; else, policy action
         """
         expert_a, buttons = self.expert.get_action()
-        self.left, self.right = tuple(buttons)
+        self.left, self.right = bool(buttons[0]), bool(buttons[1])
 
         if np.linalg.norm(expert_a) > 0.001 or (self.left + self.right) > 0.5:
             self.last_intervene = time.time()
@@ -73,12 +73,29 @@ class SpacemouseIntervention(gym.ActionWrapper):
                 self.last_intervene = time.time()
             gripper_action = self.gripper_action.copy()
             expert_a = np.concatenate((expert_a, gripper_action), axis=0)
-        if time.time() - self.last_intervene < 0.5:
+        if time.time() - self.last_intervene < 1.0:
             return expert_a, True
         return action, False
 
+    def _delta_to_absolute(self, delta_action: np.ndarray) -> np.ndarray:
+        """Convert a SpaceMouse delta action to absolute TCP target."""
+        from scipy.spatial.transform import Rotation as R
+
+        state = self.get_wrapper_attr("_franka_state")
+        cfg = self.get_wrapper_attr("config")
+        abs_action = delta_action.copy()
+        abs_action[:3] = state.tcp_pose[:3] + delta_action[:3] * cfg.action_scale[0]
+        cur_rpy = R.from_quat(state.tcp_pose[3:]).as_euler("xyz")
+        abs_action[3:6] = cur_rpy + delta_action[3:6] * cfg.action_scale[1]
+        return abs_action
+
     def step(self, action):
         new_action, replaced = self.action(action)
+
+        if replaced and getattr(
+            self.get_wrapper_attr("config"), "use_absolute_action", False
+        ):
+            new_action = self._delta_to_absolute(new_action)
 
         obs, rew, done, truncated, info = self.env.step(new_action)
         if replaced:

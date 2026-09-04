@@ -173,38 +173,45 @@ class EmbodiedTrajectoryBuilder:
         self.curr_obs.clear()
         self.next_obs.clear()
 
+    @staticmethod
+    def _align_and_stack(tensors: list[torch.Tensor]) -> torch.Tensor:
+        min_dim = min(t.shape[-1] for t in tensors)
+        if all(t.shape[-1] == min_dim for t in tensors):
+            return torch.stack(tensors, dim=0)
+        return torch.stack([t[..., :min_dim] for t in tensors], dim=0)
+
     def to_trajectory(self) -> Trajectory:
         trajectory = Trajectory(
             max_episode_length=self.max_episode_length,
         )
         if len(self.actions) > 0:
-            trajectory.actions = torch.stack(self.actions, dim=0).cpu().contiguous()
+            trajectory.actions = self._align_and_stack(self.actions).cpu().contiguous()
         if len(self.intervene_flags) > 0:
             trajectory.intervene_flags = (
-                torch.stack(self.intervene_flags, dim=0).cpu().contiguous()
+                self._align_and_stack(self.intervene_flags).cpu().contiguous()
             )
         if len(self.rewards) > 0:
-            trajectory.rewards = torch.stack(self.rewards, dim=0).cpu().contiguous()
+            trajectory.rewards = self._align_and_stack(self.rewards).cpu().contiguous()
         if len(self.terminations) > 0:
             trajectory.terminations = (
-                torch.stack(self.terminations, dim=0).cpu().contiguous()
+                self._align_and_stack(self.terminations).cpu().contiguous()
             )
         if len(self.truncations) > 0:
             trajectory.truncations = (
-                torch.stack(self.truncations, dim=0).cpu().contiguous()
+                self._align_and_stack(self.truncations).cpu().contiguous()
             )
         if len(self.dones) > 0:
-            trajectory.dones = torch.stack(self.dones, dim=0).cpu().contiguous()
+            trajectory.dones = self._align_and_stack(self.dones).cpu().contiguous()
         if len(self.prev_logprobs) > 0:
             trajectory.prev_logprobs = (
-                torch.stack(self.prev_logprobs, dim=0).cpu().contiguous()
+                self._align_and_stack(self.prev_logprobs).cpu().contiguous()
             )
         if len(self.prev_values) > 0:
             trajectory.prev_values = (
-                torch.stack(self.prev_values, dim=0).cpu().contiguous()
+                self._align_and_stack(self.prev_values).cpu().contiguous()
             )
         if len(self.versions) > 0:
-            trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
+            trajectory.versions = self._align_and_stack(self.versions).cpu().contiguous()
         if len(self.forward_inputs) > 0:
             trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
             for key in trajectory.forward_inputs.keys():

@@ -75,6 +75,7 @@ class FrankaEEInputs(transforms.DataTransformFn):
     # Do not change this for your own dataset.
     model_type: _model.ModelType = _model.ModelType.PI0
     pad_state: bool = True
+    use_wrist_image: bool = False
 
     def __call__(self, data: dict) -> dict:
         if isinstance(data["observation/state"], np.ndarray):
@@ -87,22 +88,37 @@ class FrankaEEInputs(transforms.DataTransformFn):
             state = transforms.pad_to_dim(state, self.action_dim)
 
         base_image = _parse_image(data["observation/image"])
+        wrist_source = data.get("observation/wrist_image")
+        if wrist_source is None:
+            wrist_source = data.get("observation/extra_view_image")
+            if wrist_source is not None and np.asarray(wrist_source).ndim > 3:
+                wrist_source = np.asarray(wrist_source)[0]
+        has_wrist_image = self.use_wrist_image and wrist_source is not None
+        wrist_image = (
+            _parse_image(wrist_source)
+            if has_wrist_image
+            else np.zeros_like(base_image)
+        )
 
         # We only mask padding for pi0 model, not pi0-FAST.
         if self.model_type in (_model.ModelType.PI0, _model.ModelType.PI05):
             names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
             images = (
                 base_image,
-                np.zeros_like(base_image),
+                wrist_image,
                 np.zeros_like(base_image),
             )
-            image_masks = (np.True_, np.False_, np.False_)  # with padding
+            image_masks = (
+                np.True_,
+                np.True_ if has_wrist_image else np.False_,
+                np.False_,
+            )
         elif self.model_type == _model.ModelType.PI0_FAST:
             names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
             # We don't mask out padding images for FAST models.
             images = (
                 base_image,
-                np.zeros_like(base_image),
+                wrist_image,
                 np.zeros_like(base_image),
             )
             image_masks = (np.True_, np.True_, np.True_)  # without padding
