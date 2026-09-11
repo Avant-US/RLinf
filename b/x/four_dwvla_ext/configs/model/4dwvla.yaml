@@ -1,0 +1,59 @@
+# 4DWVLA model defaults for RLinf SFT
+# Plugin-version of doc 1's examples/sft/config/model/4dwvla.yaml
+model_type: "4dwvla"
+precision: "bf16"
+
+# Checkpoint path (MUST be overridden by top-level config)
+model_path: null
+
+# High-level switches
+action_loss_only: false        # Set true to skip WAN (faster, less VRAM)
+enable_keypoint: true          # Enable GeoPredict keypoint branch
+train_expert_only: false       # Freeze VLM backbone
+
+# Action/state dimensions (Franka defaults)
+action_dim: 8
+state_dim: 8
+num_action_chunks: 50
+
+# Required by get_model() registry
+is_lora: false
+
+# Model architecture overrides (passed to InternVLAA15Config)
+four_dwvla:
+  vlm_model_name_or_path: "Qwen/Qwen3.5-2B"
+  action_expert_hidden_size: 1024
+  action_expert_intermediate_size: 3072
+  chunk_size: 50
+  n_action_steps: 50
+  max_state_dim: 32
+  max_action_dim: 32
+  num_inference_steps: 10
+  image_resolution: [224, 224]
+  num_learnable_tokens: 50
+  inference_action_type: "fm"
+  tokenize_state: true
+  use_fast_action_tokens: true
+  kpt_4d_mode: "pos_rot"
+  num_keypoint_joints: 8
+  keypoint_history_max_len: 200
+
+  # Phase 2 SFT defaults
+  gradient_checkpointing: true
+  knowledge_insulation: false
+  freeze_learnable_tokens: true
+  freeze_wan_dit: true
+  video_micro_batch_size: 1
+  enable_vqa_loss: true
+
+  # Loss weights
+  action_loss_weight: 10.0
+  kpt_loss_weight: 1.0
+  kpt_future_loss_weight: 1.5
+  kpt_rot_loss_weight: 1.0
+
+  # Per-component LR scales
+  vlm_lr_scale: 1.0
+  action_expert_lr_scale: 1.0
+  kpt_expert_lr_scale: 1.0
+  track_encoder_lr_scale: 1.0

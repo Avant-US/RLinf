@@ -1,0 +1,33 @@
+{
+    "bbox_radius": 0.8361004471778869,
+    "bbox_margin": 0.15,
+    "global_min_base_relative": [
+      -0.03219885379076004,
+      -0.14015492796897888,
+      0.1781618297100067
+    ],
+    "global_max_base_relative": [
+      0.6032583713531494,
+      0.061602745205163956,
+      0.727043867111206
+    ],
+    "normalization": "base_link_origin_isotropic",
+    "keypoint_dim": 7,
+    "keypoint_dim_layout": "px,py,pz,qx,qy,qz,qw",
+    "rotation_representation": "quaternion_xyzw_hemisphere",
+    "rotation_convention": "qw >= 0; negate if qw < 0",
+    "num_keypoints": 8,
+    "keypoint_links": [
+      "fr3v2_1_link1",
+      "fr3v2_1_link2",
+      "fr3v2_1_link3",
+      "fr3v2_1_link4",
+      "fr3v2_1_link5",
+      "fr3v2_1_link6",
+      "fr3v2_1_link7",
+      "fr3v2_1_hand_tcp"
+    ],
+    "total_frames": 66577,
+    "coordinate_system": "base_link-relative, position divided by bbox_radius, quaternion hemisphere-normalized",
+    "urdf": "b/d/Frk/fr3v2_1_franka_hand.urdf"
+  }

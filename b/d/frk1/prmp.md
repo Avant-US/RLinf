@@ -17,3 +17,21 @@
 
 
 请基于上述要求, 对文档 `4wvla_rlinf_1.md` 和 `4wvla_rlinf_eval_1.md` 进行改良.
+
+---
+按 @RLinf/b/d/frk1/4wvla_rlinf_2.md 进行实现, 并进行测试和验收. 过程中若遇到error就fix, 直到所有测试和验收都通过. 记录所有训练过程中的一切细节, 包括但不限于:所有的error及其根因分析, fix方案, 记录所有的操作, 命令, 关键路径和任何文件的增删改以及做这些操作的原因, 过程中的一切细节都记录在  @RLinf/b/d/frk1/4wvla_rlinf_2_0909LOG.md 后面. 
+
+# 4wvla 推理2
+
+参考 @RLinf/b/d/frk1/franka_3LOG.md , @RLinf/b/d/frk1/dmo_place_1LOG.md, @RLinf/b/d/frk1/dmo_place_1.md , @RLinf/b/d/frk1/dmo_place_2LOG.md , @RLinf/b/d/frk1/dmo_place_2.md , @RLinf/b/d/frk1/franka_3.md 中的真机RL方案和实践日志, 里面也有双容器部署与通过 franky 和 libfranka 去操控 Franka 机器人的内容.
+
+参考 @4WVLA/b/d/Frk/dta_4dtrj_plan_0904LOG.md , @4WVLA/b/d/Frk/dta_4dtrj_plan.md 中处理训练数据的方案和实践日志. 参考 @4WVLA/b/d/Frk/plug_p1warmup_0907LOG.md , @4WVLA/b/d/Frk/plug_p1warmup.md , @4WVLA/b/d/Frk/plug_p2sft_0907LOG.md , @4WVLA/b/d/Frk/plug_p2sft.md 中的训练方案和实践日志. 我们要用到的checkpoint ( /home/nvidia/bt/ckp/4wvlaFrk/plug/4wvlaFrkPlugCkp010420/ ) 就是基于这些数据处理方案, 训练方案, 训练而得到的. 特别要注意这些方案中的 bbox 和 归一化 相关内容, 部署推理时必须与其一致.
+
+对于 @RLinf/b/d/frk1/4wvla_rlinf_eval_2.md, 我有如下改良要求:
+- 通过 RLinf 的插件或扩展模式进行功能的增加, 尽量不改 RLinf 原来的代码.
+- 使用类似真机RL的双docker容器方案.
+- 要使用 @RLinf/b/x/franky_ext/ 中的 env 和 controller, 通过 franky 和 libfranka 去操控 Franka 机器人, 不要通过ROS.
+- 注意参考上面提到的数据处理方案, 训练方案以及相关日志等, 注意训推一致性, 特别要注意这些方案中的 bbox 和 归一化 相关内容, 部署推理时必须与其一致.
+- 测试和验收方案要分成"需要连真机"的和"不需要连真机"的两类, 以便不连真机就可以做尽量完善的测试.
+
+请根据我的要求, 对`4wvla_rlinf_eval_2.md`做改良.
