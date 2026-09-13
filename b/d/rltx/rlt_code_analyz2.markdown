@@ -3297,3 +3297,1077 @@ flowchart TB
 
 **一句话**：RLT Critic 把每个 10 步 action chunk 当作宏动作，用 \(\sum_{k=0}^{9}\gamma^k r_k + (1-\text{done})\cdot\gamma^{10} Q_{\text{target}}(s', \pi(s'))\) 作 TD 目标，在 **冻结的 `z_rl` 特征空间** 里只训练 **`q_head`**；真机操作员通过执行任务产生 chunk 级奖励与 transition，Critic 在 Actor Worker 中异步从 replay 学习「这段 chunk 值多少」，成功终止时不 bootstrap，以匹配 peg insertion 的稀疏终止奖励结构。
 
+
+# rlt.rst中的action loss
+
+## 文档公式与代码的对应关系
+
+[`rlt.rst:306-314`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 中的公式在代码里实现为：
+
+```351:351:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
+```
+
+| 文档符号 | 代码变量 | 默认权重（Franka） |
+|----------|----------|-------------------|
+| `Q(obs, π(obs))` | `qf_pi` = `Q1(curr_obs, pi)` | `q_weight=0.1` |
+| `BC(π(obs), target_action)` | `bc_loss` = 对 `bc_target` 的 MSE | `bc_weight=5` |
+| `target_action` | `bc_target`（逐步选择） | — |
+
+配置见 [`realworld_rlt_stage2_ac_mlp.yaml:74-79`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)。
+
+---
+
+## 一、术语：Q、BC、target_action、BC target 是什么、从哪来
+
+### 1. `obs`（actor 的输入，不是原始图像）
+
+Actor 用的 `curr_obs` 是 RLT 三元组（由 **冻结** feature model 在 rollout 时编码）：
+
+```text
+curr_obs = {
+  z_rl:      [B, 2048]    # RLT token 特征
+  proprio:   [B, 19]      # 机器人状态
+  ref_chunk: [B, 20×7]    # VLA 参考动作 chunk（actor 只用前 10 步）
+}
+```
+
+Actor 实际拼接输入（[`rlt_mlp_policy._actor_state`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py)）：
+
+\[
+\text{actor\_input} = [\,\text{ref\_chunk}_{:10} \;\|\; z_{rl} \;\|\; \text{proprio}\,] \in \mathbb{R}^{70+2048+19}
+\]
+
+### 2. `π(obs)` — 当前策略输出的动作
+
+训练时 **重新前向**（不是 replay 里存的历史动作）：
+
+```138:158:rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py
+    def sac_forward(self, obs, apply_reference_dropout=False, reference_dropout_prob=0.0, ...):
+        actor_state = self._actor_state(obs, apply_reference_dropout=..., ...)
+        feat = self.backbone(actor_state)
+        action_mean = self.actor_mean(feat)
+        action_std = torch.full_like(action_mean, self.fixed_std)   # 固定 0.002
+        probs = Normal(action_mean, action_std)
+        action = probs.rsample()    # 训练：随机采样
+        action = torch.tanh(action)
+        return action, chunk_logprobs, None
+```
+
+- **输出 `pi`**：`[B, 70]`（10 步 × 7 维，flatten）
+- **含义**：在当前 RLT 状态下，MLP actor 建议的 **整段 action chunk**
+
+### 3. `Q(obs, π(obs))` — Actor 目标里的 Q 值
+
+```315:337:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        all_qf_pi = self.model(
+            forward_type=ForwardType.SAC_Q,
+            obs=curr_obs,
+            actions=pi,
+            detach_encoder=True,
+        )
+        qf_pi = self._q1(all_qf_pi)   # 取 Q1，不是 min(Q1,Q2)
+```
+
+Critic 状态与 Q 头（[`rlt_mlp_policy.sac_q_forward`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py)）：
+
+```text
+critic_state = concat(z_rl, proprio)   # [B, 2067]，detach_encoder 时无梯度
+Q1, Q2 = q_head(critic_state, pi)       # 各 [B, 1]，chunk 级标量
+```
+
+- **`Q` 的含义**：「在状态 `obs` 下，若执行策略刚采样的 chunk `π(obs)`，预期回报是多少？」
+- **由谁提供**：**在线 `q_head`**（Critic 上一步/同步步刚更新过）
+- **`detach_encoder=True`**：`z_rl/proprio` 不进 Q 项的梯度；Q 对 `pi` 的梯度经 `q_head` 的动作通路回传到 `backbone` + `actor_mean`
+
+### 4. `BC` 与 `target_action` / BC target
+
+BC 在 [`_bc_metrics`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py) 中实现：
+
+```123:125:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
+        bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
+        bc_loss = torch.mean(bc_error)
+```
+
+| 概念 | 代码 | 形状 | 来源 |
+|------|------|------|------|
+| **`bc_ref_chunk`** | `curr_obs["ref_chunk"][:, :10]` | `[B,10,7]` | 冻结 VLA 每步推理的 reference |
+| **`action_chunk`** | `batch["actions"]` | `[B,10,7]` | Replay 里 **实际执行** 的动作 |
+| **`human_mask`** | `intervene_flags` 按子步聚合 | `[B,10]` | 该子步是否人工干预 |
+| **`bc_target`（即文档 `target_action`）** | `where(human, 执行动作, VLA ref)` | `[B,10,7]` | 逐步选择 |
+| **`BC`** | `mean((π - bc_target)²)` | 标量 | MSE |
+
+文档 312–314 行的两种 BC target：
+
+- **普通步**：`target_action = VLA reference` → `bc_ref_chunk`
+- **人工干预步**：`target_action = 人类动作` → `action_chunk`（replay 里存的真实执行轨迹）
+
+---
+
+## 二、Actor loss 逐步计算（代码级）
+
+以 Franka 单条样本为例（`q_weight=0.1`, `bc_weight=5`, `reference_dropout_prob=0.5`）：
+
+### Step 0：从 Replay 采样 batch
+
+```python
+batch = {
+  "curr_obs": {z_rl, proprio, ref_chunk},   # 见上
+  "actions":  [256, 70],                     # 历史执行动作（label 来源之一）
+  "intervene_flags": [256, 10] 或 None,     # 人工干预掩码
+  ...
+}
+```
+
+### Step 1：算 `π(obs)` — `ForwardType.SAC`
+
+```305:310:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        pi, log_pi, _ = self.model(
+            forward_type=ForwardType.SAC,
+            obs=curr_obs,
+            apply_reference_dropout=True,
+            reference_dropout_prob=0.5,
+        )
+```
+
+内部调用链：
+
+```text
+RLTACLossMixin.forward_actor
+  → RLTMLPPolicy.forward(SAC)
+    → sac_forward
+      → _actor_state(ref_chunk, z_rl, proprio)  # 50% 概率 zero ref_chunk
+      → backbone(256→256→256 MLP)
+      → actor_mean → Normal(μ, 0.002) → rsample → tanh
+      → pi [B, 70]
+```
+
+### Step 2：算 `Q(obs, π)` — `ForwardType.SAC_Q`
+
+```text
+  → sac_q_forward(curr_obs, pi, detach_encoder=True)
+      → critic_state = [z_rl|proprio].detach()
+      → q_head(critic_state, pi) → [Q1, Q2]
+  → qf_pi = Q1  [B, 1]
+```
+
+### Step 3：算 `BC(π, target_action)`
+
+```text
+  → _bc_metrics(pi, batch["actions"], ref_chunk, intervene_flags)
+      → pi_chunk, action_chunk, bc_ref_chunk  各 reshape 为 [B,10,7]
+      → human_mask = intervene_flags.any(dim=-1) per sub-step
+      → bc_target = where(human_mask, action_chunk, bc_ref_chunk)
+      → bc_loss = mean((pi_chunk - bc_target)²)
+```
+
+### Step 4：合成 `actor_loss` 并反传
+
+```text
+actor_loss = -0.1 * mean(Q1) + 5.0 * bc_loss
+
+actor_loss.backward()
+  → 更新 backbone, actor_mean（self.optimizer）
+  → 不更新 q_head（actor 步不用 qf_optimizer）
+```
+
+**注意**：`log_pi` 会算 entropy 指标，但 **不加进 loss**（`initial_alpha=0`，`forward_alpha` 禁用）——不是 max-entropy SAC。
+
+---
+
+## 三、数据从哪来：replay 里 `actions` 与 `intervene_flags` 的生成
+
+### 3.1 真机 Franka 路径
+
+```mermaid
+sequenceDiagram
+    participant H as 人（b / SpaceMouse）
+    participant Env as Env Worker
+    participant Roll as Rollout Worker
+    participant FM as 冻结 feature model
+    participant RB as Replay Buffer
+
+    H->>Env: 操作机器人
+    Env->>Roll: obs + rlt_switch_flags
+    Roll->>FM: extract_rlt_obs → z_rl, ref_chunk
+    Roll->>Roll: MLP 推理 student_actions
+    Roll->>Roll: RealworldRLTRoute: b前用ref，b后用actor
+    Roll-->>Env: routed_actions（写入 forward_inputs["action"]）
+    Env->>Env: chunk_step 10 子步；SpaceMouse 可能覆盖动作
+    Env->>RB: actions=实际执行；intervene_flags 经 update_last_actions
+    Env->>RB: curr_obs / next_obs（update_rlt_transitions）
+```
+
+关键代码：
+
+- **执行动作写入 replay**：`forward_inputs["action"]`（route 后 + 可能的 SpaceMouse 修正）
+- **SpaceMouse 干预**（[`spacemouse_intervention.py:76-85`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/wrappers/spacemouse_intervention.py)）：0.5s 内有输入 → 用专家动作，写 `intervene_action`
+- **下一步迭代** [`update_last_actions`](https://github.com/RLinf/RLinf/blob/main/rlinf/data/schema/embodied_trajectory_builder.py)：把人工动作写回上一条 transition 的 `actions` 和 `intervene_flags`
+- **Transition 存储** [`update_rlt_transitions`](https://github.com/RLinf/RLinf/blob/main/rlinf/algorithms/rlt/transition.py)：若干预，还会把 `curr_obs["ref_chunk"]` 对应槽位替换成人工动作（供后续 obs 一致性）
+
+### 3.2 ManiSkill 路径（文档 314 行）
+
+[`SimulatorRLTRoute`](https://github.com/RLinf/RLinf/blob/main/rlinf/algorithms/rlt/route.py) 在 `expert_takeover` 开启时：
+
+- 用 **expert model** 替换 routed action
+- 设 `intervene_flags[expert_takeover]=True`
+- 把 expert 动作写进 `ref_chunk`
+
+默认配置 **`expert_takeover` 关闭** → 只有 VLA ref 与 actor 两路，无仿真专家 BC。
+
+---
+
+## 四、训练运行时：谁做什么、权重怎么变
+
+### 4.1 异步三 Worker（Franka Stage 2）
+
+| 模块 | 节点 | Actor loss 相关职责 | 权重 |
+|------|------|---------------------|------|
+| **`rlt_feature_model`** | GPU Rollout | 每步 `extract_rlt_obs` | **冻结**（`eval()` + `requires_grad_(False)`） |
+| **`rollout.hf_model`** | GPU Rollout | 推理 π（采集数据） | **不本地训练**；周期性从 Actor 同步 |
+| **`RLTMLPPolicy`（Actor Worker）** | GPU Actor | **计算并反传 actor_loss** | 见下表 |
+| **Env Worker** | Franka 节点 | 执行动作、计 reward、写 replay | 无 NN 权重 |
+| **人** | 真机旁 | 按 `b`、SpaceMouse 干预 | 无 |
+
+### 4.2 Actor Worker 内参数分工
+
+| 子模块 | Actor loss 中的角色 | 优化器 | 更新频率 |
+|--------|---------------------|--------|----------|
+| **`backbone`** | 生成 `π(obs)`；BC 与 Q 项均反传 | `self.optimizer` | 每 **4** 次 critic 更新 1 次（`critic_actor_ratio: 4`） |
+| **`actor_mean`** | 同上 | `self.optimizer` | 同上 |
+| **`q_head`** | 仅 **评估** `Q(obs,π)`，actor 步不更新 | `qf_optimizer` | Critic 步单独更新 |
+| **`target_model`** | Actor loss **不用** | EMA | Critic 专用 |
+
+一次 `update_one_epoch`（[`fsdp_sac_policy_worker.py:551-619`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_sac_policy_worker.py)）：
+
+1. **每 epoch、每 micro-batch**：`forward_critic` → 更新 `q_head`
+2. **若 `update_step % 4 == 0`**：`forward_actor` → 更新 `backbone` + `actor_mean`
+3. **`update_epoch: 8`**：同一批 replay 数据重复 8 轮 SGD
+
+### 4.3 人在 Actor 训练中的作用
+
+| 操作 | 对 Actor loss 的影响 |
+|------|---------------------|
+| **不按 b** | `actions`≈VLA ref；BC 拉 π 向 ref；Q 项评估 VLA 轨迹附近价值 |
+| **按 b 后** | `actions`=actor 输出；BC 仍锚定 VLA ref（`bc_ref_chunk`），Q 项鼓励高回报修正 |
+| **SpaceMouse** | `intervene_flags=True` 的子步：`bc_target`→**人工动作**；BC 学专家示范 |
+| **任务成功/失败** | 通过 Critic 间接影响 Q 项（Actor 用 **当前** `q_head` 评估 π） |
+
+人 **不直接参与** 梯度计算；只通过 replay 里的 `(obs, actions, intervene_flags, rewards)` 塑造 loss。
+
+---
+
+## 五、模块与代码调用关系
+
+```mermaid
+flowchart TB
+    subgraph 采集["Rollout / Env（无 actor loss）"]
+        FM["rlt_feature_model 冻结"]
+        HF["hf_model 推理"]
+        RT["RealworldRLTRoute"]
+        FM --> HF
+        HF --> RT
+        RT --> RB["Replay Buffer"]
+    end
+
+    subgraph 训练["Actor Worker: forward_actor"]
+        SAMP["replay.sample → batch"]
+        SAC["model(SAC) → pi"]
+        SACQ["model(SAC_Q, detach_encoder) → Q1"]
+        BC["_bc_metrics → bc_loss"]
+        LOSS["actor_loss = -qw·Q1 + bcw·BC"]
+        OPT["optimizer.step → backbone, actor_mean"]
+
+        SAMP --> SAC --> SACQ
+        SAMP --> BC
+        SAC --> BC
+        SACQ --> LOSS
+        BC --> LOSS
+        LOSS --> OPT
+    end
+
+    RB --> SAMP
+```
+
+类继承关系：
+
+```text
+AsyncRLTACFSDPPolicy
+  ├─ RLTACLossMixin      # forward_actor, forward_critic, _bc_metrics
+  ├─ RLTACReplayMixin    # rollout → replay  ingestion
+  └─ AsyncEmbodiedSACFSDPPolicy
+       └─ EmbodiedSACFSDPPolicy  # update_one_epoch, optimizers, target_model
+```
+
+模型前向路由（[`mlp_policy.forward`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/mlp_policy/mlp_policy.py)）：
+
+```text
+ForwardType.SAC   → RLTMLPPolicy.sac_forward   → backbone + actor_mean
+ForwardType.SAC_Q → RLTMLPPolicy.sac_q_forward → q_head（+ detached critic_state）
+```
+
+---
+
+## 六、数值例子（单样本直觉）
+
+设某 transition（已按 b，无 SpaceMouse）：
+
+- `bc_ref_chunk` = VLA 建议 `[10,7]`
+- `batch["actions"]` = actor 实际执行（略偏离 ref）
+- 重新前向得 `pi_chunk`
+
+**BC 项**（`bc_weight=5`）：
+
+\[
+\text{bc\_loss} = \text{mean}\big(\|\pi - \text{ref\_chunk}\|^2\big),\quad
+\text{weighted} = 5 \times \text{bc\_loss}
+\]
+
+→ 把 π **锚在 VLA 附近**，防止 RL 探索飘太远。
+
+**Q 项**（`q_weight=0.1`，设 `Q1=2.0`）：
+
+\[
+\text{weighted} = -0.1 \times 2.0 = -0.2
+\]
+
+→ 梯度 **增大 π 在 Q 意义下的回报**（Q 高则 loss 更负）。
+
+若同 chunk 第 3 子步有 SpaceMouse 干预：
+
+- `human_mask[2]=True`
+- `bc_target[2] = action_chunk[2]`（人工动作，非 VLA）
+- BC 在该子步学 **模仿人**，而非 VLA。
+
+---
+
+## 七、设计思路：为什么这样实现
+
+### 7.1 为什么是 `-q_weight·Q + bc_weight·BC`（而非标准 SAC actor）
+
+| 设计选择 | 原因 |
+|----------|------|
+| **BC 锚定 VLA ref** | Stage 1 已有强 prior；Stage 2 学 **residual 修正**，不是从零控制 |
+| **Q 项权重小**（Franka 0.1 vs BC 5） | 真机样本少，纯 RL 易不稳定；BC 主导安全与可复现 |
+| **固定小 std（0.002）+ 无熵项** | 近确定性策略，适合 peg insertion 精细阶段 |
+| **用 Q1 而非 min(Q1,Q2)**（`actor_agg_q: q1`） | Actor 可更积极利用 Q1 信号；Critic target 仍用 min 抑过估计 |
+
+ManiSkill 可用 [`actor_weight_schedule`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/maniskill_rlt_stage2_ac_mlp.yaml)：warmup 高 BC、低 Q，后期渐增 Q——先模仿后优化。
+
+### 7.2 为什么 BC target 分 VLA / 人工两路
+
+- **VLA ref**：未干预时，最佳监督是 Stage 1 示范轨迹（与 RLT 论文一致）
+- **人工动作**：SpaceMouse / expert takeover 时，**真实意图** 来自人/专家，而非 VLA；切换 `bc_target` 避免 BC 把 π 拉向错误的 VLA 段
+
+### 7.3 为什么 `reference_dropout_prob=0.5`
+
+训练 actor 时随机 **置零 ref_chunk 输入**，迫使 π 也依赖 `z_rl + proprio`，避免过拟合「复制 ref」、提升按 b 后无 VLA 执行时的鲁棒性。
+
+### 7.4 为什么 Q 项 `detach_encoder`
+
+- `z_rl` 来自 **冻结** feature model，本就不该反传
+- 即使不 detach，也无 VLA 梯度；detach 明确：**Actor 步只更新 MLP actor，不碰 Q 头、不碰特征**
+
+### 7.5 为什么 Actor / Critic 分优化器、4:1 更新比
+
+Critic 需先提供可靠 `Q(s,a)`，Actor 再追 Q；更频繁的 Critic 更新 + 较慢 Actor 更新，是在线 off-policy 常见稳定手段。
+
+### 7.6 为什么训练时重算 `π(obs)` 而非用 replay 里的旧动作
+
+Actor loss 要对 **当前策略参数** 求梯度，必须重新前向；replay 里的 `actions` 仅作 **BC label**（执行轨迹 / 人工示范），不是 π 本身。
+
+---
+
+## 八、与 Critic 训练的边界（避免混淆）
+
+| | **Actor loss**（本节） | **Critic loss**（上一节） |
+|--|------------------------|---------------------------|
+| 公式 | `-qw·Q1(s,π) + bcw·MSE(π, target)` | `MSE(Q(s,a), TD_target)` |
+| 更新的权重 | `backbone`, `actor_mean` | `q_head` |
+| 用的动作 | **当前** `π(obs)` | replay 里的 **历史** `a` |
+| `a` / target 来源 | BC：`ref_chunk` 或人工 | TD：chunk 折扣 reward + bootstrap |
+
+两者共用 replay 的 `curr_obs`，但 **优化目标、参数、用的动作版本不同**。
+
+---
+
+**一句话总结**：Stage 2 的 actor loss 在 Actor Worker 里对 replay 采样的 `curr_obs` 重新采样得到 `π(obs)`，用 **冻结特征下的 Q1** 提供小幅策略改进信号（`-0.1·Q`），用 **对 VLA ref 或人工动作的 MSE** 提供主要行为锚定（`5·BC`）；`backbone` 与 `actor_mean` 每 4 个 critic 步更新一次，feature model 与 `q_head` 在 actor 步分别保持冻结与仅前向评估——这是「在 VLA prior 上做保守、可干预的在线 residual RL」在代码里的直接体现。
+
+
+# rlt.rst 所说的Franka数据采集及其归一化统计
+
+## 结论
+
+**这是人工遥操作采集的示范数据（demonstration），不是机器人随机或策略随机跑出来的数据。**
+
+文档 319 行也写的是「采集 Franka **示范**」，对应 Stage 1 的 SFT 训练。
+
+---
+
+## 依据
+
+### 1. 采集脚本里没有策略 / Rollout
+
+`collect_data.sh` 调用的是 [`collect_real_data.py`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/collect_real_data.py)，只有 `DataCollector` + 真机 `RealWorldEnv`，**没有** Rollout Worker、没有 VLA/RL 策略、也没有随机动作采样器。
+
+### 2. 每步动作：默认零动作 + 遥操作覆盖
+
+```132:143:examples/embodiment/collect_real_data.py
+            # Teleop wrapper overrides this via info["intervene_action"].
+            action = np.zeros((1, self.action_dim))
+            next_obs, reward, terminated, truncated, info = self.env.step(action)
+            ...
+            if "intervene_action" in info:
+                action = info["intervene_action"]
+```
+
+- 发给 env 的 policy 动作是 **全零**（机器人不会自己乱动）。
+- 操作员用 **SpaceMouse** 等遥操作设备输入时，`SpacemouseIntervention` 会写入 `intervene_action`，**实际运动来自人**。
+
+### 3. 默认配置启用 SpaceMouse
+
+[`realworld_collect_data.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_collect_data.yaml)：
+
+```yaml
+use_spacemouse: True
+```
+
+也可用 GELLO / Pico 等变体（如 `realworld_collect_data_gello.yaml`），见 [Franka 文档](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/franka.rst)——都是 **遥操作采集**。
+
+### 4. 保存的数据被标成「全程人工」
+
+成功 episode 入库时：
+
+```210:212:examples/embodiment/collect_real_data.py
+                    trajectory.intervene_flags = torch.ones_like(
+                        trajectory.intervene_flags
+                    )
+```
+
+表示整条轨迹都是人工示范，不是自主策略轨迹。
+
+### 5. 只保留成功轨迹
+
+`only_success: True`（配置里），失败 episode 丢弃——典型 **人类示范 + 成功筛选** 流程。
+
+---
+
+## 和「随机」的关系（容易混淆的一点）
+
+Peg insertion 任务可在 **reset 时对末端位姿做随机扰动**（`enable_random_reset`、xy/rz 小范围随机），那是 **初始条件随机化**，增加示范多样性；**episode 内的运动仍由人遥操作完成**，不是机器人随机探索。
+
+---
+
+## 与 `rlt.rst` 配置片段的差异
+
+文档 327–332 行建议 `export_format: "lerobot"`；仓库默认 [`realworld_collect_data.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_collect_data.yaml) 里是 `export_format: "pickle"`。采集方式都是遥操作，只是导出格式需按 Stage 1 要求改成 LeRobot。
+
+---
+
+**一句话**：`bash examples/embodiment/collect_data.sh realworld_collect_data` 启动的是 **操作员用 SpaceMouse（或 GELLO 等）遥操作 Franka 做 peg insertion 示范并录成数据集**；不是 RL 随机 rollout，也不是自主策略采集。
+
+---
+
+## 以下讨论归一化统计
+
+## 结论先说
+
+[`rlt.rst:340-351`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 这一步，是在 **你已有人工遥操作采集的 LeRobot 数据集** 上，用 OpenPI 的 **`pi05_franka_state` 数据管线** 扫一遍数据，对 **`state` 和 `actions` 两个张量** 统计 **mean / std / q01 / q99**，写入 `norm_stats.json`。  
+Stage 1 SFT 和 Stage 2 冻结 VLA 推理时，用同一套 stats 做 **Normalize / Unnormalize**，保证训练与部署尺度一致。
+
+**不是**对图像做 ImageNet 式归一化；**也几乎不依赖** 预训练 checkpoint 里自带的 stats（Franka 真机数据需 **在你自己的 demo 上重算**）。
+
+---
+
+## 1. 命令在做什么
+
+```bash
+export HF_LEROBOT_HOME=/path/to/lerobot_root
+python toolkits/lerobot/calculate_norm_stats.py \
+    --config-name pi05_franka_state \
+    --repo-id realworld_peg_insertion_rlt_stage1
+```
+
+入口脚本：[`toolkits/lerobot/calculate_norm_stats.py`](https://github.com/RLinf/RLinf/blob/main/toolkits/lerobot/calculate_norm_stats.py)。
+
+| 参数 | 作用 |
+|------|------|
+| `HF_LEROBOT_HOME` | LeRobot 数据集根目录；本地数据集也可直接作为路径解析 |
+| `--config-name pi05_franka_state` | 选用 Franka + Pi0.5 + **离散 state 输入** 的 OpenPI dataconfig |
+| `--repo-id realworld_peg_insertion_rlt_stage1` | 数据集 ID，须与 Stage 1/2 YAML 里 `openpi_data.repo_id` **完全一致** |
+
+---
+
+## 2. 数据集从哪来、长什么样
+
+前置步骤是 **SpaceMouse 人工遥操作** 采集并导出 LeRobot（`data/` + `meta/`）。每帧大致包含（[`collect_episode._buffer_to_lerobot_ep`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/wrappers/collect_episode.py)）：
+
+| 字段 | 含义 | 典型形状 |
+|------|------|----------|
+| `image` | 主相机 RGB | H×W×3 |
+| `state` | 机器人 proprio（`states` 拼接） | ~19–20 维 float |
+| `actions` | **实际执行**的单步动作 | **7 维**（Franka EE + gripper） |
+| `task` | 语言指令 | 字符串（统计时会被去掉） |
+
+脚本会先检查数据集是否存在：
+
+```110:117:toolkits/lerobot/calculate_norm_stats.py
+    dataset_root = resolve_lerobot_dataset_root(repo_id)
+    if not (dataset_root / "meta" / "info.json").is_file():
+        raise FileNotFoundError(...)
+```
+
+解析顺序（[`resolve_lerobot_dataset_root`](https://github.com/RLinf/RLinf/blob/main/rlinf/data/storage/lerobot/paths.py)）：
+
+1. 若 `repo_id` 本身是含 `meta/info.json` 的本地路径 → 直接用  
+2. 否则 → `$HF_LEROBOT_HOME/<repo_id>/`（默认 `~/.cache/huggingface/lerobot/<repo_id>/`）
+
+---
+
+## 3. `pi05_franka_state` 决定了什么
+
+注册于 [`rlinf/models/embodiment/openpi/dataconfig/__init__.py`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/openpi/dataconfig/__init__.py)：
+
+```228:240:rlinf/models/embodiment/openpi/dataconfig/__init__.py
+        name="pi05_franka_state",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=20, discrete_state_input=True
+        ),
+        data=LeRobotFrankaEEDataConfig(
+            ...
+            output_action_dim=7,
+            pad_state=False,   # 不把 state pad 到 32 维
+        ),
+```
+
+对 **统计计算** 关键的是 [`LeRobotFrankaEEDataConfig`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/openpi/dataconfig/franka_co_training_dataconfig.py) 里的 transform 链：
+
+```mermaid
+flowchart LR
+    A["LeRobot 原始帧"] --> B["RepackTransform<br/>image/state/actions/prompt"]
+    B --> C["FrankaEEInputs<br/>解析图像、保留 state<br/>actions pad 到 model action_dim=32"]
+    C --> D["RemoveStrings"]
+    D --> E["RunningStats 统计<br/>keys: state, actions"]
+```
+
+[`FrankaEEInputs`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/openpi/policies/franka_policy.py) 要点：
+
+- **`pad_state=False`**（RLT Franka）：`state` **保持数据集原始维度**（与真机 `states` 拼接一致，约 19–20 维；Stage 2 配置里 `proprio_dim: 19` 是 RLT 特征侧用法，统计仍以 dataconfig 为准）。
+- **`actions`**：在统计前会被 **pad 到 Pi0 的 `action_dim=32`**（仅尾部 7 维有物理含义，其余为 0 padding）。
+- **图像不参与** `calculate_norm_stats`（脚本只统计 `keys = ["state", "actions"]`）。
+
+`extra_delta_transform=False`：Franka 默认 **不做** delta action 变换；统计的是 LeRobot 里存的 **绝对/原始动作**（与 SFT 训练一致）。
+
+---
+
+## 4. 统计量怎么算（核心算法）
+
+```137:148:toolkits/lerobot/calculate_norm_stats.py
+    keys = ["state", "actions"]
+    stats = {key: normalize.RunningStats() for key in keys}
+
+    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+        for key in keys:
+            stats[key].update(np.asarray(batch[key]))
+
+    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    ...
+    normalize.save(output_path, norm_stats)
+```
+
+[`RunningStats`](https://github.com/Physical-Intelligence/openpi/blob/main/src/openpi/shared/normalize.py)（OpenPI 实现）对每个 key 的 **最后一维** 做在线聚合：
+
+| 输出字段 | 含义 |
+|----------|------|
+| `mean` | 逐维均值 |
+| `std` | 逐维标准差 \(\sqrt{E[x^2]-E[x]^2}\) |
+| `q01` | 逐维 **1% 分位数**（直方图近似） |
+| `q99` | 逐维 **99% 分位数** |
+
+要求至少 2 个样本向量才能输出（`count >= 2`）。
+
+DataLoader 会遍历 LeRobot 数据集（`action_horizon=20` 的 chunk 采样），**把所有 batch 里的 state/actions 帧都喂进 RunningStats**，等价于在整个 demo 集合上估计分布。
+
+---
+
+## 5. 归一化公式：Pi0.5 用分位数，不是 z-score
+
+`pi05_franka_state` 的模型类型是 **PI05**，OpenPI 里：
+
+```python
+use_quantile_norm = (model_type != ModelType.PI0)  # PI05 → True
+```
+
+训练/推理时的 [`Normalize`](https://github.com/Physical-Intelligence/openpi/blob/main/src/openpi/transforms.py) 使用 **分位数归一化**（默认 `use_quantiles=True`）：
+
+\[
+x_{\text{norm}} = \frac{x - q_{01}}{q_{99} - q_{01} + \epsilon} \times 2 - 1
+\]
+
+近似把每维压到 **[-1, 1]**，对真机动作/状态的长尾分布比 z-score 更稳。
+
+反归一化 [`Unnormalize`](https://github.com/Physical-Intelligence/openpi/blob/main/src/openpi/transforms.py) 在推理输出 action 时用，Stage 2 feature model 的 `ref_chunk` 也依赖同一套 stats。
+
+---
+
+## 6. 输出文件放哪、JSON 长什么样
+
+```146:148:toolkits/lerobot/calculate_norm_stats.py
+    output_path = config.assets_dirs / data_config.repo_id
+    normalize.save(output_path, norm_stats)
+```
+
+典型路径（相对运行脚本时的 cwd）：
+
+```text
+<assets_base_dir>/pi05_franka_state/realworld_peg_insertion_rlt_stage1/norm_stats.json
+```
+
+`norm_stats.json` 结构（OpenPI 格式）：
+
+```json
+{
+  "norm_stats": {
+    "state": {
+      "mean": [...],
+      "std": [...],
+      "q01": [...],
+      "q99": [...]
+    },
+    "actions": {
+      "mean": [...],
+      "std": [...],
+      "q01": [...],
+      "q99": [...]
+    }
+  }
+}
+```
+
+`actions` 侧长度为 **32**（含 padding 维）；**有效 7 维** 对应 Franka 控制，padding 维 stats 通常接近 0。
+
+---
+
+## 7. Stage 1 / Stage 2 怎么消费这套 stats
+
+文档 351 行：把 stats 放到训练节点，并与 checkpoint 对齐。
+
+**加载优先级**（[`openpi_rlinf/transforms_pipeline.py`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/openpi_rlinf/transforms_pipeline.py)）：
+
+1. `openpi_data.norm_stats_path` 显式指向 `norm_stats.json`  
+2. 否则 `<model_path>/<repo_id>/norm_stats.json`  
+3. SFT 实验的 `assets_dir / asset_id`
+
+Stage 1（[`realworld_rlt_stage1_sft_openpi_pi05.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml)）：
+
+```yaml
+openpi_data:
+  repo_id: "realworld_peg_insertion_rlt_stage1"  # 与 calculate 时一致
+openpi:
+  config_name: "pi05_franka_state"
+```
+
+Stage 2 冻结 feature model（[`realworld_rlt_stage2_ac_mlp.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）同样 `config_name: pi05_franka_state` + 同一 `repo_id`，保证 **SFT 与在线 RL 用同一 normalization**。
+
+推荐目录布局（与 [Franka Pi0 部署文档](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/franka_pi0_sft_deploy.rst) 一致）：
+
+```text
+/path/to/pi0-base-or-stage1-checkpoint/
+├── model.safetensors
+└── realworld_peg_insertion_rlt_stage1/
+    └── norm_stats.json    ← 由 calculate_norm_stats 生成后拷贝到此
+```
+
+若 Stage 1 checkpoint 已打包 stats，可跳过单独配置；否则在 YAML 里设：
+
+```yaml
+openpi_data:
+  norm_stats_path: /path/to/norm_stats.json
+```
+
+---
+
+## 8. 端到端数据流（从采集到训练）
+
+```mermaid
+sequenceDiagram
+    participant H as 操作员 SpaceMouse
+    participant E as Franka + CollectEpisode
+    participant L as LeRobot 数据集
+    participant C as calculate_norm_stats.py
+    participant S as Stage1 SFT / Stage2 feature model
+
+    H->>E: 遥操作示范
+    E->>L: 导出 state, actions, image, task
+    C->>L: 读取 HF_LEROBOT_HOME/repo_id
+    C->>C: pi05_franka_state transforms
+    C->>C: RunningStats(state, actions)
+    C->>C: 写 norm_stats.json
+    S->>S: Normalize(state, actions) 训练/推理
+    S->>S: Unnormalize(actions) 输出到机器人空间
+```
+
+---
+
+## 9. 设计原因（为什么要单独算、为什么要这样算）
+
+1. **必须用本机 demo 的分布**：预训练 Pi0.5 的 stats 来自别的机器人/任务；Franka peg insertion 的状态范围、动作尺度不同，复用会导致 Normalize 失真、SFT 和 flow matching 难收敛。  
+2. **与训练 pipeline 严格同构**：统计前走 **同一套** `RepackTransform + FrankaEEInputs`，保证「算 stats 的向量」=「训练时喂模型的向量」。  
+3. **只统计 state/actions**：VLM 图像走 Pi0 内部视觉编码；语言是 token，不需要这套 stats。  
+4. **Pi0.5 分位数归一化**：真机动作/力/位姿常有 outlier；q01–q99 比 mean/std 更鲁棒。  
+5. **`repo_id` 作为 asset 键**：同一 base model 可挂多套 stats（不同任务/数据集），Stage 1/2 通过相同 `repo_id` 锁定同一套。
+
+---
+
+## 10. 实操注意
+
+| 项 | 说明 |
+|----|------|
+| 采集格式 | 文档要求 `export_format: "lerobot"`；默认 `realworld_collect_data.yaml` 是 `pickle`，做 RLT 前需改配置 |
+| 样本量 | 默认采 20 条成功 episode（`num_data_episodes: 20`）；stats 质量随 demo 数量/多样性提升 |
+| 与 RLT MLP 的关系 | Stage 2 的 `proprio_dim/z_dim` **不用** 这份 `norm_stats.json`；那是 **OpenPI/VLA 专用**；MLP 吃的是 Stage 1 产出的 `z_rl` 和原始 `proprio` |
+| 运行环境 | 需已安装 **openpi**（脚本 `import openpi.*`） |
+
+---
+
+**一句话**：这一步是在 **你的人工 LeRobot 示范数据** 上，按 **`pi05_franka_state` 与 SFT 完全相同的数据变换**，对 **state（原始 proprio）和 actions（pad 到 32 维）** 估计 **分位数归一化参数**，写入 **`…/<repo_id>/norm_stats.json`**，供 Stage 1 训练与 Stage 2 冻结 VLA 特征提取统一使用；**不是随机 rollout 数据统计，也不是图像归一化**。
+
+# rlt.rst提到的keyboard_rlt_policy_switch_wrapper.py
+
+
+## 先澄清：「按 `b` 进入 Stage 2 actor」指什么
+
+[`rlt.rst:432-434`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 里的 **Stage 2 actor 控制阶段**，指的是 **在线 rollout 内的动作路由切换**，不是重新启动训练或加载新模型。
+
+- **按 `b` 之前**：机器人执行冻结 VLA 的 `ref_chunk`（approach 段）
+- **按 `b` 之后**：机器人执行 Stage 2 已训练的 **MLP actor** 动作（critical 插入段）
+- **MLP 与 VLA 特征模型**：全程都在跑；`b` 只改 **最终下发给 Franka 的动作来源**
+
+配置入口（[`realworld_rlt_stage2_ac_mlp.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）：
+
+```yaml
+env:
+  train:
+    keyboard_reward_wrapper: rlt_policy_switch
+```
+
+---
+
+## 一、实现架构：从键盘到机器人
+
+### 1.1 Wrapper 栈（Franka 真机）
+
+[`apply_single_arm_wrappers`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/wrappers/apply.py) 装配顺序（由内到外）：
+
+```text
+FrankaEnv
+  → SpacemouseIntervention（可选，遥操作覆盖动作）
+  → KeyboardRLTPolicySwitchWrapper   ← keyboard_reward_wrapper: rlt_policy_switch
+  → RelativeFrame
+  → Quat2EulerWrapper
+```
+
+`KeyboardRLTPolicySwitchWrapper` 在 **SpaceMouse 之外** 再包一层：它不管动作内容，只维护 **`rlt_switch_flags`** 布尔状态。
+
+### 1.2 核心类：`KeyboardRLTPolicySwitchWrapper`
+
+```25:70:rlinf/envs/realworld/common/wrappers/keyboard_rlt_policy_switch_wrapper.py
+class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
+    """Press ``b`` to enter the RLT critical phase."""
+    ...
+    def reset(self, *, seed=None, options=None):
+        self._rlt_switch_flags = False   # 每个 episode 清零
+        ...
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        for key in self.listener.pop_pressed_keys():
+            ...
+            if key == "b":
+                if not self._rlt_switch_flags:
+                    event = "enter_actor"
+                    self._rlt_switch_flags = True   # 锁存，本 episode 不回退
+        info["rlt_switch_flags"] = self._rlt_switch_flags
+        info["rlt_policy_switch_event"] = event
+        return obs, reward, terminated, truncated, info
+```
+
+行为要点：
+
+| 行为 | 实现 |
+|------|------|
+| 监听按键 | `KeyboardListener`（Linux evdev 后台线程） |
+| 触发键 | 小写 `"b"`（evdev `KEY_B` → `"b"`） |
+| 防抖 | `PEDAL_DEBOUNCE_S = 0.2` 秒 |
+| 状态 | `_rlt_switch_flags`：**False→True 一次锁存**，同 episode 内再按只报 `actor_already_active` |
+| 重置 | **`reset()` 时清 False** |
+| 输出 | `info["rlt_switch_flags"]` 供下游 RLT route 使用 |
+
+### 1.3 键盘监听：`KeyboardListener`
+
+[`keyboard_listener.py`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/keyboard/keyboard_listener.py)：
+
+- 用 **evdev** 读 `/dev/input/event*`
+- 环境变量 **`RLINF_KEYBOARD_DEVICE`** 可指定脚踏/键盘设备路径
+- `pop_pressed_keys()`：**边沿检测**（只记首次按下，忽略 autorepeat）
+- 设备需支持 `KEY_A/B/C/Q`（用于识别「键盘类」设备）
+
+---
+
+## 二、信号如何传到 Rollout 并切换动作
+
+### 2.1 Env 内：chunk 内逐步累积 flag
+
+[`realworld_env.chunk_step`](https://github.com/RLinf/RLmm/rlinf/envs/realworld/realworld_env.py) 对 10 个子步逐步 `step()`，每步的 `rlt_switch_flags` 被 stack 成 `[num_envs, chunk_size]`。
+
+### 2.2 Env Worker → Rollout Worker
+
+```943:951:rlinf/workers/env/env_worker.py
+    def _build_rollout_input_data(self, env_batch):
+        data = {"obs": ..., "final_obs": ...}
+        if self.enable_rlt:
+            data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
+```
+
+异步循环：本 chunk 执行期间按的 `b`，flag 随 **下一轮** 的 obs 发给 Rollout。
+
+### 2.3 Rollout：`RealworldRLTRoute` 二选一
+
+```119:144:rlinf/algorithms/rlt/route.py
+        routed_actions = torch.where(
+            rlt_switch_flags,
+            actions,                                              # True → MLP actor
+            ref_actions[:, : actions.shape[1], : actions.shape[2]],  # False → VLA ref
+        )
+```
+
+Rollout 每步仍跑：`feature_model.extract_rlt_obs` + `MLP.predict_action_batch`，route 决定 **哪一路真正进 Franka**。
+
+### 2.4 端到端时序（Peg insertion 典型场景）
+
+```mermaid
+sequenceDiagram
+    participant Op as 操作员
+    participant KB as KeyboardRLTPolicySwitchWrapper
+    participant Env as Env Worker + Franka
+    participant Roll as Rollout Worker
+    participant Route as RealworldRLTRoute
+
+    Note over Op,Route: Episode 开始，flag=False
+
+    Roll->>Route: MLP 动作 + VLA ref_chunk
+    Route->>Env: 下发 ref_chunk（approach）
+    Env->>KB: chunk_step 子步
+    Op->>KB: 尚未按 b
+    KB-->>Env: rlt_switch_flags=False
+
+    Note over Op: 对准孔位，按脚踏 b
+
+    Env->>KB: 某子步 step 返回
+    KB->>KB: _rlt_switch_flags=True
+    Env->>Roll: 下一帧 obs + flags（含 True）
+
+    Roll->>Route: predict_rlt_actions
+    Route->>Env: 下发 MLP actor 动作（insert）
+```
+
+---
+
+## 三、与 SpaceMouse、训练的关系
+
+| 机制 | 作用 | 与 `b` 的关系 |
+|------|------|---------------|
+| **`b` / `rlt_switch_flags`** | VLA ref ↔ MLP actor **策略路由** | 文档 432 行所指 |
+| **SpaceMouse** | 覆盖 **当前选中策略** 的具体动作 | 正交；可 actor 阶段再人工微调 |
+| **MLP / Critic 训练** | 后台 Actor Worker 持续更新 | **不**因 `b` 开关；replay 里按 b 前后 action 不同 |
+
+---
+
+## 四、如何基于 `keyboard_rlt_policy_switch_wrapper.py` 定制
+
+### 4.1 扩展契约（必须遵守）
+
+下游 RLT 真机路径 **只认** `info["rlt_switch_flags"]`（bool 或 tensor）。定制 wrapper 应保证：
+
+1. **`reset()`** 里初始化 flag（通常 `False`）
+2. **`step()`** 里在 `self.env.step(action)` **之后** 读键盘、更新 flag
+3. **写入** `info["rlt_switch_flags"]`
+4. 可选：`info["rlt_policy_switch_event"]` 供日志/监控
+
+**不要**改 Rollout route 或 Env Worker，除非换仿真 ManiSkill 自动 gate 方案。
+
+### 4.2 注册新 wrapper 模式
+
+在 [`apply.py`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/wrappers/apply.py) 的 `_apply_keyboard_wrapper` 增加分支：
+
+```python
+if mode == "rlt_policy_switch":
+    return KeyboardRLTPolicySwitchWrapper(env)
+if mode == "my_custom_rlt_switch":
+    return MyCustomRLTPolicySwitchWrapper(env)
+```
+
+YAML：
+
+```yaml
+env:
+  train:
+    keyboard_reward_wrapper: my_custom_rlt_switch
+```
+
+可参考同目录其它 wrapper 的分工：
+
+| mode | 类 | 用途 |
+|------|-----|------|
+| `start_end` | `KeyboardStartEndWrapper` | 数据采集 a/b/c |
+| `eval_control` | `KeyboardEvalControlWrapper` | 自主 eval 起停 |
+| `rlt_policy_switch` | `KeyboardRLTPolicySwitchWrapper` | RLT actor 阶段切换 |
+
+### 4.3 可复用组件
+
+- **`KeyboardListener`**：evdev、防抖队列、设备选择
+- **`PEDAL_DEBOUNCE_S`**：脚踏连击过滤
+- **继承 `KeyboardRLTPolicySwitchWrapper`**：只改 `step()` 里按键逻辑，保留 reset/日志
+
+---
+
+## 五、定制例子（含流程）
+
+### 例子 1：双击 `b` 确认后再切 actor（防误触）
+
+**需求**：peg insertion 中，单次误踩 `b` 代价高，要 **0.5s 内连按两次 `b`** 才进入 actor。
+
+```python
+class DoubleConfirmRLTSwitchWrapper(KeyboardRLTPolicySwitchWrapper):
+    CONFIRM_WINDOW_S = 0.5
+
+    def __init__(self, env):
+        super().__init__(env)
+        self._first_b_ts: float | None = None
+
+    def reset(self, *, seed=None, options=None):
+        self._first_b_ts = None
+        return super().reset(seed=seed, options=options)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().env.step(action)
+        event = None
+        for key in self.listener.pop_pressed_keys():
+            now = time.monotonic()
+            if now - self._last_press_ts.get(key, -math.inf) < self.PEDAL_DEBOUNCE_S:
+                continue
+            self._last_press_ts[key] = now
+            if key == "b" and not self._rlt_switch_flags:
+                if self._first_b_ts is None:
+                    self._first_b_ts = now
+                    event = "await_second_b"
+                elif now - self._first_b_ts <= self.CONFIRM_WINDOW_S:
+                    self._rlt_switch_flags = True
+                    event = "enter_actor"
+                    self._log_info("Double 'b' confirmed; switching to Stage2 actor.")
+                else:
+                    self._first_b_ts = now
+                    event = "await_second_b"
+        info["rlt_switch_flags"] = self._rlt_switch_flags
+        info["rlt_policy_switch_event"] = event
+        return obs, reward, terminated, truncated, info
+```
+
+**流程**：第一次 `b` → flag 仍为 False，仍走 VLA；窗口内第二次 `b` → flag True，**下一 rollout 轮**起走 actor。Episode reset 清空确认状态。
+
+---
+
+### 例子 2：`b` 进入 actor，`v` 切回 VLA（可逆切换）
+
+默认实现 **不可回退**。若任务需要在 critical 段临时退回 VLA：
+
+```python
+def step(self, action):
+    obs, reward, terminated, truncated, info = self.env.step(action)
+    event = None
+    for key in self.listener.pop_pressed_keys():
+        ...
+        if key == "b" and not self._rlt_switch_flags:
+            self._rlt_switch_flags = True
+            event = "enter_actor"
+        elif key == "v" and self._rlt_switch_flags:
+            self._rlt_switch_flags = False
+            event = "back_to_ref"
+    info["rlt_switch_flags"] = self._rlt_switch_flags
+    ...
+```
+
+**注意**：切回 VLA 后 replay 里 action 来源会变，Critic/Actor 仍照常训练；仅适合明确需要的调试/安全场景。
+
+---
+
+### 例子 3：仅允许在「接近目标」时响应 `b`（结合观测）
+
+在 `step()` 里读 **内层 env 状态**（wrapper 在 Spacemouse 外，step 返回的 `obs` 已是变换后观测）：
+
+```python
+def step(self, action):
+    obs, reward, terminated, truncated, info = self.env.step(action)
+    ...
+    if key == "b" and not self._rlt_switch_flags:
+        states = obs.get("states")  # RealWorldEnv 拼接后的 proprio
+        if states is not None:
+            pos_err = np.linalg.norm(states[0, :3] - self._target_xyz)
+            if pos_err > 0.02:  # 2cm 外忽略 b
+                event = "b_ignored_too_far"
+                continue
+        self._rlt_switch_flags = True
+        event = "enter_actor"
+```
+
+**流程**：远处按 `b` 无效；进入 2cm 邻域后 `b` 才锁存 True → route 切 actor。`_target_xyz` 可在 `__init__` 从 `env.config.target_ee_pose` 读取。
+
+---
+
+### 例子 4：脚踏板硬件映射（不改代码）
+
+操作员常用 USB 脚踏映射为 **键盘 B**。在 Franka 控制节点：
+
+```bash
+export RLINF_KEYBOARD_DEVICE=/dev/input/by-id/usb-FOOTPEDAL-event-kbd
+bash examples/embodiment/run_realworld_async.sh realworld_rlt_stage2_ac_mlp
+```
+
+`KeyboardListener` 仍收到 `"b"`，wrapper 逻辑不变。
+
+---
+
+### 例子 5：加「紧急停」键（不改 route，只停 episode）
+
+```python
+if key == "q":
+    terminated = True
+    truncated = True
+    event = "operator_abort"
+```
+
+**流程**：按 `q` → episode 结束 → `auto_reset` 回 home → 新 episode `reset()` 把 `rlt_switch_flags` 清 False。与 [`KeyboardEvalControlWrapper`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/wrappers/keyboard_eval_control_wrapper.py) 的 `c` 结束 eval 类似，但这里只终止、不强行 success reward。
+
+---
+
+## 六、定制时常见坑
+
+| 坑 | 说明 |
+|----|------|
+| **时延** | `b` 在本 chunk 某子步生效，route 用的是 **下一轮** rollout 的 flags；整 chunk 10 步会 broadcast 同一 flag |
+| **不可回退** | 默认锁存 True；要可逆需自己写（例子 2） |
+| **与 Stage 1/2 训练阶段混淆** | `b` **不**切换训练阶段；VLA 冻结、MLP 训练与 `b` 无关 |
+| **权限** | 无 evdev 读权限会启动失败；需 input 组或 udev |
+| **dummy 模式** | `config.is_dummy=True` 时不挂 keyboard wrapper |
+| **多 teleop** | `use_spacemouse` / `use_gello` / `use_pico` **只能选一个** |
+
+---
+
+## 七、与 ManiSkill 的对比（文档上下文）
+
+真机用 **键盘 + `RealworldRLTRoute`**；ManiSkill joint 用 **`env.*.rlt_policy_switch`** 任务信息自动产生 `rlt_switch_flags`（[`SimulatorRLTRoute`](https://github.com/RLinf/RLinf/blob/main/rlinf/algorithms/rlt/route.py)），无需操作员按 `b`。算法语义相同：**critical phase 用 actor，之前用 ref**。
+
+---
+
+**一句话**：「按 `b` 进入 Stage 2 actor」= `KeyboardRLTPolicySwitchWrapper` 通过 evdev 把 **`b` 映射为锁存的 `info["rlt_switch_flags"]`**，经 Env→Rollout 传给 **`RealworldRLTRoute`**，在 VLA `ref_chunk` 与 MLP actor 动作之间切换；定制时继承/改写该 wrapper 的按键逻辑，保持 `rlt_switch_flags` 契约，并在 `apply.py` 注册新的 `keyboard_reward_wrapper` 模式即可。
