@@ -2443,7 +2443,7 @@ sequenceDiagram
 这样 RLT 把 **表示学习（Stage 1）** 和 **在线控制（Stage 2）** 拆开，避免在线 RL 破坏已学 VLA 表示。
 
 
-# rlt.rst中按b前后的系统变化
+# rlt.rst中按`b`前后的系统变化
 
 ## 直接回答：你的理解 **不对**
 
@@ -2657,4 +2657,643 @@ Stage 2 启动后，**π₀.₅ 和 RLT 就已冻结**；按不按 `b` 都不会
 ## 一句话总结
 
 **[`rlt.rst:215-217`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 描述的是 Stage 2 rollout 的「动作路由策略」：按 `b` 前真机走冻结 VLA 的 `ref_chunk`，按 `b` 后走可训 MLP actor；feature model 每步都在跑但从不更新，actor/critic 在 learner 里持续从 replay 更新——与按键无关。**
+
+---
+
+## 下面是另一个相关发问
+
+深入分析 @RLmm/docs/source-zh/rst_source/examples/embodied/rlt.rst 的相关代码, 详细解释一下 @RLmm/docs/source-zh/rst_source/examples/embodied/rlt.rst:215-217 这段话所描述的操作细节, 具体是在怎么做的, 系统哪个模块在做什么, 人在做什么, 什么权重又会怎样被更新. 以及这些操作反映了背后怎样的设计思路和实现细节, 为什么要这样设计与实现.
+
+
+
+## 先澄清：这段话在描述什么
+
+[`rlt.rst:215-217`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 描述的是 **Stage 2 真机 rollout 里的「动作路由」**，不是「按 b 前训 VLA、按 b 后训 actor」。
+
+整段 Franka Stage 2 在线训练里：
+
+- **π₀.₅ + RLT Token Transformer**：始终 **冻结**，只做特征提取  
+- **MLP actor + critic**：始终 **可训**（learner 从 replay 更新）  
+- **按 `b`**：只决定 **机器人实际执行 VLA 的 `ref_chunk` 还是 MLP actor 动作**
+
+---
+
+## 一、人在做什么
+
+Franka 配置（[`realworld_rlt_stage2_ac_mlp.yaml:111-119`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）下，操作员通常做三件事：
+
+| 操作 | 设备 | 作用 |
+|------|------|------|
+| **按 `b`** | 键盘（可接脚踏） | 宣布进入 **critical phase**：之后由 RL actor 控制 |
+| **SpaceMouse 拖动** | 3D 鼠标（`use_spacemouse: True`） | **任意时刻** 可人工接管末端动作（与 `b` 独立） |
+| **观察任务进度** | — | 在 peg 对准、接近插入时再按 `b` |
+
+### 按 `b` 的具体行为
+
+```58:69:rlinf/envs/realworld/common/wrappers/keyboard_rlt_policy_switch_wrapper.py
+            if key == "b":
+                if not self._rlt_switch_flags:
+                    event = "enter_actor"
+                    self._rlt_switch_flags = True
+                    ...
+        info["rlt_switch_flags"] = self._rlt_switch_flags
+```
+
+- **每个 episode reset 后**：`_rlt_switch_flags = False`  
+- **按一次 `b`**：置 `True` 并 **锁存**（本 episode 内不再回退）  
+- **0.2s 防抖**：避免连按误触  
+
+文档第 432 行的「进入 Stage 2 actor 控制阶段」= **rollout 内的 actor 执行阶段**，不是才开始 Stage 2 训练。
+
+### SpaceMouse 干预（并行机制）
+
+Wrapper 栈（[`apply.py:119-150`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/wrappers/apply.py)）：
+
+```text
+KeyboardRLTPolicySwitchWrapper（最外层）
+  → SpacemouseIntervention
+    → … → Franka 真机
+```
+
+SpaceMouse 在 **policy 动作进入真机前** 可能被替换（[`spacemouse_intervention.py:55-78`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/wrappers/spacemouse_intervention.py)）：最近 0.5s 内有 SpaceMouse 输入 → 用专家动作替代 policy 动作，并写 `info["intervene_action"]`。
+
+**与 `b` 的关系**：`b` 管 **VLA vs actor 二选一**；SpaceMouse 管 **是否覆盖当前选中的那路动作**。两者正交。
+
+---
+
+## 二、系统模块分工（Franka 双节点异步）
+
+典型部署（[`realworld_rlt_stage2_ac_mlp.yaml:15-38`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）：
+
+```text
+GPU 节点（4090）                    Franka 节点
+├─ Rollout Worker                   ├─ Env Worker
+│   ├─ rlt_feature_model（冻结）   │   └─ RealWorldEnv + wrappers
+│   └─ hf_model（MLP 副本，同步）   │       └─ 真机 + 相机
+└─ Actor Worker（训练 MLP）  ←Ray Channel→  采集 obs / 下发 action
+```
+
+入口：`bash examples/embodiment/run_realworld_async.sh realworld_rlt_stage2_ac_mlp`（[`rlt.rst:430`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）。
+
+---
+
+## 三、一个 control step 的完整操作细节
+
+Stage 2 以 **action chunk** 交互：actor 输出 **10 步 × 7 维**（[`realworld_rlt_stage2_ac_mlp.yaml:245-246`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）；VLA feature model 推理 **20 步**，route 取前 10 步与 actor 对齐。
+
+### 时序（Env ↔ Rollout 一轮）
+
+```mermaid
+sequenceDiagram
+    participant H as 人（b / SpaceMouse）
+    participant Env as Env Worker + 真机
+    participant Roll as Rollout Worker
+    participant FM as 冻结 feature model
+    participant MLP as MLP 副本
+    participant Route as RealworldRLTRoute
+
+    Note over Env,Roll: 上一轮结束，Env 持有 obs_t 与 rlt_switch_flags
+
+    Env->>Roll: obs_t, rlt_switch_flags
+    Roll->>FM: extract_rlt_obs(obs_t)
+    FM-->>Roll: z_rl, proprio, ref_chunk（20×7）
+    Roll->>MLP: predict_action_batch({z_rl, proprio, ref_chunk[:10]})
+    MLP-->>Roll: student_actions（10×7）
+    Roll->>Route: route(flags, ref_chunk, student_actions)
+
+    alt flags == False（未按 b）
+        Route-->>Env: 执行 ref_chunk[:, :10, :]
+    else flags == True（已按 b）
+        Route-->>Env: 执行 student_actions
+    end
+
+    H->>Env: 本步可能按 b / 推 SpaceMouse
+    Env->>Env: chunk_step 逐步执行 10 个子步
+    Env->>Roll: obs_{t+1}, 更新后的 flags
+    Env->>Env: update_rlt_transitions → replay
+```
+
+### Rollout 侧：`predict_rlt_actions`（每步必跑，与 `b` 无关）
+
+```51:75:rlinf/algorithms/rlt/rollout.py
+    with torch.no_grad():
+        rlt_obs = feature_model.extract_rlt_obs(env_obs)     # ① 冻结 VLA+RLT
+        actions, result = policy_model.predict_action_batch( # ② MLP 推理
+            env_obs=rlt_obs, ...
+        )
+        route_output = rlt_route.route(...)                  # ③ 选最终动作
+        actions = route_output.actions
+```
+
+① **冻结 feature model**（π₀.₅ + `rlt_module`）：  
+- 输入：原始图像 + state + 语言  
+- 输出：`z_rl`(2048)、`proprio`(19)、`ref_chunk`(20×7)  
+- **无梯度、权重不变**
+
+② **MLP 副本**（`rollout.hf_model`）：  
+- 输入：`concat(ref_chunk[:10], z_rl, proprio)`  
+- 输出：`student_actions`（10×7）  
+- 仅推理；权重由 Actor Worker **异步同步**
+
+③ **RealworldRLTRoute** — 文档 215–217 的核心：
+
+```130:143:rlinf/algorithms/rlt/route.py
+        routed_actions = torch.where(
+            rlt_switch_flags,
+            actions,                                              # True → actor
+            ref_actions[:, : actions.shape[1], : actions.shape[2]],  # False → ref
+        )
+        result["forward_inputs"]["record_transition"] = rlt_switch_flags[:, :1]
+        result["forward_inputs"]["actor_switch"] = record_transition
+```
+
+- **`flags=False`（按 b 前）**：10 步全走 **VLA `ref_chunk` 前 10 步**  
+- **`flags=True`（按 b 后）**：10 步全走 **MLP actor**  
+- 整 chunk 同一策略（flag 会 broadcast 到 chunk 内每一步）
+
+### Env 侧：执行与标志回传
+
+1. 收到 `routed_actions`（10×7 chunk）  
+2. `chunk_step` 内逐步 `step()`；每步 keyboard wrapper 读 `b`，更新 `rlt_switch_flags`  
+3. SpaceMouse 可能在 `SpacemouseIntervention` 层再次替换动作  
+4. 相机/state 更新 → 下一帧 obs  
+5. `update_rlt_transitions` 写入 replay（见下节）
+
+`rlt_switch_flags` 随 **下一步** 的 obs 发给 rollout（本步按 `b`，下一步 route 才生效）。
+
+---
+
+## 四、Replay 里存什么、Learner 更新什么权重
+
+### 4.1 Transition 写入
+
+```62:102:rlinf/algorithms/rlt/transition.py
+def update_rlt_transitions(...):
+    if pending_obs is not None:
+        # 若 SpaceMouse 干预：把 curr_obs["ref_chunk"] 对应槽位换成人工动作
+        ...
+        append_transitions(pending_obs, next_obs)  # 来自 rlt_transition_*
+    if cache_current:
+        pending_obs = {z_rl, proprio, ref_chunk}  # 当前步 curr_obs
+```
+
+每条 transition（[`rlt.rst:211-213`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+```text
+curr_obs = {z_rl, proprio, ref_chunk}
+action   = 实际执行的动作（route + 可能的 SpaceMouse 后）
+reward   = 环境奖励
+next_obs = {next_z_rl, next_proprio, next_ref_chunk}
+```
+
+**真机路径不过滤 `record_transition`**，故文档写明（[`rlt.rst:694`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+> 切换前的 step 仍然会用于训练。这些 step 的执行动作是 VLA reference action。
+
+### 4.2 权重更新总表（Stage 2 全程）
+
+| 模块 | 位置 | 按 b 前 | 按 b 后 | 更新方式 |
+|------|------|---------|---------|----------|
+| **π₀.₅ VLA** | `rollout.rlt_feature_model.model` | 冻结推理 | 冻结推理 | **不更新** |
+| **`rlt_module`** | 同上 | 冻结推理 | 冻结推理 | **不更新** |
+| **`backbone`** | Actor Worker MLP | **更新** | **更新** | Actor loss 反传 |
+| **`actor_mean`** | 同上 | **更新** | **更新** | Actor loss 反传 |
+| **`q_head`**（Twin Q） | 同上 | **更新** | **更新** | Critic TD loss |
+| **`target_model`** | Actor Worker 副本 | EMA 跟随 | EMA 跟随 | **无梯度**，`tau=0.005` 软更新 |
+| **`rollout.hf_model`** | Rollout Worker | 同步权重 | 同步权重 | **不本地训练**，从 Actor 同步 |
+
+**Stage 1 的 π₀.₅ + RLT 已在离线 SFT 训完**；Stage 2 启动后不再碰这些权重。
+
+### 4.3 按 b 前 / 后：同一套 loss，不同 transition 语义
+
+Learner（`RLTACFSDPPolicy`）**不区分**是否按过 `b`，统一从 replay 采样；差异在 **transition 内容**：
+
+#### Critic（更新 `q_head`）
+
+```text
+target_q = discounted_chunk_reward + (1-done) * γ^H * min Q_target(next_obs, next_action)
+loss = MSE(Q(curr_obs, action), target)
+```
+
+| 阶段 | `action`（replay 里） | Critic 在学 |
+|------|----------------------|-------------|
+| 按 b 前 | 实际执行的 **VLA ref_chunk** | \(Q(s, a_{\text{VLA}})\) |
+| 按 b 后 | 实际执行的 **actor 动作** | \(Q(s, a_{\text{actor}})\) |
+
+`curr_obs` / `next_obs` 里的 `z_rl`、`ref_chunk` 每步都由 **冻结 feature model** 重算，不参与反传。
+
+#### Actor（更新 `backbone` + `actor_mean`）
+
+```text
+actor_loss = -q_weight * Q1(s, π(s)) + bc_weight * MSE(π(s), bc_target)
+```
+
+默认 `q_weight=0.1`，`bc_weight=5`（[`realworld_rlt_stage2_ac_mlp.yaml:74-76`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）。
+
+| 阶段 | `bc_target` | 含义 |
+|------|-------------|------|
+| 普通步 | `ref_chunk` | actor 应贴近 VLA 参考 |
+| SpaceMouse 干预步 | **实际人工动作** | BC 对齐专家示范 |
+
+```123:124:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
+```
+
+**按 b 前**：actor 每步仍前向，但 route **丢弃**输出；replay 里 `action=VLA`，BC 仍拉向 `ref_chunk`（二者一致），主要学 **「在 VLA 轨迹附近 Q 值怎么标」**。  
+**按 b 后**：actor 输出被下发；BC 仍锚定 VLA，Q 项鼓励高回报修正。
+
+#### 更新节奏
+
+- 每 step：**Critic** 更新  
+- 每 4 step（`critic_actor_ratio=4`）：**Actor** 更新  
+- 每 step：`target_model` 软更新  
+- 周期性：`actor → rollout.hf_model` 权重同步  
+
+---
+
+## 五、按 b 前后对照（操作 + 权重 + 数据）
+
+| 维度 | 按 `b` **之前** | 按 `b` **之后** |
+|------|----------------|----------------|
+| **人** | 观察对准；**不按 b**；可用 SpaceMouse | **按 `b` 一次**；critical 阶段可 SpaceMouse |
+| **`rlt_switch_flags`** | `False` | `True`（锁存） |
+| **机器人动作** | VLA `ref_chunk` 前 10 步 | MLP actor 10 步 |
+| **MLP 是否推理** | ✅ 每步推理 | ✅ 每步推理 |
+| **MLP 输出是否执行** | ❌ route 丢弃 | ✅ route 下发 |
+| **feature model** | 每步 `extract_rlt_obs` | 同上 |
+| **replay `action`** | VLA 实际轨迹 | actor 实际轨迹 |
+| **训 π₀.₅/RLT？** | ❌ | ❌ |
+| **训 MLP actor/critic？** | ✅（有数据就更新） | ✅ |
+
+---
+
+## 六、设计思路与实现细节
+
+### 6.1 为何用 `b` 做阶段切换，而不是一上来就用 actor？
+
+1. **任务两阶段结构**（peg insertion）  
+   - **Approach**：VLA 示范 SFT 后粗定位较稳  
+   - **Insert**：需精细力控/对齐，用 **小 MLP + 在线 RL** 做 residual  
+
+2. **真机安全**  
+   - 远离目标时 actor 探索风险大  
+   - 操作员确认「可以插入」后再交 actor（[`rlt.rst:432-434`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）
+
+3. **与 RLT 论文一致**  
+   - Stage 1 提供强 prior（`ref_chunk` + `z_rl`）  
+   - Stage 2 只学 **修正**，不是从零控制  
+
+仿真用 **`rlt_policy_switch` 自动 gate**（抓 peg、近 hole 等）替代键盘（[`rlt.rst:219-223`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)），逻辑相同、去掉人工。
+
+### 6.2 为何 route 在 Rollout 而非 Env？
+
+- **集中决策**：feature model、MLP、ref_chunk 都在 Rollout GPU  
+- **`RealworldRLTRoute`** 纯 tensor 逻辑，易测、与 ManiSkill `SimulatorRLTRoute` 共用 `predict_rlt_actions` 框架  
+- Env 只传 **`rlt_switch_flags`**，保持 env 与算法解耦  
+
+### 6.3 为何按 b 前 transition 也进 replay？
+
+- Critic 需学 **VLA 动作在各状态下的 Q**，作 bootstrap 基础  
+- Actor 的 BC 在 VLA 阶段即对齐 `ref_chunk`，进入 actor 阶段时不「忘记」VLA  
+- 数据效率：approach 段也有 reward 信号  
+
+### 6.4 为何 feature model 始终跑、始终冻结？
+
+- `z_rl` / `ref_chunk` 必须 **随新观测实时更新**  
+- 在线 RL 若继续训 ~2.3B VLA，易 **灾难性遗忘** + 真机不稳定  
+- 冻结后 Stage 2 只训 **~百万级 MLP**，样本效率高  
+
+### 6.5 实现细节摘要
+
+| 细节 | 实现 |
+|------|------|
+| Flag 粒度 | 整 chunk broadcast（10 步同策略） |
+| Flag 时延 | 本步按 `b`，**下一步** route 生效 |
+| `record_transition` | 真机 **不** 用于过滤 replay；主要供指标 / 仿真路径 |
+| SpaceMouse | 改 **执行动作** + 可能改 `curr_obs.ref_chunk`（BC）；**不**改 `rlt_switch_flags` |
+| Actor 输入 dropout | `reference_dropout_prob=0.5` 防过度依赖 ref |
+| 异步 | Env 采数据与 Actor 训练并行；rollout MLP 为 Actor 权重副本 |
+
+---
+
+## 七、一句话总结
+
+[`rlt.rst:215-217`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 描述的是 **Stage 2 真机 rollout 的执行策略**：人按 **`b`** 把 `rlt_switch_flags` 置真，**`RealworldRLTRoute`** 据此在 **冻结 VLA 的 `ref_chunk`** 与 **可训 MLP actor 动作** 之间二选一发给 Franka；**π₀.₅ 与 RLT 全程不更新**，**MLP actor/critic 全程从 replay 更新**，按 b 前后差别在于 **replay 里实际执行的 `action` 来自哪一路**，而非切换「训练哪套大模型」。这样把 **VLA 粗控制**、**人工阶段确认** 和 **RL 精细修正** 拆开，兼顾 peg insertion 任务结构、真机安全与 RLT「在 VLA prior 上做 residual RL」的设计。
+
+
+# rlt.rst 的critic训练
+
+## 文档在说什么
+
+[`rlt.rst:225-231`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 描述的是 **Stage 2 里 Critic（Q 网络）的 TD 目标构造方式**：RLT 不是逐步 \(r_t + \gamma Q(s_{t+1})\)，而是把 **一个 action chunk（10 个环境子步）** 当作一次决策，先把 chunk 内 10 个标量奖励折扣累加，再用 **chunk 执行完毕后的下一状态** 做 bootstrap。
+
+核心公式（代码与文档一致）：
+
+\[
+\text{target\_q} = \underbrace{\sum_{k=0}^{H-1} \gamma^k r_k}_{\text{discounted\_chunk\_reward}} + \underbrace{(1 - \text{done}) \cdot \gamma^{H} \cdot \min(Q_1', Q_2')}_{\text{bootstrap}}
+\]
+
+其中 \(H =\) `chunk_horizon` \(=\) `num_action_chunks` \(= 10\)，\(\gamma = 0.96\)（[`realworld_rlt_stage2_ac_mlp.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）。
+
+---
+
+## 一、关键概念：它们是什么、从哪来
+
+### 1. 「action chunk 内的奖励」
+
+真机一次 **chunk 交互** = Env 连续执行 **10 个子步** 控制指令（每步 7 维 EE delta）。
+
+```293:324:rlinf/envs/realworld/realworld_env.py
+    def chunk_step(self, chunk_actions):
+        ...
+        for i in range(chunk_size):
+            actions = chunk_actions[:, i]
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(
+                actions, auto_reset=False
+            )
+            ...
+            chunk_rewards.append(step_reward)
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
+```
+
+- **形状**：`rewards` = `[B, 10]`，每列是 chunk 内第 \(k\) 个子步的即时奖励 \(r_k\)。
+- **Peg insertion 来源**（`use_dense_reward: False`）：稀疏成功奖励——TCP 进入目标区域并保持 `success_hold_steps` 后 `reward=1.0`，否则多为 0（[`franka_env._calc_step_reward`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/franka/franka_env.py)）。
+- **写入 replay**：Env Worker 每完成一个 chunk，把 `chunk_rewards` 经 `EmbodiedTrajectoryBuilder.append_step_result` 存入 trajectory；与 `curr_obs` / `action` / `next_obs` 对齐成 **一条 transition**。
+
+### 2. 「chunked rewards / discounted_chunk_reward」
+
+Critic 训练时不逐步拟合 \(Q(s_t, a_t)\)，而是拟合 **整段 chunk 宏动作** 的回报。先把 10 步奖励折扣求和：
+
+```86:94:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+    def _discounted_chunk_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+        rewards = rewards.reshape(rewards.shape[0], -1)
+        ...
+        discounts = torch.pow(gamma, torch.arange(chunk_len, ...))
+        return torch.sum(rewards * discounts, dim=-1, keepdim=True)
+```
+
+**数值例子**（\(\gamma=0.96\)，chunk 内仅第 7 步成功 \(r_6=1\)，其余为 0）：
+
+\[
+\text{discounted\_chunk\_reward} = 0.96^6 \times 1 \approx 0.782
+\]
+
+含义：成功发生在 chunk 越靠后，折扣累加越小——Critic 能感知 **奖励在 chunk 内的时间位置**。
+
+### 3. 「bootstrap / TD target」
+
+Bootstrap 项是 **chunk 结束后** 对「未来价值」的估计：
+
+```243:274:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        with torch.no_grad():
+            next_actions, _, _ = self.model(forward_type=ForwardType.SAC, obs=next_obs)
+            all_qf_next_target = self.target_model(
+                forward_type=ForwardType.SAC_Q, obs=next_obs, actions=next_actions,
+            )
+            q_next = self._min_twin_q(all_qf_next_target)   # min(Q1', Q2')
+
+            reward_target = self._discounted_chunk_rewards(rewards)
+            bootstrap_discount = self.cfg.algorithm.gamma ** reward_horizon   # γ^10
+
+            if bootstrap_type == "standard":
+                target_q_values = reward_target + not_done * bootstrap_discount * q_next
+```
+
+| 符号 | 含义 | 来源 |
+|------|------|------|
+| `next_obs` | `{next_z_rl, next_proprio, next_ref_chunk}` | 下一步 rollout 时冻结 feature model 对 **chunk 执行后** 观测的编码 |
+| `next_action` | MLP actor 在 `next_obs` 上的输出（70 维 flat chunk） | **在线** `self.model`（非 target）前向，无梯度 |
+| `Q_target(...)` | Twin target Q 的较小值 | **`target_model.q_head`**，EMA 慢更新 |
+| `not_done` | 是否 bootstrap | `~terminations.any()`（真机）；仿真 ManiSkill 用 `dones` |
+| `bootstrap_type: standard` | episode **终止**时不加 bootstrap | 真机成功插入 = 真终止，不再幻想未来 Q |
+
+RLT Stage 2 **不含熵项**（`backup_entropy: False`，`initial_alpha: 0.0`），TD target 比标准 max-entropy SAC 更简单。
+
+### 4. Critic 损失
+
+```276:295:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        all_data_q_values = self.model(
+            forward_type=ForwardType.SAC_Q, obs=curr_obs, actions=actions,
+        )
+        critic_loss = F.mse_loss(
+            all_data_q_values, target_q_values.expand_as(all_data_q_values)
+        )
+```
+
+- **Twin Q**：`MultiQHead` 输出 \(Q_1, Q_2\)，target 用 `min(Q1', Q2')` 抑过估计。
+- **Loss**：两个 Q 头都对同一 `target_q` 做 MSE（`expand_as` 广播）。
+
+---
+
+## 二、Critic 输入输出与网络结构
+
+`RLTMLPPolicy` 把 **10×7=70 维整段动作** 当作一个宏动作；Q 是 **chunk 级标量**（`output_dim=1`）：
+
+```59:70:rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py
+        actor_obs_dim = z_dim + proprio_dim + flat_action_dim   # actor 用
+        critic_obs_dim = z_dim + proprio_dim                    # critic 用
+
+        super().__init__(..., action_dim=flat_action_dim, num_action_chunks=1, ...)
+```
+
+Critic 前向：
+
+```132:165:rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py
+    def _critic_state(self, obs: dict) -> torch.Tensor:
+        return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
+
+    def sac_q_forward(self, obs, actions, ...):
+        return self.q_head(critic_state, self._flatten_batch(actions))
+```
+
+| 量 | 形状（单条 transition） | 说明 |
+|----|------------------------|------|
+| `curr_obs["z_rl"]` | `[2048]` | 冻结 RLT 特征 |
+| `curr_obs["proprio"]` | `[19]` | 机器人状态 |
+| `curr_obs["ref_chunk"]` | `[20×7]`（critic **不直接读**，但 actor 用） | VLA 参考 |
+| `actions` | `[70]` | **实际执行**的整段 chunk（VLA 或 actor，经 route + 可能的 SpaceMouse） |
+| `rewards` | `[10]` | chunk 内逐步奖励 |
+| `next_obs` | 同上结构 | chunk 结束后的 RLT 观测 |
+| \(Q(s,a)\) | 标量 × 2（twin） | `q_head` 输出 |
+
+**重要**：Critic **不看原始图像**，只看 Stage 1 冻结编码 `z_rl` + `proprio`；图像→`z_rl` 的 π₀.₅+RLT **不参与 Critic 反传**。
+
+---
+
+## 三、端到端运行细节：谁做什么、权重怎么变
+
+### 3.1 数据采集（Env + Rollout，与 Critic 并行）
+
+```mermaid
+sequenceDiagram
+    participant H as 操作员
+    participant Env as Env Worker（Franka 节点）
+    participant Roll as Rollout Worker（GPU）
+    participant FM as 冻结 rlt_feature_model
+    participant RB as Replay Buffer（Actor 进程内）
+
+    H->>Env: 操作机器人 / 按 b / SpaceMouse
+    Env->>Env: chunk_step：10 子步，得 rewards[10]
+    Env->>Roll: obs + rlt_switch_flags
+    Roll->>FM: extract_rlt_obs → z_rl, ref_chunk
+    Roll->>Roll: MLP 推理 + route 选动作
+    Roll-->>Env: 下发 chunk 动作
+    Env->>Env: update_rlt_transitions(curr_obs, next_obs)
+    Env->>RB: trajectory → recv_rollout_trajectories → add
+```
+
+一条 replay 行（真机 **不过滤** `record_transition`）：
+
+```text
+curr_obs = {z_rl, proprio, ref_chunk}
+action   = 实际执行的 70 维 chunk
+rewards  = [r_0, ..., r_9]          # 10 个标量
+next_obs = {next_z_rl, next_proprio, next_ref_chunk}
+terminations = chunk 是否在本段结束成功
+```
+
+终止时（[`fsdp_rlt_ac_policy_worker.py:551-556`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py)）：`next_obs = curr_obs`，且 `bootstrap_type: standard` 令 `not_done=0`，target 只剩 `discounted_chunk_reward`。
+
+### 3.2 Critic 训练（Actor Worker，GPU）
+
+异步 runner（[`async_embodied_runner.py`](https://github.com/RLinf/RLinf/blob/main/rlinf/runners/async_embodied_runner.py)）在 Env 采数据的同时调用 `actor.run_training()`。
+
+**每个 training step**（[`update_one_epoch`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_sac_policy_worker.py)）：
+
+1. 从 replay **采样 batch**（`global_batch_size=256`）
+2. **仅 Critic 更新**（每步都做）：
+   - `qf_optimizer.zero_grad()`
+   - `forward_critic(batch)` → `critic_loss.backward()`
+   - `qf_optimizer.step()` — **只更新 `q_head` 参数**
+3. **每 4 步**（`critic_actor_ratio: 4`）才更新 actor（`backbone` + `actor_mean`），与 Critic 分离
+4. **每步** `soft_update_target_model(tau=0.005)`：EMA 更新 `target_model`（含 `q_head`；`target_update_type: all` 时 actor 权重也缓慢跟随，但 target 仅用于 Q 评估）
+
+### 3.3 模块冻结 / 可训 / 更新方式
+
+| 模块 | 位置 | Critic 训练时 | 权重如何变 |
+|------|------|--------------|-----------|
+| **π₀.₅ VLA + RLT** | `rollout.rlt_feature_model` | 冻结推理（`eval()` + `requires_grad_(False)`） | **不更新** |
+| **`q_head`（Twin Q）** | Actor Worker `RLTMLPPolicy` | **训练** | `critic_loss` → `qf_optimizer`（lr=3e-4） |
+| **`target_model.q_head`** | Actor Worker 副本 | 仅 eval | **无梯度**；每步 EMA：`θ' ← (1-τ)θ' + τ θ` |
+| **`backbone` + `actor_mean`** | 同上 | Critic 步不更新 | Actor 步另算 actor loss；Critic 的 `sac_q_forward` 不经过 backbone |
+| **`rollout.hf_model`** | Rollout Worker | 推理副本 | 周期性从 Actor **同步权重**，本地不训练 |
+
+Critic 优化器参数过滤（[`fsdp_sac_policy_worker.py:119-129`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_sac_policy_worker.py)）：RLT MLP 无独立 critic encoder，**实际只有 `q_head`** 进 `qf_optimizer`。
+
+### 3.4 人在做什么
+
+Critic 训练 **不需要人直接操作**；人通过真机交互 **间接提供训练数据**：
+
+| 人的操作 | 对 Critic 的影响 |
+|----------|-----------------|
+| **不按 b / 按 b** | 改变 `action` 是 VLA 还是 actor → Q 学习不同策略下的价值 |
+| **SpaceMouse 干预** | 改变执行轨迹与 `rewards`；BC 另管，Critic 仍拟合「该 chunk 实际回报 + bootstrap」 |
+| **完成任务（插入成功）** | 某子步 `r_k=1` → `discounted_chunk_reward` 跳变；`terminations=True` → **去掉 bootstrap** |
+| **失败 / 超时 truncate** | `bootstrap_type: standard` 下 truncate **仍 bootstrap**（与 termination 不同，见 SAC 文档） |
+
+Critic 在后台持续从 replay 采样更新；人只负责产生 **(obs, action, rewards, next_obs, done)** 五元组。
+
+---
+
+## 四、完整 Critic 前向 + 反传（一步训练 micro-batch）
+
+```mermaid
+flowchart TB
+    subgraph 无梯度目标构造
+        R["rewards [B,10]"] --> D["discounted_chunk_reward<br/>Σ γ^k r_k"]
+        NO["next_obs"] --> A["next_action = π(next_obs)"]
+        A --> TQ["Q_target = min(Q1',Q2')<br/>target_model.q_head"]
+        D --> TG["target_q"]
+        TQ --> TG
+        TD["terminations → not_done"] --> TG
+        TG["target_q = discounted + not_done·γ^10·Q_target"]
+    end
+
+    subgraph 有梯度
+        CO["curr_obs + action"] --> QO["Q1, Q2 = model.q_head"]
+        QO --> L["MSE(Q1,Q2 vs target_q)"]
+        L --> U["qf_optimizer → 更新 q_head"]
+    end
+```
+
+**与标准逐步 SAC 的对比**（同框架 [`fsdp_sac_policy_worker.forward_critic`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_sac_policy_worker.py)）：
+
+| | 逐步 SAC（`num_action_chunks=1`） | RLT Critic |
+|--|----------------------------------|------------|
+| 奖励 | 标量 \(r_t\) | 向量 \([r_0,\ldots,r_{9}]\) 先折扣求和 |
+| Bootstrap 折扣 | \(\gamma\) | \(\gamma^{10}\) |
+| 状态 | 原始 obs / CNN 特征 | 冻结 `z_rl` + `proprio` |
+| 动作 | 单步 | 70 维 flat chunk |
+| TD target 熵项 | 可选 \(\alpha\log\pi\) | **无**（`initial_alpha: 0`） |
+
+---
+
+## 五、设计思路：为什么要这样实现
+
+### 5.1 为什么要「chunk 内折扣累加 + γ^H bootstrap」
+
+1. **与决策粒度一致**：Stage 2 每 10 步才做一次 MLP 决策；Q 应回答「在这个 RLT 状态下执行 **这一整段 chunk** 值多少」，而不是逐步 Q。
+2. **奖励时序正确**：Peg insertion 成功可能发生在 chunk 中间某步；\(\sum \gamma^k r_k\) 保留「第几步成功」的信息。
+3. **与 n-step return 等价**：在 chunk 边界上，这等价于 **10-step 宏观 TD**，一步更新覆盖 10 个物理步，样本效率更高。
+4. **与 VLA chunk 对齐**：VLA 出 20 步 ref、actor 出 10 步；Critic 评估的是 actor 的 10 步宏动作。
+
+### 5.2 为什么 Critic 只吃 `z_rl` 而不训 feature model
+
+- Stage 1 已学好视觉→RLT 表征；Stage 2 在线 RL 若反传 2B+ VLA，易 **灾难性遗忘** 且真机不稳定。
+- 固定表征下，Critic 只在 **2048 维语义空间** 学价值，参数量小（`q_head` 约百万级），适合在线样本稀缺。
+
+### 5.3 为什么 `bootstrap_type: standard`（真机默认）
+
+文档（[`rlt.rst:231`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）与 SAC 参考（[`sac.rst:86`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/reference/algorithms/sac.rst)）一致：
+
+- **Termination（插入成功）**：任务结束，\(V(s_{\text{terminal}})=0\)，不应 bootstrap → `target_q = discounted_chunk_reward`。
+- **Truncation（超时）**：episode 人为截断但物理世界可继续，仍 bootstrap 未来 Q。
+
+真机配置 `ignore_terminations: False`，成功时 `terminations` 会正确触发「不 bootstrap」。
+
+### 5.4 为什么 Twin Q + target network + 无熵 backup
+
+- **Twin Q + min**：抑过估计，离线/在线混合数据更稳（RLPD 系常见做法）。
+- **Target EMA**：慢 moving target，减 TD 目标抖动。
+- **无熵项 + 固定小 std（0.002）**：RLT Stage 2 是 **近确定性 residual policy**，不需要 max-entropy 探索；Critic 专注拟合任务回报。
+
+### 5.5 为什么 Critic 与 Actor 分开优化器、4:1 更新比
+
+- `q_head` 与 `backbone/actor_mean` 分离：Critic 更频繁更新（每步），Actor 较慢（每 4 步），避免 actor 追逐尚未收敛的 Q。
+- Actor 更新时 `detach_encoder=True` 的 Q 评估（`forward_actor`），Critic 目标构造也不反传 actor——标准 SAC actor-critic 解耦。
+
+---
+
+## 六、一条 transition 的 Critic 视角小结
+
+假设某 chunk：按 b 后 actor 执行，第 8 子步插入成功，\(\gamma=0.96\)：
+
+| 字段 | 值 |
+|------|-----|
+| `discounted_chunk_reward` | \(0.96^7 \approx 0.751\) |
+| `terminations` | True → `not_done=0` |
+| **target_q** | **0.751**（无 bootstrap） |
+| **Critic 学** | \(Q_1(s, a_{\text{actor}}) \approx Q_2(s, a_{\text{actor}}) \approx 0.751\) |
+| **更新** | 仅 `q_head` 权重；`target_model.q_head` EMA 跟随 |
+
+若同 chunk 未成功、episode 未终止：
+
+| 字段 | 值 |
+|------|-----|
+| `discounted_chunk_reward` | \(\approx 0\)（全 0 奖励） |
+| **target_q** | \(0 + 0.96^{10} \cdot Q_{\text{target}}(s', a') \approx 0.665 \cdot Q_{\text{target}}\) |
+| **含义** | Critic 把「当前 chunk 没立刻成功」时的 **长期价值** 传给当前 \((s, a)\) |
+
+---
+
+## 七、与 Actor 训练的边界（避免混淆）
+
+- **Critic**（本节）：`−MSE(Q, target_q)`，更 **`q_head`**。
+- **Actor**（另线）：`−0.1·Q_1(s, π(s)) + 5·BC`，更 **`backbone` + `actor_mean`**；BC 目标为 `ref_chunk` 或人工动作。
+
+两者共用 replay，但 **优化参数、loss、更新频率不同**；文档 225–231 行 **只描述 Critic 的 TD target**，不涉及 actor 的 BC 项。
+
+---
+
+**一句话**：RLT Critic 把每个 10 步 action chunk 当作宏动作，用 \(\sum_{k=0}^{9}\gamma^k r_k + (1-\text{done})\cdot\gamma^{10} Q_{\text{target}}(s', \pi(s'))\) 作 TD 目标，在 **冻结的 `z_rl` 特征空间** 里只训练 **`q_head`**；真机操作员通过执行任务产生 chunk 级奖励与 transition，Critic 在 Actor Worker 中异步从 replay 学习「这段 chunk 值多少」，成功终止时不 bootstrap，以匹配 peg insertion 的稀疏终止奖励结构。
 
