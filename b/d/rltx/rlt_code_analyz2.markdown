@@ -3297,6 +3297,325 @@ flowchart TB
 
 **一句话**：RLT Critic 把每个 10 步 action chunk 当作宏动作，用 \(\sum_{k=0}^{9}\gamma^k r_k + (1-\text{done})\cdot\gamma^{10} Q_{\text{target}}(s', \pi(s'))\) 作 TD 目标，在 **冻结的 `z_rl` 特征空间** 里只训练 **`q_head`**；真机操作员通过执行任务产生 chunk 级奖励与 transition，Critic 在 Actor Worker 中异步从 replay 学习「这段 chunk 值多少」，成功终止时不 bootstrap，以匹配 peg insertion 的稀疏终止奖励结构。
 
+---
+
+## 下面讨论的是 q_pi 和 `q_value_*` 的计算
+
+下面把 `rlt.rst:715` 里的 **`q_pi`** 和 **`q_value_*`** 从「是什么 → 怎么算 → 输入/输出/label → 谁更新权重 → 实现细节 → 设计原因」完整对齐本地代码。
+
+---
+
+## 1. 文档这句话在说什么
+
+```715:715:docs/source-zh/rst_source/examples/embodied/rlt.rst
+  - ``q_pi`` 和 ``q_value_*``：actor 和 critic heads 上的 Q 值。
+```
+
+更精确的代码含义是：
+
+| 指标 | 实际来源 | 含义 |
+|------|----------|------|
+| **`q_value_0`, `q_value_1`, …** | **Actor 更新步** `forward_actor()` | Twin-Q 中**每个 Q head** 在 **\(Q(s, \pi(s))\)** 上的 batch 均值 |
+| **`q_pi`** | 同上 | 取 **Q1 head**（第 0 个 head）的 \(Q(s, \pi(s))\) batch 均值，用于 actor 的 \(-Q\) 项 |
+| **`critic/q_data`**（文档未列，但成对出现） | **Critic 更新步** `forward_critic()` | 同一组 Q head 在 **\(Q(s, a_{\text{replay}})\)** 上的 batch 均值 |
+
+文档里的 “actor 和 critic heads” 指的是 **同一套物理 Q 网络**（`MultiQHead`，默认 2 个 head），不是两套独立网络。  
+**`q_pi` / `q_value_*` 只在 actor 前向里打日志**；critic 侧对应诊断是 **`q_data`**。
+
+日志前缀：`update_one_epoch()` 里 actor metrics 加 `actor/` 前缀 → TensorBoard/WandB 里看到 **`train/actor/q_pi`**、**`train/actor/q_value_0`** 等。
+
+---
+
+## 2. Q 网络结构与 “head” 是什么
+
+Stage 2 真机用 `RLTMLPPolicy`（`rlt_mlp_policy`），内置 **Twin Q**（Clipped Double Q / SAC 风格）：
+
+```71:76:rlinf/models/embodiment/mlp_policy/mlp_policy.py
+self.q_head = MultiQHead(
+    hidden_size=self.critic_obs_dim,
+    hidden_dims=[256, 256, 256],
+    num_q_heads=2,
+    output_dim=output_dim,
+    action_feature_dim=action_dim * self.num_action_chunks,
+)
+```
+
+`MultiQHead` 是 **两个独立的 `QHead` MLP**，输出 concat：
+
+```150:160:rlinf/models/embodiment/modules/q_head.py
+def forward(self, state_features, action_features):
+    q_vs = []
+    for qf in self.qs:
+        q_vs.append(qf(state_features, action_features))
+    return torch.cat(q_vs, dim=-1)  # [B, num_q_heads]
+```
+
+对 RLT Stage 2：
+
+- **Critic 状态** \(s\)：`cat(z_rl, proprio)`，**不含** `ref_chunk`
+- **动作** \(a\)：整段 action chunk 展平，维度 `10 × 7 = 70`（配置 `num_action_chunks=10`, `action_dim=7`）
+- **Actor 状态**（只用于出 \(\pi\)）：`cat(ref_chunk, z_rl, proprio)`
+
+```131:165:rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py
+def _critic_state(self, obs: dict) -> torch.Tensor:
+    return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
+
+def sac_q_forward(self, obs, actions, ..., detach_encoder=False):
+    critic_state = self._critic_state(obs)
+    if detach_encoder:
+        critic_state = critic_state.detach()
+    return self.q_head(critic_state, self._flatten_batch(actions))
+```
+
+因此：**Q 估计的是「在 RLT 特征状态 \(s=\{z\_rl, proprio\}\) 下，执行某个 action chunk \(a\) 的 chunk 级折扣回报」**，不是逐步 Q。
+
+---
+
+## 3. `q_pi` 和 `q_value_*` 如何计算（Actor 步）
+
+计算链在 `RLTACLossMixin.forward_actor()`：
+
+```297:364:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+# 1) 用 curr_obs 采样 actor 输出 pi
+pi, log_pi, _ = self.model(forward_type=ForwardType.SAC, obs=curr_obs, ...)
+
+# 2) 把 pi 喂进 Q 网络（detach_encoder=True）
+all_qf_pi = self.model(
+    forward_type=ForwardType.SAC_Q,
+    obs=curr_obs,
+    actions=pi,
+    detach_encoder=True,
+)
+
+# 3) 打 metric
+metrics = {f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item() ...}
+qf_pi = self._q1(all_qf_pi)   # 只取 head 0
+metrics["q_pi"] = qf_pi.mean().item()
+
+# 4) actor loss 用 q_pi
+actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
+```
+
+用公式写就是：
+
+\[
+\pi = \tanh(\mathcal{N}(\mu_\theta(s_{\text{actor}}), \sigma_{\text{fixed}})), \quad s_{\text{actor}} = [\text{ref\_chunk}, z_{rl}, \text{proprio}]
+\]
+
+\[
+Q_i(s, \pi) = \text{QHead}_i\big(\text{concat}(z_{rl}, \text{proprio}),\ \pi\big), \quad i \in \{0,1\}
+\]
+
+\[
+\texttt{q\_value\_}i = \mathbb{E}_{\text{batch}}[Q_i(s, \pi)], \quad
+\texttt{q\_pi} = \mathbb{E}_{\text{batch}}[Q_0(s, \pi)]
+\]
+
+**要点：**
+
+1. **`q_value_*` 是监控量**，对 batch 求 `.mean()` 后 `.detach()` 进 metrics，**不参与 loss 的单独项**。
+2. **`q_pi` 特指 Q1（head 0）**，RLT 硬编码 `_q1()`，不用 `min(Q1,Q2)` 做 actor 目标（与 critic bootstrap 的 `min` 不同）。
+3. 配置里虽有 `actor_agg_q: q1`，RLT 路径不读该字段，行为与之一致。
+4. **`detach_encoder=True`**：\(z_{rl}, proprio\) 不参与 Q 对「状态输入」的梯度；actor 的 \(-Q\) 项只通过 **\(\pi\)** 反传到 `backbone`/`actor_mean`。
+
+---
+
+## 4. Critic 侧的对应量：`q_data`（补充理解）
+
+Critic 步不算 `q_pi`，而算 **`q_data`**：
+
+```276:295:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+all_data_q_values = self.model(
+    forward_type=ForwardType.SAC_Q,
+    obs=curr_obs,
+    actions=actions,  # replay 里实际执行的动作，不是 pi
+)
+critic_loss = F.mse_loss(all_data_q_values, target_q_values.expand_as(all_data_q_values))
+return critic_loss, {"q_data": all_data_q_values.mean().item()}
+```
+
+| 对比项 | Actor 步 (`q_pi`, `q_value_*`) | Critic 步 (`q_data`) |
+|--------|-------------------------------|----------------------|
+| 动作 | \(\pi(s)\) 当前 actor 输出 | `batch["actions"]` replay 行为动作 |
+| 用途 | 监控 + actor \(-Q_1\) 目标 | TD 拟合 + 监控 |
+| 是否 detach 状态 | 是（`detach_encoder=True`） | 否（但 \(z_{rl}\) 本身是 frozen 特征张量） |
+
+---
+
+## 5. 输入、输出与 label（Critic 的 TD label）
+
+### 5.1 采样 batch 输入
+
+来自 replay（见前面对 replay 的分析）：
+
+```python
+curr_obs = {z_rl, proprio, ref_chunk}   # Q 只用 z_rl + proprio
+next_obs = {next_z_rl, next_proprio, next_ref_chunk}
+actions  = 实际执行的动作 chunk          # critic 的 a
+rewards  = chunk 内逐步 reward [B, H] 或 [B, H, 1]
+dones / terminations
+```
+
+### 5.2 Critic TD target（label）
+
+```243:274:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+next_actions, _, _ = self.model(forward_type=ForwardType.SAC, obs=next_obs)
+all_qf_next_target = self.target_model(forward_type=ForwardType.SAC_Q, obs=next_obs, actions=next_actions)
+q_next = min(Q1', Q2')   # _min_twin_q
+
+reward_target = sum_{t=0}^{H-1} gamma^t * r_t   # _discounted_chunk_rewards
+bootstrap_discount = gamma^H
+target_q = reward_target + (1-done) * bootstrap_discount * q_next
+```
+
+\[
+y = \sum_{t=0}^{H-1} \gamma^t r_t + (1 - \text{done}) \cdot \gamma^H \cdot \min\bigl(Q^{\text{target}}_1(s', \pi(s')), Q^{\text{target}}_2(s', \pi(s'))\bigr)
+\]
+
+**Label 是标量** \(y\)，shape `[B, 1]`，**广播到两个 Q head**：
+
+\[
+\mathcal{L}_{\text{critic}} = \text{MSE}(Q_1(s,a), y) + \text{MSE}(Q_2(s,a), y)
+\]
+
+真机配置：`gamma=0.96`, `bootstrap_type=standard`, `backup_entropy=False`（RLT 无 entropy backup）。
+
+### 5.3 Actor 的 “label”
+
+Actor **没有 Q 的 regression label**；Q 项是 **最大化** \(Q_1(s,\pi)\)。  
+BC 项的 label 是 `bc_target = where(human, actions, ref_chunk)`（训练时算，不在 buffer 里）。
+
+---
+
+## 6. 权重如何更新（谁冻结、谁动）
+
+```mermaid
+flowchart LR
+    subgraph frozen["冻结 / 不训练"]
+        FM[rollout.rlt_feature_model]
+        Z[z_rl, proprio 来自 frozen encoder]
+    end
+
+    subgraph actor_opt["self.optimizer"]
+        BB[backbone]
+        AM[actor_mean]
+    end
+
+    subgraph critic_opt["self.qf_optimizer"]
+        QH[q_head Q0 + Q1]
+    end
+
+    subgraph target["target_model 软更新"]
+        TQ[target q_head]
+    end
+
+    FM --> Z
+    Z --> QH
+    Z --> BB
+    ref[ref_chunk] --> BB
+
+    critic_loss --> QH
+    actor_bc --> BB
+    actor_bc --> AM
+    actor_q["-q_weight * Q1(s,pi)"] --> AM
+    actor_q -.->|梯度经 pi，不 step q_head| BB
+
+    QH -.tau.-> TQ
+```
+
+| 模块 | 是否更新 | 更新来源 |
+|------|----------|----------|
+| `rollout.rlt_feature_model` | 否 | Stage1 冻结，只产出 \(z_{rl}\) |
+| `backbone` + `actor_mean` | 是 | `bc_loss` + \(-Q_1(s,\pi)\) 对 \(\pi\) 的梯度 |
+| `q_head`（Q0, Q1） | 是 | **仅** `critic_loss` TD MSE（`qf_optimizer`） |
+| `target_model.q_head` | 软更新 | 每步 `tau=0.005` 从 online `q_head` 拷贝 |
+
+优化器分组（SAC worker 通用逻辑）：`q_head` 归 **critic optimizer**，`backbone`/`actor_mean` 归 **actor optimizer**。  
+因此 actor 的 \(-Q\) 项 **只改变策略 \(\pi\)**，**不直接 step Q 权重**；Q 权重由 critic TD 学习。
+
+`update_one_epoch` 顺序（每个 micro-batch 循环内）：
+
+1. `forward_critic` → `qf_optimizer.step()` → 更新 Q head  
+2. 若 `update_step % critic_actor_ratio == 0`：`forward_actor` → `optimizer.step()` → 更新 actor  
+3. `soft_update_target_model()` 更新 target Q
+
+真机配置 `critic_actor_ratio: 4`：**每 4 次 critic 更新才 1 次 actor 更新**；`q_pi` 只在 actor 步刷新。
+
+---
+
+## 7. 端到端数据流（一次 actor 更新）
+
+```mermaid
+sequenceDiagram
+    participant RB as Replay Buffer
+    participant AW as Actor Worker
+    participant M as RLTMLPPolicy
+    participant Q as MultiQHead
+
+    RB->>AW: batch[curr_obs, actions, ...]
+    AW->>M: SAC(curr_obs) → pi
+    Note over M: actor_state = [ref_chunk, z_rl, proprio]
+    AW->>M: SAC_Q(curr_obs, pi, detach_encoder=True)
+    M->>Q: Q(s_critic, pi)
+    Q-->>AW: all_qf_pi [B,2]
+    AW->>AW: q_value_0/1 = mean; q_pi = mean(Q0)
+    AW->>AW: loss = -q_weight*q_pi + bc_weight*BC
+    AW->>M: backward → backbone, actor_mean
+```
+
+---
+
+## 8. 张量形状示例（真机默认配置）
+
+| 张量 | 典型 shape | 说明 |
+|------|------------|------|
+| `z_rl` | `[B, 2048]` | RLT token 特征 |
+| `proprio` | `[B, 19]` | 本体状态 |
+| `ref_chunk` | `[B, 20×7]` 截断到 `[B, 10×7]` | 仅 actor 用 |
+| `pi` / `actions` | `[B, 70]` | 10-step × 7-DoF chunk |
+| `all_qf_pi` | `[B, 2]` | Twin Q 标量输出 |
+| `q_pi`（标量 log） | scalar | `all_qf_pi[:,0].mean()` |
+| TD target `y` | `[B, 1]` | chunk 折扣回报 + bootstrap |
+
+---
+
+## 9. 与标准 SAC 的差异（读 metrics 时要注意）
+
+| 点 | 标准 `EmbodiedSACFSDPPolicy` | RLT `rlt_ac` |
+|----|------------------------------|--------------|
+| Actor Q 聚合 | `agg_q`: min 或 mean | **固定 Q1** → `q_pi` |
+| Actor loss | `α log π - Q` | **`-q_weight·Q1 + bc_weight·BC`**，α=0 |
+| Critic reward | 常 `sum(rewards)` | **chunk 内 \(\sum \gamma^t r_t\)** + \(\gamma^H\) bootstrap |
+| Q 状态 | 依模型而定 | **`z_rl + proprio`（无 ref）** |
+| 监控 | 同样有 `q_pi`, `q_value_*` | 额外有 `bc_*`, `weighted_q`, `action_ref_abs_mean` |
+
+---
+
+## 10. 设计原因（为什么这样实现 metrics）
+
+1. **Twin Q + `q_value_0/1` 分开打**：看两个 head 是否发散、是否过估计；RLT critic bootstrap 用 **min**，actor 用 **Q1**，故 **`q_pi` 通常 ≥ min(Q1,Q2) 的趋势** 可反映 optimistic bias。  
+2. **`q_pi` 用当前策略动作**：反映「actor 认为自己策略值多少 Q」，与 **`q_data`（行为动作上的 Q）** 对比，可看 off-policy gap（VLA ref 阶段 vs actor 阶段 mix 时尤其有用）。  
+3. **Chunk-level Q + \(\gamma^H\) bootstrap**：与 action chunk 执行、reward 聚合一致，避免把 10 步 chunk 当成单步 MDP。  
+4. **Critic 不看 ref_chunk**：Q 评估的是 **RL 状态空间** 里行为好坏；ref 只作 actor 条件输入和 BC anchor，不进入 value 函数（减维、避免 value 依赖 frozen VLA 每步重算的 ref）。
+
+---
+
+## 11. 读日志时的实用对照
+
+| 日志键 | 何时更新 | 解读 |
+|--------|----------|------|
+| `train/actor/q_pi` | actor 步 | 当前 batch 上 \(Q_1(s,\pi)\) 均值；随策略/ critic 变化 |
+| `train/actor/q_value_0` | actor 步 | Q head 0 同上 |
+| `train/actor/q_value_1` | actor 步 | Q head 1 同上 |
+| `train/critic/q_data` | 每 critic 步 | replay 行为动作上的 Q 均值 |
+| `train/critic/critic_loss` | critic 步 | TD MSE；Q 学得像不像 label |
+| `train/actor/weighted_q` | actor 步 | `q_weight * q_pi`，与 BC 项量级对比 |
+
+若 **`q_pi` 长期接近 0 且不涨**，常见原因：reward 稀疏/尺度小、critic 未收敛、或 `q_weight` 太小（默认 0.1）导致 Q 信号弱——需结合 `critic_loss`、`replay/reward_positive_rate` 一起看。
+
+---
+
+**总结一句**：`q_value_*` 是 **Twin Q 各 head 对当前 actor 输出 \(\pi(s)\) 的 Q 估计 batch 均值**；`q_pi` 是其中 **Q1 head 的均值**，并进入 actor loss 的 \(-q\_weight \cdot Q_1\) 项；它们 **不来自 critic 训练步的直接 log**，但与 critic 共用的 `MultiQHead` 由 TD loss（label 为 chunk 折扣回报 + target min-Q bootstrap）更新，target 网络软同步提供 bootstrap 稳定性。
 
 # rlt.rst中的action loss
 
@@ -4371,3 +4690,332 @@ if key == "q":
 ---
 
 **一句话**：「按 `b` 进入 Stage 2 actor」= `KeyboardRLTPolicySwitchWrapper` 通过 evdev 把 **`b` 映射为锁存的 `info["rlt_switch_flags"]`**，经 Env→Rollout 传给 **`RealworldRLTRoute`**，在 VLA `ref_chunk` 与 MLP actor 动作之间切换；定制时继承/改写该 wrapper 的按键逻辑，保持 `rlt_switch_flags` 契约，并在 `apply.py` 注册新的 `keyboard_reward_wrapper` 模式即可。
+
+# rlt.rst 中的 Replay Buffer
+
+下面按「从环境 step 到梯度更新」的时间顺序，把 `rlt.rst:680-699` 描述的 Replay Buffer 逻辑与本地代码对齐说明。
+
+---
+
+## 1. 文档在说什么（术语对照）
+
+| 术语 | 含义 | 代码落点 |
+|------|------|----------|
+| **`loss_type: rlt_ac`** | 启用 RLT Actor-Critic（非标准 SAC：无 entropy/α，固定方差 actor，Twin-Q critic，BC 正则） | `env_worker` 检测 `rlt_ac` 开启 RLT 路径；Actor 为 `RLTACFSDPPolicy` / `AsyncRLTACFSDPPolicy` |
+| **`transition`** | 一条 `(curr_obs, action, reward, next_obs, done, …)`，状态是 **RLT 特征**而非原始图像 | `update_rlt_transitions()` + `EmbodiedTrajectoryBuilder.append_transitions()` |
+| **`curr_obs` / `next_obs`** | `{z_rl, proprio, ref_chunk}` 三个张量 | `RLT_OBS_KEYS` in `transition.py` |
+| **`action`** | **实际发给环境的 action chunk**（route 后 + 人工干预后），不是 actor 的 π | `forward_inputs["action"]` → `ChunkStepResult.actions` |
+| **`BC target`** | **训练时现场计算**，不写入 buffer | `RLTACLossMixin._bc_metrics()` |
+| **真机切换前 step 仍训练** | 切换前执行 VLA `ref_chunk`，整条 transition 仍入库（真机路径**不过滤** `record_transition`） | `_ingest_rollout_trajectories()` 真机分支 |
+| **同一 replay buffer** | 在线 rollout 与 demo（人工干预）共用 `TrajectoryReplayBuffer` 体系 | `setup_sac_components()` |
+| **`sample_window_size`** | 采样时只看**最近 N 条 trajectory** 内的 transition | `TrajectoryReplayBuffer.sample_chunks()` |
+| **`max_steps_per_rollout_epoch` / rollout flush** | 一次 interact epoch 收集的环境 **step 数**；flush = epoch 结束把 trajectory **推送给 Actor** | `n_train_chunk_steps = max_steps // num_action_chunks` |
+
+Stage 2 真机配置示例（`realworld_rlt_stage2_ac_mlp.yaml`）：
+
+- `max_steps_per_rollout_epoch: 300`，`num_action_chunks: 10` → 每 flush **30 个 chunk-step**（30 条 transition）
+- `sample_window_size: 200` → 采样窗口是**最近 200 条 trajectory**，与 300 step/flush **独立**
+
+---
+
+## 2. 端到端流水线（逐步 I/O）
+
+### 阶段 A：Rollout 侧 — 冻结特征 + 动作路由
+
+```mermaid
+sequenceDiagram
+    participant Human as 人(SpaceMouse/键盘)
+    participant Env as EnvWorker
+    participant Rollout as RolloutWorker
+    participant FM as rlt_feature_model(冻结)
+    participant MLP as Actor副本(推理)
+
+    Env->>Rollout: obs, rlt_switch_flags
+    Rollout->>FM: extract_rlt_obs(env_obs) [@no_grad]
+    FM-->>Rollout: z_rl, proprio, ref_chunk
+    Rollout->>MLP: predict_action_batch(rlt_obs)
+    MLP-->>Rollout: student_actions
+    Rollout->>Rollout: RLTRoute.route(ref vs actor)
+    Note over Rollout: forward_inputs.action = 实际执行动作
+    Rollout->>FM: extract_rlt_obs(final_obs) → rlt_transition_*
+    Rollout-->>Env: PolicyOutput(actions, forward_inputs)
+```
+
+**Rollout Worker**（`predict_rlt_actions`）：
+
+```38:84:rlinf/algorithms/rlt/rollout.py
+def predict_rlt_actions(...):
+    with torch.no_grad():
+        rlt_obs = feature_model.extract_rlt_obs(env_obs)
+        actions, result = policy_model.predict_action_batch(...)
+        route_output = rlt_route.route(...)
+        _append_rlt_transition_obs(...)  # 写入 rlt_transition_{z_rl,proprio,ref_chunk}
+```
+
+**冻结模块**：`rollout.rlt_feature_model`（Stage 1 OpenPi + RLT encoder）在 rollout worker 里 `eval()` + `requires_grad_(False)`，只前向提特征，**权重不更新**。
+
+**真机路由**（`RealworldRLTRoute`）：`rlt_switch_flags=False` 用 VLA `ref_chunk`，`True` 用 MLP actor 输出；`forward_inputs["action"]` 始终是**环境实际收到的动作**：
+
+```119:144:rlinf/algorithms/rlt/route.py
+routed_actions = torch.where(rlt_switch_flags, actions, ref_actions[...])
+result["forward_inputs"]["action"] = routed_actions.reshape(...)
+result["forward_inputs"]["record_transition"] = rlt_switch_flags.reshape(...)[:, :1]
+```
+
+**人在做什么**：
+- **键盘** `b`：切换 `rlt_switch_flags`（VLA ref ↔ learned actor）
+- **SpaceMouse**：`intervene_actions` 覆盖部分 chunk 步的动作；`intervene_flags` 标记人工步
+- **键盘奖励 wrapper**：给 RL 奖励信号（与 buffer 存储格式无关）
+
+---
+
+### 阶段 B：Env Worker — 组装 transition
+
+每个 **chunk-step** 的 I/O：
+
+| 步骤 | 输入 | 输出 / 写入 |
+|------|------|-------------|
+| 收 rollout 结果 | `policy_output.forward_inputs`（含 `action`, `ref_chunk`, `rlt_transition_*`） | `append_step_result`：`actions`=执行动作，`rewards`，`dones`，`forward_inputs` |
+| 缓存 curr_obs | 同上（非 transition 前缀键） | `pending_obs[stage] = {z_rl, proprio, ref_chunk}` |
+| `env_interact_step` | `policy_output.actions`（route 后） | 新 `env_output.obs` |
+| 下一 chunk 收 rollout | 新 obs 上的 `rlt_transition_*` | 与 `pending_obs` 组成一条 transition |
+
+**Transition 组装核心**（`update_rlt_transitions`）：
+
+```62:103:rlinf/algorithms/rlt/transition.py
+# pending 非空 → 写入 (curr_obs, next_obs)
+next_obs = extract_rlt_obs_from_forward_inputs(policy_output.forward_inputs, transition=True)
+trajectory_builders[stage_id].append_transitions(pending_obs[stage_id], next_obs)
+# 若 cache_current → 缓存本步 curr_obs；人工干预会改写 curr_obs 内 ref_chunk
+```
+
+**单条 transition 的语义**（与文档一致）：
+
+```text
+curr_obs = {z_rl, proprio, ref_chunk}     # 执行 action 前的 RLT 状态
+action   = forward_inputs["action"]       # 实际执行的动作 chunk [B, H*dim]
+reward   = chunk 内逐步 reward（用于 discounted_chunk_reward）
+next_obs = {next_z_rl, next_proprio, next_ref_chunk}  # 执行后下一步重算的 RLT 特征
+```
+
+**注意**：`ref_chunk` 在 **curr 和 next 里都会随冻结 VLA 每步重算**；切换前后格式相同，只是 `action` 来源不同（ref vs actor）。
+
+**人工干预对存储的影响**：
+- `actions`：`update_last_actions` 把 SpaceMouse 动作写进 trajectory
+- `intervene_flags`：标记哪些 chunk 步是人工
+- `curr_obs["ref_chunk"]`：在 transition 组装时会把人工动作 merge 进 ref_chunk（供 BC 参考），但 **replay 里的 `actions` 仍是执行动作**
+
+---
+
+### 阶段 C：Rollout flush — trajectory 推送给 Learner
+
+**flush 触发**：`_run_interact_once` 跑完 `n_train_chunk_steps`（= `max_steps_per_rollout_epoch / num_action_chunks`）后：
+
+```1000:1010:rlinf/workers/env/env_worker.py
+trajectories = trajectory_builder.to_splited_trajectories(self.actor_split_num)
+trajectory_builder.clear()
+for trajectory in trajectories:
+    channel.put(trajectory, async_op=True)
+```
+
+**Trajectory 内容**（`to_trajectory`）：stack 后的 `actions`, `rewards`, `dones`, `curr_obs`, `next_obs`, `intervene_flags`, `forward_inputs` 等。
+
+**Actor 接收**：
+
+```689:703:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+trajectory = await input_channel.get(...)
+recv_list.append(trajectory)
+added, completed = self._ingest_rollout_trajectories(recv_list)
+```
+
+异步 runner 里 **Env 采集、Rollout 推理、Actor 收 trajectory + 训练** 并行；flush 是 Env 侧「一批 chunk 结束 → 推送」的节奏，不必等训练完成。
+
+---
+
+### 阶段 D：Replay 入库 — 真机 vs ManiSkill（重要差异）
+
+```604:655:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+if use_simulator_transition_replay(self.cfg):  # 仅 MANISKILL_RLT
+    # 切成 max_episode_length=1 的单 transition trajectory
+    # 且 record_transition==True 才入库
+    ...
+else:
+    self.replay_buffer.add_trajectories(recv_list)  # 真机：整段 trajectory 直接入库
+```
+
+| 路径 | 入库形态 | 是否过滤切换前 step |
+|------|----------|---------------------|
+| **真机 Franka** | 整段 trajectory（含 30 条 transition）直接 `add_trajectories` | **不过滤** → 切换前（VLA ref 执行）与切换后（actor 执行）**都进同一 buffer** |
+| **ManiSkill** | 先 `_transition_replay_trajectories` 切成 1-sample trajectory | **过滤** `record_transition`（critical phase 等）才入库 |
+
+文档 694 行「切换前仍训练」针对**真机**；ManiSkill 另有 `record_transition` 门控（`SimulatorRLTRoute` 写 `critical_phase`）。
+
+**Demo buffer**（真机）：从整 trajectory 里 `extract_intervene_traj()` 抽人工干预段，额外写入 `demo_buffer`，训练时可 replay+demo 混合采样。
+
+---
+
+### 阶段 E：采样 — `sample_window_size`
+
+```567:616:rlinf/data/storage/replay/buffer.py
+window_ids = self._trajectory_id_list[-window_size:]  # 最近 N 条 trajectory
+sample_ids = torch.randint(0, window_total_samples, (num_chunks,))
+# 均匀随机抽 transition，flatten 后按 idx 取 curr_obs/next_obs/actions/...
+```
+
+- **`sample_window_size=200`**：只在最近 200 条 trajectory 的所有 transition 上均匀采样（偏向**近期数据**，类似 recency window）
+- **不必等于** `max_steps_per_rollout_epoch`：前者管**采样范围**，后者管**每次 flush 采集多长**
+
+采样 batch 字段（供 critic/actor）：
+
+```python
+batch = {
+  "curr_obs": {z_rl, proprio, ref_chunk},   # [B, ...]
+  "next_obs": {next_z_rl, next_proprio, next_ref_chunk},
+  "actions":  历史执行动作,                  # critic 的 (s,a)；actor BC 的 anchor
+  "rewards":  chunk 内逐步 reward,
+  "dones"/"terminations": 终止标志,
+  "intervene_flags": 人工步标记,
+}
+```
+
+**Label 分工**（易混点）：
+
+| 字段 | 角色 | 是否 buffer 内固定 label |
+|------|------|--------------------------|
+| `actions` | Critic 拟合 \(Q(s,a)\) 的 **a**；人工步也是 BC 的 human target | 是（执行动作） |
+| `ref_chunk`（在 curr_obs 内） | Actor BC 的 **默认 target**（非人工步） | 是（每步 VLA 重算后存入） |
+| `π(obs)` | Actor 当前输出 | 否，forward 时算 |
+| **BC target** | `where(human, actions, ref_chunk)` | **训练时算，不存 buffer** |
+
+```123:124:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
+```
+
+---
+
+### 阶段 F：Learner 训练 — 谁更新、谁冻结
+
+**可训练（Actor Worker 上 FSDP 模型）**：
+- **Backbone**（RLT 特征上的 MLP encoder）
+- **`actor_mean`**（输出 action chunk）
+- **`q_head`**（Twin Q，critic）
+
+**冻结 / 不通过 replay 更新**：
+- **`rollout.rlt_feature_model`**（OpenPi+RLT Stage1）：只在 rollout GPU 上 frozen 推理
+- **VLA ref 本身**：不进入 Stage2 梯度；`ref_chunk` 是 frozen VLA 的输出张量
+- **Entropy / α**：`forward_alpha` 直接 `NotImplementedError`
+
+**Critic 一步**（`forward_critic`）：
+
+\[
+y = \sum_{t=0}^{H-1} \gamma^t r_t + (1-done)\cdot \gamma^H \min(Q_1', Q_2')(s', \pi(s'))
+\]
+
+- 输入：`curr_obs`, `next_obs`, **`actions`（执行动作）**, `rewards`
+- 更新：**仅 `q_head`**（及共享 backbone 的 critic 路径）
+- Target network 周期性 sync（`target_update_freq`）
+
+**Actor 一步**（`forward_actor`）：
+
+\[
+\mathcal{L}_{actor} = -q\_weight \cdot Q_1(s, \pi(s)) + bc\_weight \cdot \| \pi(s) - bc\_target \|^2
+\]
+
+- `π(s)` = 当前 actor 输出；BC 用 `ref_chunk` 或人工 `actions`
+- 更新：**backbone + actor_mean**（Q 用于 actor loss 时对 encoder `detach_encoder=True`）
+
+**权重同步**：Actor 更新后 → **Rollout 上的 MLP 副本**同步（`sync_weight`），保证在线执行与训练一致；feature model 不同步（始终 Stage1 checkpoint）。
+
+**训练调度**（`rlt_schedule`）：buffer 达到 `min_buffer_size` 后，按 `train_every_transitions` / `update_epoch` 决定每步 `run_training()` 做几次 `update_one_epoch`；与 flush 频率解耦。
+
+---
+
+## 3. 模块职责与调用关系（静态）
+
+```mermaid
+flowchart TB
+    subgraph 采集["采集侧 (Ray Workers)"]
+        E[EnvWorker<br/>组装 trajectory]
+        R[RolloutWorker<br/>predict_rlt_actions]
+        FM[rlt_feature_model ❄️]
+        RT[RLTRoute]
+        E <-->|Channel| R
+        R --> FM
+        R --> RT
+    end
+
+    subgraph 学习["学习侧 (Actor Worker)"]
+        RB[(TrajectoryReplayBuffer)]
+        DS[ReplayBufferDataset.sample]
+        C[Critic forward_critic]
+        A[Actor forward_actor]
+        M[FSDP Model: backbone+actor+q_head ✅]
+        RB --> DS --> C
+        DS --> A
+        C --> M
+        A --> M
+    end
+
+    E -->|flush trajectory| RB
+    M -.权重同步.-> R
+```
+
+---
+
+## 4. 设计 rationale（为什么要这样）
+
+1. **状态存 RLT 特征而非图像**  
+   降维、固定维度、与 Stage1 表示对齐；replay 体积和采样 IO 远小于存 raw image。代价是 **状态分布依赖 frozen encoder**，Stage2 假设 Stage1 已足够好。
+
+2. **`action` 存执行动作，BC target 训练时再算**  
+   Critic 必须学 **行为策略下的 Q**（off-policy 但行为含 VLA ref + actor + 人工）；BC 需要对 ref 和 human 两种监督分开处理，用 `intervene_flags` 动态选 target，比存两套 label 更省且一致。
+
+3. **真机不过滤切换前 transition**  
+   切换前数据是 **VLA 示范的行为分布**，仍含有效 `(s, a_ref, r, s')`，可帮 critic 估 Q、actor 做 BC 锚定；若过滤会浪费大量采集成本。ManiSkill 用 `record_transition` 是为仿真里 **只在 critical phase 做 RL** 的实验设计。
+
+4. **ManiSkill 切成 1-sample trajectory**  
+   仿真 env 多、并行高，按 env-step 粒度入库便于与 `record_transition` 门控、done 对齐；真机单 env、trajectory 较短，整段入库再 flatten 采样更简单。
+
+5. **`sample_window_size` 与 flush 长度解耦**  
+   flush 由机器人控制频率和 epoch 设计决定；采样窗口控制 **非平稳策略下的 recency**，避免过旧 VLA-only 数据主导更新。两者职责不同，故文档强调不必一致。
+
+6. **Feature model 放 Rollout、Actor 只训小 MLP**  
+   大 VLM 不在 RL 环里反传，显存和延迟可控；RL 在 **固定语义特征空间** 里做 AC+BC，符合 RLT「Stage1 表征 + Stage2 策略」两阶段范式。
+
+---
+
+## 5. 一个真机 flush 的数值例子
+
+配置：`max_steps_per_rollout_epoch=300`, `num_action_chunks=10`, `sample_window_size=200`
+
+1. Env 循环 **30 次 chunk**（每次 10 个 env step）  
+2. 每次产生 1 条 transition → trajectory 含 **30 条** `(curr_obs, action, next_obs, …)`  
+3. flush → Actor `add_trajectories` 1 条 trajectory（`num_samples=30`）  
+4. 训练时 `sample(batch_size)` 从**最近 200 条 trajectory** 的全部 transition 中随机抽 B 条  
+5. 若操作员前 15 chunk 未按 `b`（VLA ref），后 15 chunk 按 `b`（actor）：**30 条全部可采样**；BC 对前 15 条 target≈`ref_chunk`，critic 的 `a` 也是 ref 执行动作
+
+---
+
+## 6. 关键代码索引
+
+| 功能 | 文件 |
+|------|------|
+| RLT obs 键与 transition 组装 | `rlinf/algorithms/rlt/transition.py` |
+| Rollout 特征+路由 | `rlinf/algorithms/rlt/rollout.py`, `route.py` |
+| Env 采集与 flush | `rlinf/workers/env/env_worker.py` |
+| Replay 入库（真机/仿真分叉） | `rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py` |
+| 采样窗口 | `rlinf/data/storage/replay/buffer.py` |
+| Critic/Actor/BC | `RLTACLossMixin` in 同上 |
+| Buffer 初始化 | `fsdp_sac_policy_worker.setup_sac_components()` |
+
+若你需要，我可以再单独画一张「单个 chunk-step 内 `pending_obs` 状态机」或对照 ManiSkill `record_transition` 过滤条件的逐步 trace。
+
+
+
+
+
+
+
+
+
+
