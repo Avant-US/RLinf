@@ -1085,4 +1085,1576 @@ VLA SFT only (π₀.₅)
 
 ---
 
-*本文档基于 `/home/nvidia/bt/s/RLinf/` 本地代码 2026-09-11 状态编写；若 upstream 变更，请以对应路径源码为准。*
+# rlt.rst 中`冻结的 Stage 1 特征模型`是什么
+## 结论
+
+文档里的 **「冻结的 Stage 1 特征模型」**，指的是 Stage 1 联合训练完成后保存的 **完整 OpenPI π₀.₅ + RLT Token Transformer 检查点**，在 Stage 2 中通过配置项 `rollout.rlt_feature_model` 加载，以 **`OpenPiPytorchEvalActionModel`**（`openpi.task: eval`）的形式运行。它在 rollout 阶段 **不参与梯度更新**，只负责把原始环境观测转换成 Stage 2 actor-critic 需要的 `{z_rl, proprio, ref_chunk}`。
+
+---
+
+## 1. 它由哪些组件构成？
+
+Stage 1 特征模型不是单独的小模块，而是 **两个子系统打包在一起**：
+
+| 组件 | 代码位置 | 作用 |
+|------|----------|------|
+| **π₀.₅ VLA 主干** (`Pi0`) | `rlinf/models/embodiment/openpi_rlinf/pi0_model/` | SigLIP 视觉编码 + Gemma 2B + 300M action expert；处理图像/语言/状态，输出 prefix hidden states，并采样 reference action chunk |
+| **RLT Token Transformer** (`rlt_module`) | `rlinf/models/embodiment/modules/rlt_token_transformer.py` | 读取 VLA prefix embeddings，压缩为紧凑向量 `z_rl`（默认 2048 维） |
+
+Stage 2 配置里写得很明确：
+
+```177:179:examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml
+  # Frozen Stage1 pi0.5 + RLT token transformer.
+  # This is the actual Stage1 model path. Rollout uses it to convert raw env
+  # observations into the Stage2 obs dict: z_rl, proprio, ref_chunk.
+```
+
+基类在 `use_rlt=True` 时会挂载 `rlt_module`：
+
+```48:60:rlinf/models/embodiment/openpi_rlinf/openpi_action_model.py
+        if self.rlt_cfg.use_rlt:
+            from rlinf.models.embodiment.modules.rlt_token_transformer import (
+                RLTTokenTransformer,
+            )
+
+            self.rlt_module = RLTTokenTransformer(
+                input_dim=self.rlt_cfg.rlt_input_dim,
+                embed_dim=self.rlt_cfg.rlt_embed_dim,
+                prefix_seq_len=self.rlt_cfg.rlt_prefix_seq_len,
+                num_layers=self.rlt_cfg.rlt_num_layers,
+                num_heads=self.rlt_cfg.rlt_num_heads,
+                mlp_ratio=self.rlt_cfg.rlt_mlp_ratio,
+            ).to(dtype=next(self.model.parameters()).dtype)
+```
+
+---
+
+## 2. 它从哪里来？（Stage 1 训练产物）
+
+Stage 1 用 `OpenPiPytorchSFTActionModel`（`openpi.task: sft`）在示范数据上 **联合优化** 两个目标：
+
+```87:96:rlinf/models/embodiment/openpi_rlinf/sft_action_model.py
+        per_timestep_loss, prefix_output, prefix_mask = (
+            self._sft_forward_with_rlt_prefix(observation, actions)
+        )
+        vla_loss = per_timestep_loss.mean()
+        rlt_loss, _ = self._rlt_forward(prefix_output, prefix_mask)
+        return {
+            "loss": rlt_loss + self.rlt_cfg.rlt_alpha * vla_loss,
+            "vla_loss": vla_loss,
+            "rlt_loss": rlt_loss,
+        }
+```
+
+- **`vla_loss`**：普通 flow-matching 动作预测，更新整个 VLA
+- **`rlt_loss`**：RLT token 重建目标，只更新 `rlt_module`（prefix 在送入 RLT 前做了 `detach()`，避免 RLT 梯度回灌 VLA prefix）
+
+训练完成后，检查点通常位于：
+
+```text
+logs/<run-name>/checkpoints/global_step_<step>/actor
+```
+
+Stage 2 必须把该 **`actor/` 目录** 填到 `rollout.rlt_feature_model.model_path`，**不能** 转成裸 `model.safetensors`，因为 `rlt_module.*` 权重保存在完整 wrapper checkpoint 里（见 `rlt_utils.py` 的 `load_full_wrapper_weights`）。
+
+---
+
+## 3. 「冻结」在代码里如何实现？
+
+Rollout worker 初始化时单独加载特征模型，并显式冻结：
+
+```151:157:rlinf/workers/rollout/hf/huggingface_worker.py
+        if rlt_feature_model_config is not None:
+            self.rlt_feature_model = get_model(copy.deepcopy(rlt_feature_model_config))
+            self.rlt_feature_model.eval()
+            self.rlt_feature_model.requires_grad_(False)
+            self.rlt_route = build_rlt_route(self.cfg)
+```
+
+核心推理入口 `extract_rlt_obs` 也在 `@torch.no_grad()` 下运行：
+
+```357:404:rlinf/models/embodiment/openpi_rlinf/eval_action_model.py
+    @torch.no_grad()
+    def extract_rlt_obs(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Extract the frozen Stage1 features consumed by the Stage2 RLT head."""
+        ...
+        prefix_output, prefix_mask, kv_cache = self.model.build_prefix_cache(
+            prepared_observation
+        )
+        ...
+        z_rl = self._encode_rlt_flat(rlt_prefix_output, rlt_prefix_mask).to(
+            dtype=torch.float32
+        )
+        ...
+        ref_chunk = self.output_transform(
+            {"actions": model_actions, "state": observation.state}
+        )["actions"]
+        ...
+        return {
+            "z_rl": z_rl,
+            "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
+            "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
+        }
+```
+
+Stage 2 **只训练** `actor.model` 下的轻量 `rlt_mlp_policy`（MLP actor + Q critic），约几百万参数；~2.3B 的 VLA + RLT transformer 权重保持不变，避免在线 RL 破坏 Stage 1 学到的表示。
+
+---
+
+## 4. 它在 Stage 2 里具体做什么？
+
+数据流如下：
+
+```mermaid
+flowchart LR
+    A["原始 env 观测<br/>(图像 + 状态 + 任务信息)"] --> B["rollout.rlt_feature_model<br/>(冻结 Stage 1)"]
+    B --> C["z_rl<br/>RL 紧凑表示"]
+    B --> D["proprio<br/>本体状态"]
+    B --> E["ref_chunk<br/>VLA 参考动作块"]
+    C --> F["Stage 2 MLP Actor-Critic<br/>(可训练)"]
+    D --> F
+    E --> F
+    F --> G["实际执行动作"]
+```
+
+Rollout 编排代码：
+
+```51:57:rlinf/algorithms/rlt/rollout.py
+    with torch.no_grad():
+        rlt_obs = feature_model.extract_rlt_obs(env_obs)
+        actions, result = policy_model.predict_action_batch(
+            env_obs=rlt_obs,
+            mode=mode,
+            return_obs=True,
+        )
+```
+
+三个输出的含义：
+
+- **`z_rl`**：VLA prefix hidden states 经 `RLTTokenTransformer.encode_flat()` 得到的 RL 表示（文档中 `z_dim: 2048`）
+- **`proprio`**：机器人/仿真本体状态（Franka 示例为 19 维 raw state）
+- **`ref_chunk`**：同一 VLA 用 flow matching 采样的 reference action chunk（如 20×7），供 actor 做 residual 修正或作为 VLA 阶段的 fallback 动作
+
+Replay buffer 存的 transition 也是这三元组，而不是原始像素。
+
+---
+
+## 5. 和 Stage 2 其它模型的区别
+
+| 配置项 | 模型 | Stage 2 是否更新 |
+|--------|------|------------------|
+| `rollout.rlt_feature_model` | Stage 1 完整 checkpoint（π₀.₅ + RLT transformer） | **冻结** |
+| `actor.model` (`rlt_mlp_policy`) | 轻量 MLP actor-critic | **训练** |
+| `rollout.model` | Stage 2 MLP 的 rollout 侧同步副本 | 从 actor 同步权重 |
+
+常见误配（文档多次强调）：
+
+- ❌ 把 Stage 1 路径填到 `rollout.model.model_path` 或 `actor.model.model_path`
+- ❌ 把 Stage 1 checkpoint 转成裸 safetensors（会丢失 `rlt_module` 权重）
+- ✅ 只填 `rollout.rlt_feature_model.model_path`，且 `repo_id` / `config_name` / `rlt_*` 超参与 Stage 1 一致
+
+---
+
+## 6. 一句话总结
+
+**「冻结的 Stage 1 特征模型」= Stage 1 联合 SFT 训出的 `OpenPiPytorchEvalActionModel`（π₀.₅ VLA + RLT Token Transformer），在 Stage 2 rollout 中作为固定的观测编码器，把原始传感器输入映射为 `{z_rl, proprio, ref_chunk}`，供轻量 actor-critic 在线学习；VLA 和 RLT 模块的权重在此阶段不再更新。**
+
+# rlt.rst 中的`标准 maximum-entropy SAC`
+
+## 先说结论
+
+文档第 195 行说的 **「标准 maximum-entropy SAC」**，指的是 Haarnoja 等人提出的 **Soft Actor-Critic（SAC）**：在最大化累积回报的同时，**显式最大化策略熵**，用温度系数 \(\alpha\) 平衡「多拿奖励」和「保持随机、多探索」。
+
+RLT Stage 2 虽然用了 SAC 的工程骨架（off-policy、replay buffer、twin Q、target network），但 **目标函数和训练机制已经偏离标准 max-entropy SAC**，更像 **「Q-learning + 行为克隆（BC）正则」的 actor-critic**。文档因此特意加 note 提醒，避免读者按标准 SAC 调参。
+
+---
+
+## 1. 什么是「标准 maximum-entropy SAC」？
+
+### 1.1 核心思想：奖励 + 熵
+
+普通 RL 只最大化期望回报；**maximum-entropy RL** 在目标里额外加入策略熵 \(H(\pi(\cdot|s))\)：
+
+\[
+J(\pi) = \sum_t \mathbb{E}_{(s_t,a_t)\sim\rho_\pi}\Big[r(s_t,a_t) + \alpha\, H(\pi(\cdot|s_t))\Big]
+\]
+
+- \(r\)：环境奖励  
+- \(H(\pi)\)：策略随机性（探索程度）  
+- \(\alpha\)：温度，控制「奖励 vs 熵」的权重；\(\alpha \to 0\) 时退化为普通 RL  
+
+**出处**：[Haarnoja et al., ICML 2018, Eq. (1)](https://proceedings.mlr.press/v80/haarnoja18b/haarnoja18b.pdf)；RLinf 中文算法文档 [`docs/source-zh/rst_source/reference/algorithms/sac.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/reference/algorithms/sac.rst) 第 13–37 行。
+
+直观理解：SAC 不只学「怎么做最好」，还鼓励策略 **保持一定随机性**，避免过早收敛到次优确定性策略，提升样本效率和稳定性。
+
+### 1.2 三个相互耦合的更新
+
+标准 SAC 通常包含三块（RLinf 文档第 39–65 行）：
+
+| 组件 | 目标 | 公式（简化） |
+|------|------|-------------|
+| **Critic (Q)** | 拟合 soft Bellman 目标 | \(L_Q = \frac{1}{2}(Q(s,a) - (r + \gamma(\min Q_{\text{targ}}(s',a') - \alpha \log\pi(a'|s'))))^2\) |
+| **Actor (\(\pi\))** | 最大化 Q，同时增大熵 | \(L_\pi = \mathbb{E}[\alpha \log\pi(a|s) - \min Q(s,a)]\) |
+| **Temperature (\(\alpha\))** | 自动调节探索强度 | \(L_\alpha = -\alpha(H_{\text{targ}} - H(\pi))\) |
+
+**出处**：RLinf [`sac.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/reference/algorithms/sac.rst) 第 39–65 行；原论文 [Haarnoja et al., 2018](https://arxiv.org/abs/1801.01290)。
+
+### 1.3 RLinf 里「标准 SAC」长什么样？
+
+配置示例（`loss_type: embodied_sac`）：
+
+```yaml
+algorithm:
+  adv_type: embodied_sac
+  loss_type: embodied_sac
+  entropy_tuning:
+    alpha_type: softplus      # 或 exp / fixed_alpha
+    initial_alpha: 0.01       # 通常 > 0
+    target_entropy: -4        # 目标熵 ≈ -action_dim
+  backup_entropy: True      # Critic bootstrap 里减去 α·log π
+```
+
+**出处**：[`docs/source-zh/rst_source/reference/algorithms/sac.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/reference/algorithms/sac.rst) 第 74–96 行。
+
+对应实现（标准 SAC actor loss）：
+
+```524:524:rlinf/workers/actor/fsdp_sac_policy_worker.py
+        actor_loss = ((self.entropy_temp.alpha * log_pi) - qf_pi).mean()
+```
+
+Critic bootstrap 里减去熵项：
+
+```412:415:rlinf/workers/actor/fsdp_sac_policy_worker.py
+                if self.cfg.algorithm.get("backup_entropy", True):
+                    qf_next_target = (
+                        qf_next_target - self.entropy_temp.alpha * next_state_log_pi
+                    )
+```
+
+还会训练温度参数：
+
+```547:549:rlinf/workers/actor/fsdp_sac_policy_worker.py
+        alpha = self.entropy_temp.compute_alpha()
+        alpha_loss = -alpha * (log_pi.mean() + self.target_entropy)
+        return alpha_loss
+```
+
+这三处合在一起，才是文档所说的 **「标准 maximum-entropy SAC」**。
+
+---
+
+## 2. RLT Stage 2 为什么「不是」标准 SAC？
+
+RLT Stage 2 的配置和 loss 实现都明确偏离了上述框架。
+
+### 2.1 配置层面的信号
+
+[`examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml) 第 70–106 行：
+
+```yaml
+algorithm:
+  adv_type: embodied_sac      # 复用 SAC 的 replay / worker 基础设施
+  loss_type: rlt_ac           # 但 loss 走 RLT 专用路径
+
+  q_weight: 0.1
+  bc_weight: 5                # ← 标准 SAC 没有 BC 项
+
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0        # ← 温度为 0
+
+  backup_entropy: False      # ← Critic 不做 entropy backup
+```
+
+注释也直接写明（第 85–86 行）：
+
+> Entropy/alpha is kept at zero; this is not standard maximum-entropy SAC.
+
+**出处**：[`realworld_rlt_stage2_ac_mlp.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)；[`rlt.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 第 193–195、306–314 行。
+
+### 2.2 Actor 目标：Q 最大化 + BC，没有熵项
+
+文档给出的 Stage 2 actor loss（[`rlt.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 第 306–314 行）：
+
+```text
+actor_loss = -q_weight * Q(obs, pi(obs)) + bc_weight * BC(pi(obs), target_action)
+```
+
+代码实现：
+
+```349:351:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        entropy = -log_pi.mean()
+        bc_weight, q_weight, weight_metrics = self._actor_objective_weights()
+        actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
+```
+
+对比标准 SAC：
+
+| | 标准 SAC | RLT Stage 2 |
+|---|---------|-------------|
+| Actor 目标 | \(\alpha \log\pi - Q\)（含熵奖励） | \(-q\_weight \cdot Q + bc\_weight \cdot BC\) |
+| BC 正则 | 无 | 有，target 为 VLA `ref_chunk` 或人类干预动作 |
+| 熵是否进 loss | 是（\(\alpha>0\)） | 否（\(\alpha=0\)） |
+
+`RLTACLossMixin` 的 docstring 也写得很清楚（第 38–44 行）：
+
+> RLT objective **disables entropy/alpha** and uses a fixed-std actor, min-Q critic target, Q1 actor objective, and **BC regularization**.
+
+**出处**：[`rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py) 第 38–44、349–351 行。
+
+### 2.3 完全关闭温度学习
+
+RLT 直接禁止 `forward_alpha`：
+
+```366:372:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+    @Worker.timer("forward_alpha")
+    def forward_alpha(self, batch):
+        del batch
+        raise NotImplementedError(
+            "RLT AC disables entropy/alpha training. Use "
+            "algorithm.entropy_tuning.alpha_type=fixed_alpha."
+        )
+```
+
+标准 SAC 会用 `forward_alpha` 自动调节 \(\alpha\)；RLT 没有这一步。
+
+### 2.4 Critic：chunk 折扣奖励，且不 backup 熵
+
+RLT critic 的 TD target（[`rlt.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 第 225–231 行）：
+
+```text
+target_q = discounted_chunk_reward + gamma ** chunk_horizon * Q_target(next_obs, next_action)
+```
+
+实现中 **没有** `- α log π` 项：
+
+```266:272:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+            reward_target = self._discounted_chunk_rewards(rewards)
+            reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
+            bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
+            if bootstrap_type == "always":
+                target_q_values = reward_target + bootstrap_discount * q_next
+            elif bootstrap_type == "standard":
+                target_q_values = reward_target + not_done * bootstrap_discount * q_next
+```
+
+标准 SAC 在 `backup_entropy=True` 时会做 `qf_next -= α * log_pi`；RLT 配置为 `backup_entropy: False`，代码路径也不减熵。
+
+另外，RLT 把 **action chunk 内逐步奖励先折扣求和** 再 bootstrap（`_discounted_chunk_rewards`），这是面向 chunk 控制的扩展，也不是教科书 SAC 的单步 \((s,a,r,s')\) 形式。
+
+### 2.5 策略几乎确定性：fixed_std
+
+标准 max-entropy SAC 的核心是 **随机策略**；RLT 的 MLP actor 用 **固定极小标准差**：
+
+```153:157:rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py
+        action_std = torch.full_like(action_mean, self.fixed_std)
+        probs = Normal(action_mean, action_std)
+        action = action_mean if deterministic else probs.rsample()
+        chunk_logprobs = probs.log_prob(action)
+        action = torch.tanh(action)
+```
+
+默认 `fixed_std: 0.002`（[`realworld_rlt_stage2_ac_mlp.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml) 第 238 行）。策略几乎是确定性的，与「maximum entropy」的探索哲学相悖。
+
+### 2.6 Actor 用 Q1，Critic 用 min twin-Q
+
+- Critic target：RLT 用 `_min_twin_q`（双 Q 取 min，防过估计）——这点 **与 SAC 一致**  
+- Actor 选动作：RLT 用 `_q1`（只用第一个 Q 头），标准 SAC 通常用 `min(Q1, Q2)`
+
+```337:337:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        qf_pi = self._q1(all_qf_pi)
+```
+
+---
+
+## 3. 一张对照表
+
+```mermaid
+flowchart TB
+    subgraph SAC["标准 maximum-entropy SAC"]
+        A1["目标: max 回报 + α·熵"]
+        A2["Actor: α·logπ − Q"]
+        A3["Critic: r + γ(min Q' − α·logπ')"]
+        A4["自动调节 α"]
+        A5["随机策略是核心"]
+    end
+
+    subgraph RLT["RLT Stage 2 (rlt_ac)"]
+        B1["目标: max Q + BC 贴近 VLA"]
+        B2["Actor: −q_weight·Q + bc_weight·BC"]
+        B3["Critic: chunk_reward + γ^H·min Q'"]
+        B4["α=0, 不训练温度"]
+        B5["fixed_std≈0, 近确定性"]
+    end
+
+    SAC -.->|"共享 replay / twin-Q / target net"| RLT
+```
+
+| 维度 | 标准 max-entropy SAC | RLT Stage 2 |
+|------|---------------------|-------------|
+| 优化哲学 | 奖励与熵 jointly 最大化 | 奖励最大化 + 不偏离 VLA/人类示范 |
+| `loss_type` | `embodied_sac` | `rlt_ac` |
+| Actor loss | \(\alpha\log\pi - Q\) | \(-q\_weight\cdot Q + bc\_weight\cdot BC\) |
+| 温度 \(\alpha\) | 通常 >0，可自动学习 | 固定为 0 |
+| Critic entropy backup | 默认 True | False |
+| BC 正则 | 无 | 有（`ref_chunk` / 人类动作） |
+| 策略随机性 | 核心机制 | 极小 fixed_std，几乎确定性 |
+| 观测 | 通常原始 state/图像 | `{z_rl, proprio, ref_chunk}` |
+| 奖励处理 | 逐步 TD | action chunk 内折扣累加 |
+
+---
+
+## 4. 为什么 RLT 要这样设计？
+
+结合 [RL Token 官方项目页](https://www.pi.website/research/rlt) 和文档逻辑，可以这样理解：
+
+1. **Stage 1 已有强 VLA 策略**：Stage 2 只需在 `ref_chunk` 附近做 **小 residual 修正**，不需要 SAC 式的大范围随机探索。  
+2. **BC 防止灾难性偏离**：`bc_weight: 5` 远大于 `q_weight: 0.1`，保证在线 RL 不会快速忘掉 VLA 能力。  
+3. **真机安全**：固定小噪声 + 无熵驱动，行为更可预测；配合 `rlt_policy_switch` 人工切换 VLA/actor 阶段。  
+4. **复用 SAC 基础设施**：`adv_type: embodied_sac` 让 RLT 继承 replay buffer、target network、FSDP worker 等，但 **换了一套更适合 VLA bootstrap 的目标函数**。
+
+---
+
+## 5. 一句话总结
+
+**「标准 maximum-entropy SAC」** = 在 actor、critic、temperature 三处都 **显式使用熵项 \(\alpha H(\pi)\)** 的 Soft Actor-Critic（[Haarnoja et al., 2018](https://arxiv.org/abs/1801.01290)；RLinf [`sac.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/reference/algorithms/sac.rst)）。
+
+**RLT Stage 2** 虽然叫 actor-critic、底层走 SAC worker，但 \(\alpha=0\)、无 entropy backup、actor 加 BC 正则、策略近确定性——因此文档 [`rlt.rst:195`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 明确标注：**不是标准 maximum-entropy SAC**，而是 **「SAC 工程壳 + Q/BC 混合目标」** 的在线 fine-tuning 方案。
+
+
+# rlt.rst中的"VLA reference action chunk" 
+
+## 一句话定义
+
+**VLA reference action chunk（`ref_chunk`）** 是：在 Stage 2 rollout 时，**冻结的 Stage 1 π₀.₅ VLA** 根据当前观测（图像 + 语言 + 本体状态）**实时推理出的一段未来动作序列**。它是 VLA 认为「此刻应该怎么做」的参考轨迹，供 Stage 2 轻量 actor 作为 **输入条件、行为先验（BC 目标）和 VLA 阶段的实际执行动作**。
+
+**出处**：[`docs/source-zh/rst_source/examples/embodied/rlt.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 第 200–206、306–314 行；[RL Token 官方项目页](https://www.pi.website/research/rlt)。
+
+---
+
+## 1. 它从哪来？——VLA 在线推理，不是离线示范
+
+`ref_chunk` **不是** replay 里存的专家示范，而是 **每一步 rollout 时现场算出来的**。
+
+冻结的 Stage 1 特征模型在 `extract_rlt_obs()` 里，与 `z_rl`、`proprio` 一起产出：
+
+```357:404:rlinf/models/embodiment/openpi_rlinf/eval_action_model.py
+    @torch.no_grad()
+    def extract_rlt_obs(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Extract the frozen Stage1 features consumed by the Stage2 RLT head."""
+        ...
+        prefix_output, prefix_mask, kv_cache = self.model.build_prefix_cache(
+            prepared_observation
+        )
+        ...
+        z_rl = self._encode_rlt_flat(rlt_prefix_output, rlt_prefix_mask).to(
+            dtype=torch.float32
+        )
+
+        model_actions = self._sample_actions_from_prefix_cache(
+            prepared_observation,
+            prefix_mask,
+            kv_cache,
+        )
+        ref_chunk = self.output_transform(
+            {"actions": model_actions, "state": observation.state}
+        )["actions"]
+        ...
+        return {
+            "z_rl": z_rl,
+            "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
+            "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
+        }
+```
+
+生成流程可以概括为：
+
+```mermaid
+flowchart LR
+    A["原始观测<br/>图像 + 语言 + state"] --> B["OpenPI transforms<br/>归一化 / tokenize"]
+    B --> C["π₀.₅ build_prefix_cache<br/>VLA 理解当前场景"]
+    C --> D["Flow Matching Euler 采样<br/>num_steps=4"]
+    D --> E["output_transform<br/>反归一化到 env 坐标系"]
+    E --> F["ref_chunk<br/>env-frame 动作块"]
+```
+
+### 1.1 采样：Flow Matching，不是 Stage 1 的 SFT 前向
+
+VLA 动作用 **flow matching 的 Euler ODE 采样器** 生成（与 Stage 1 训练时的 flow-matching 目标一致）：
+
+```406:438:rlinf/models/embodiment/openpi_rlinf/eval_action_model.py
+    def _sample_actions_from_prefix_cache(...):
+        """Run Pi0's eval Euler sampler using an already-built prefix cache."""
+        ...
+        x_t = noise
+        dt = -1.0 / self.num_steps
+        t = 1.0
+        while t >= -dt / 2:
+            ...
+            suffix_out = self.model.run_suffix(
+                observation, x_t, t_tensor, kv_cache, prefix_mask
+            )
+            v_t = self.model.velocity_from_suffix(suffix_out)
+            x_t = x_t + dt * v_t
+            t += dt
+        return x_t
+```
+
+- 从随机噪声出发，迭代 `num_steps` 步（Franka 配置为 4）去噪，得到模型内部动作
+- 再经 `output_transform` 反归一化，得到 **可直接发给机器人/仿真的 env-frame 动作**
+
+**出处**：[`realworld_rlt_stage2_ac_mlp.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml) 中 `rlt_feature_model.openpi.num_steps: 4`；Stage 1 配置 [`realworld_rlt_stage1_sft_openpi_pi05.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml) 第 46–66 行（`num_action_chunks: 20`, `action_dim: 7`）。
+
+### 1.2 为什么叫 "reference"？
+
+- **Reference** = 参考、基准，不是最终执行动作的唯一来源
+- Stage 2 actor 学的是 **在 VLA 建议之上做修正**（residual / edit），而不是从零学整个动作分布
+- 在 VLA 控制阶段，环境 **直接执行** `ref_chunk`（或其前若干步）
+
+文档表述（[`rlt.rst:306-314`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+> 普通 policy step 中，BC target 是 VLA reference action。
+
+---
+
+## 2. 它长什么样？——形状与语义
+
+### 2.1 张量形状
+
+| 字段 | 典型形状（Franka peg） | 含义 |
+|------|------------------------|------|
+| `ref_chunk` | `(B, 20, 7)` | B 个并行 env；20 步未来动作；每步 7 维（Franka 末端控制） |
+| `num_action_chunks`（actor 输出） | 10 | Stage 2 actor **实际输出/执行** 的步数 |
+| `ref_num_action_chunks` | 20 | VLA **推理** 的步数（≥ actor 步数） |
+
+Franka Stage 2 配置：
+
+```244:246:examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml
+    action_dim: 7
+    num_action_chunks: 10
+    ref_num_action_chunks: 20
+```
+
+- VLA 一次预测 **20 步** 未来动作（与 Stage 1 `action_horizon=20` 一致）
+- Stage 2 MLP actor 只输出 **10 步**；actor 输入时取 `ref_chunk` 的前 10 步：
+
+```100:105:rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py
+    def _get_ref_chunk(self, obs: dict) -> torch.Tensor:
+        ref_chunk = self._flatten_batch(obs["ref_chunk"]).reshape(
+            obs["ref_chunk"].shape[0], -1, self.step_action_dim
+        )
+        ref_chunk = ref_chunk[:, : self.chunk_len]
+        return ref_chunk.reshape(ref_chunk.shape[0], -1)
+```
+
+ManiSkill 示例中两者均为 10（[`maniskill_rlt_stage2_ac_mlp.yaml`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/maniskill_rlt_stage2_ac_mlp.yaml) 第 148–149 行）。
+
+### 2.2 动作语义（env-frame）
+
+`ref_chunk` 是 **反归一化后的环境动作**，不是模型内部的 32 维 padded 表示：
+
+- Franka：`action_dim: 7`，通常为末端位姿/关节相关控制量（由 `pi05_franka_state` dataconfig 定义）
+- ManiSkill joint：`8` 维 `pd_joint_delta_pos`（文档 [`rlt.rst:439-441`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）
+
+归一化统计必须与 Stage 1 一致（同一 `repo_id` + `norm_stats.json`），否则 `ref_chunk` 尺度错误，BC 会失效（文档 warning，[`rlt.rst:507-511`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）。
+
+---
+
+## 3. 它在 Stage 2 里怎么用？
+
+`ref_chunk` 同时承担 **三种角色**：
+
+```mermaid
+flowchart TB
+    FM["冻结 VLA<br/>extract_rlt_obs()"]
+    FM --> RC["ref_chunk"]
+    RC --> R1["① Actor 输入<br/>concat(ref, z_rl, proprio)"]
+    RC --> R2["② BC 正则目标<br/>actor 应贴近 ref"]
+    RC --> R3["③ VLA 阶段执行动作<br/>switch=False 时直接下发"]
+    ACT["Stage 2 MLP Actor"] --> OUT["actor action"]
+    R1 --> ACT
+    ROUTE["RLTRoute"] --> ENV["环境"]
+    RC --> ROUTE
+    OUT --> ROUTE
+```
+
+### 3.1 作为 Actor 输入（behavioral prior）
+
+`RLTMLPPolicy` 把 `ref_chunk` 与 `z_rl`、`proprio` 拼接后送入 MLP：
+
+```120:130:rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py
+    def _actor_state(...):
+        ref_chunk = self._get_ref_chunk(obs)
+        if apply_reference_dropout:
+            ref_chunk = self._maybe_drop_reference(ref_chunk, reference_dropout_prob)
+        return torch.cat([ref_chunk, self._get_z(obs), self._get_proprio(obs)], dim=-1)
+```
+
+Franka 示例 actor 输入维度：`20×7 + 2048 + 19 = 2137`（取 ref 前 10 步则为 `10×7 + 2048 + 19`）。
+
+训练时还有 **reference dropout**（默认 0.5）：随机把整段 `ref_chunk` 置零，避免 actor 过度依赖 VLA 参考（[`realworld_rlt_stage2_ac_mlp.yaml:79`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）。
+
+**Critic 不用 `ref_chunk`**，只用 `{z_rl, proprio}` + 动作，避免 Q 值被 VLA 先验偏置（[`rlt_mlp_policy.py:132-133`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py)）。
+
+### 3.2 作为 BC 正则目标
+
+Actor loss（[`rlt.rst:306-310`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+```text
+actor_loss = -q_weight * Q(obs, pi(obs)) + bc_weight * BC(pi(obs), target_action)
+```
+
+BC 目标逻辑：
+
+```123:124:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
+        bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
+```
+
+- 普通 step：`bc_target = ref_chunk`（actor 应接近 VLA 建议）
+- 有人类/专家干预：`bc_target = 实际执行的人类动作`
+
+默认 `bc_weight: 5` >> `q_weight: 0.1`，说明 Stage 2 主要是 **在 VLA 附近做小修正**，而非大幅偏离（[`realworld_rlt_stage2_ac_mlp.yaml:74-76`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）。
+
+### 3.3 作为 VLA 阶段的实际执行动作
+
+Rollout route 在 **整 chunk 级别** 选择执行 actor 还是 VLA ref：
+
+**真机**（按键 `b` 前走 VLA）：
+
+```127:134:rlinf/algorithms/rlt/route.py
+        ref_actions = result["forward_inputs"]["ref_chunk"].to(...)
+        routed_actions = torch.where(
+            rlt_switch_flags,
+            actions,
+            ref_actions[:, : actions.shape[1], : actions.shape[2]],
+        ).contiguous()
+```
+
+**ManiSkill**（critical phase 前走 VLA）：
+
+```191:202:rlinf/algorithms/rlt/route.py
+        base_actions = _base_ref_actions(
+            ctx.rlt_obs["ref_chunk"],
+            chunk_len=chunk_len,
+            ...
+        )
+        routed_actions = torch.where(
+            actor_switch[:, None, None],
+            actions,
+            base_actions,
+        ).contiguous()
+```
+
+文档说明（[`rlt.rst:215-217, 693-696`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+- 切换前：环境执行的是 **VLA `ref_chunk`**，这些 transition 也会进 replay
+- 切换后：环境执行 **actor action**
+- replay 里的 `action` 始终是 **实际下发** 的动作；`ref_chunk` 存在 `curr_obs` / `next_obs` 里作为上下文
+
+---
+
+## 4. 与 `action` 的区别
+
+Replay 中一条 transition（[`rlt.rst:209-213, 688-690`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+```text
+curr_obs = {z_rl, proprio, ref_chunk}
+action   = 实际发送给环境的 action chunk
+next_obs = {next_z_rl, next_proprio, next_ref_chunk}
+```
+
+| | `ref_chunk` | `action` |
+|---|-------------|----------|
+| 来源 | 冻结 VLA 每步重新推理 | route 选择后的 **最终执行** 动作 |
+| 是否等于 VLA 输出 | 是（除非 expert 接管改写） | 可能是 ref、actor 或 expert |
+| 用途 | actor 输入 + BC 目标 | critic TD、环境 step、Q 学习 |
+| 是否随时间更新 | 每步随新观测重算 | 记录本步实际行为 |
+
+Expert 接管时，route 会把 expert 动作写回 `forward_inputs["ref_chunk"]`，供后续 BC 使用（[`route.py:230-237`](https://github.com/RLinf/RLinf/blob/main/rlinf/algorithms/rlt/route.py)）。
+
+---
+
+## 5. 直观例子（Franka 插 peg）
+
+1. 相机看到 peg 和孔，VLA 输出 `ref_chunk`：未来 20 步的 7 维末端控制，大致是「靠近 → 对齐 → 插入」。
+2. 操作员尚未按 `b`：机器人 **直接执行** `ref_chunk` 前 10 步。
+3. 按 `b` 进入 actor 阶段：MLP 输入 `[ref_chunk[:10], z_rl, proprio]`，输出 10 步修正动作；route 下发 actor 动作。
+4. 训练时 BC 把 actor 拉向 `ref_chunk`（或人类干预动作），Q 项鼓励高回报修正。
+
+---
+
+## 6. 总结
+
+| 问题 | 答案 |
+|------|------|
+| **是什么？** | 冻结 Stage 1 π₀.₅ 对当前观测推理出的 **env-frame 未来动作块** |
+| **怎么算？** | `build_prefix_cache` → flow matching Euler 采样 → `output_transform` 反归一化 |
+| **典型形状？** | `(B, ref_num_action_chunks, action_dim)`，如 `(B, 20, 7)` |
+| **为何叫 reference？** | 作为 VLA 行为先验：actor 输入、BC 锚点、VLA 阶段 fallback 执行 |
+| **与 actor action 关系？** | actor 在 ref 附近学 residual；route 决定实际执行哪一个 |
+
+**一句话**：`ref_chunk` 就是 **「此刻 VLA 认为该怎么动」的一段未来动作轨迹**；RLT Stage 2 不是抛弃 VLA 重学控制，而是在这条参考轨迹上，用轻量 RL 做 **在线微调与任务阶段切换**。
+
+# rlt.rst中提到的 next_z_rl 和 next_ref_chunk
+
+## 结论先说
+
+文档第 213 行的 `next_obs = {next_z_rl, next_proprio, next_ref_chunk}` 表示：**在执行完当前 action、环境推进到下一时刻后**，冻结 VLA 特征模型对 **下一时刻原始观测** 重新推理得到的 RLT 状态。
+
+- **`next_z_rl`** = `next_obs["z_rl"]`：下一时刻的 RL 紧凑表示  
+- **`next_ref_chunk`** = `next_obs["ref_chunk"]`：下一时刻 VLA 重新采样的参考动作块  
+
+它们与 `curr_obs` 里的 `z_rl`、`ref_chunk` **类型相同、算法相同**，区别只在 **时间步**：一个是 $s_t$，一个是 $s_{t+1}$。
+
+**出处**：[`docs/source-zh/rst_source/examples/embodied/rlt.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 第 209–213、225–231、686–690 行。
+
+---
+
+## 1. 在 transition 里扮演什么角色？
+
+RLT Stage 2 的 replay 存的是 **特征空间** 的 $(s, a, r, s')$，不是原始图像：
+
+```text
+curr_obs = {z_rl, proprio, ref_chunk}          ← 时刻 t 的状态
+action   = 实际发给环境的 action chunk        ← 时刻 t 的行为
+next_obs = {next_z_rl, next_proprio, next_ref_chunk}  ← 时刻 t+1 的状态
+```
+
+对应 Bellman 一步：
+
+\[
+(s_t,\ a_t,\ r_t,\ s_{t+1}) \quad\text{其中}\quad s_t = \{z\_rl,\ proprio,\ ref\_chunk\},\ s_{t+1} = \{next\_z\_rl,\ next\_proprio,\ next\_ref\_chunk\}
+\]
+
+Critic 的 TD target（[`rlt.rst:225-231`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+```text
+target_q = discounted_chunk_reward + gamma ** chunk_horizon * Q_target(next_obs, next_action)
+```
+
+**`next_z_rl` 和 `next_ref_chunk` 的核心作用**：为 Critic 提供 **bootstrap 的下一状态 $s_{t+1}$**，让 Q 网络学习「当前动作有多好，取决于下一状态上 actor 能拿到多少 Q 值」。
+
+---
+
+## 2. 它们是怎么生成的？
+
+### 2.1 总流程：与 `z_rl` / `ref_chunk` 同一套函数，输入换成「下一帧观测」
+
+两者都由冻结 Stage 1 模型的 `extract_rlt_obs()` 产生，算法与当前步完全一致：
+
+```357:404:rlinf/models/embodiment/openpi_rlinf/eval_action_model.py
+    @torch.no_grad()
+    def extract_rlt_obs(self, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
+        ...
+        prefix_output, prefix_mask, kv_cache = self.model.build_prefix_cache(
+            prepared_observation
+        )
+        ...
+        z_rl = self._encode_rlt_flat(rlt_prefix_output, rlt_prefix_mask).to(
+            dtype=torch.float32
+        )
+        model_actions = self._sample_actions_from_prefix_cache(...)
+        ref_chunk = self.output_transform(
+            {"actions": model_actions, "state": observation.state}
+        )["actions"]
+        ...
+        return {"z_rl": z_rl, "proprio": proprio, "ref_chunk": ref_chunk}
+```
+
+| 字段 | 生成方式 |
+|------|----------|
+| **`next_z_rl`** | VLA prefix hidden states → `RLTTokenTransformer.encode_flat()` → 2048 维向量 |
+| **`next_ref_chunk`** | 同一 VLA 对 **下一帧** 做 flow matching Euler 采样（默认 4 步）→ `output_transform` 反归一化 → env-frame 动作块 |
+
+**关键**：`next_ref_chunk` **不是** 上一步 `ref_chunk` 的「剩余未执行部分」，而是 VLA 看到 **新图像 + 新 proprio** 后 **完整重新推理** 的未来动作序列。
+
+### 2.2 Rollout 侧：写入 `rlt_transition_*` 键
+
+Rollout 每收到一帧 env 观测，先算当前步特征，再写入 **下一状态** 用的 transition 字段：
+
+```24:35:rlinf/algorithms/rlt/rollout.py
+def _append_rlt_transition_obs(...):
+    transition_obs = rlt_obs
+    if final_obs is not None:
+        transition_obs = feature_model.extract_rlt_obs(final_obs)
+    for key in RLT_OBS_KEYS:
+        result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[key]
+```
+
+- 一般情况（`final_obs is None`）：`rlt_transition_*` = 本帧 `extract_rlt_obs(env_obs)` 的结果  
+- Episode 终止且 auto_reset（`final_obs` 有值）：对 **终止前真实观测** 再跑一次 `extract_rlt_obs(final_obs)`，避免用 reset 后的新 episode 观测当 $s'$
+
+常量定义（[`transition.py:22-23`](https://github.com/RLinf/RLinf/blob/main/rlinf/algorithms/rlt/transition.py)）：
+
+```python
+RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
+RLT_TRANSITION_PREFIX = "rlt_transition_"
+# → forward_inputs 里: rlt_transition_z_rl, rlt_transition_proprio, rlt_transition_ref_chunk
+```
+
+### 2.3 Env ↔ Rollout 时序（为何是「下一状态」）
+
+```mermaid
+sequenceDiagram
+    participant Env
+    participant Rollout
+    participant FM as 冻结 VLA (feature model)
+    participant Buffer as Replay Buffer
+
+    Note over Env,Buffer: 时刻 t：Rollout 收到 obs_t
+    Rollout->>FM: extract_rlt_obs(obs_t)
+    FM-->>Rollout: {z_rl_t, proprio_t, ref_chunk_t}
+    Rollout->>Env: 下发 action_t
+    Env->>Env: chunk_step(action_t)
+    Note over Env: 环境推进 → obs_{t+1}
+
+    Note over Env,Buffer: 时刻 t+1：Rollout 收到 obs_{t+1}
+    Rollout->>FM: extract_rlt_obs(obs_{t+1})
+    FM-->>Rollout: curr + rlt_transition_*
+    Note over Rollout: rlt_transition_* = {next_z_rl, next_proprio, next_ref_chunk}
+
+    Rollout->>Env: policy_output (含 rlt_transition_*)
+    Env->>Buffer: update_rlt_transitions<br/>append(curr_obs_t, next_obs_{t+1})
+```
+
+Env worker 在收到 rollout 的 `policy_output` 后，用 `update_rlt_transitions()` 拼 transition（[`transition.py:62-102`](https://github.com/RLinf/RLinf/blob/main/rlinf/algorithms/rlt/transition.py)）：
+
+1. 若已有缓存的 `pending_obs`（= 上一时刻的 `curr_obs`）  
+2. 从 `policy_output.forward_inputs` 读出 `rlt_transition_*`，映射为 `next_obs`  
+3. `append_transitions(pending_obs, next_obs)` 写入 trajectory  
+4. 再把本步 `forward_inputs` 里的 `{z_rl, proprio, ref_chunk}` 缓存为新的 `pending_obs`
+
+因此：**本步 rollout 算出的 `rlt_transition_*`，对应的是「上一 transition 的 next_obs」**。
+
+---
+
+## 3. `next_z_rl` 详解
+
+### 是什么？
+
+下一时刻 $s_{t+1}$ 的 **RL 状态嵌入**：把 VLA 对「执行 action 后新场景」的理解，压缩成 2048 维向量。
+
+### 与 `z_rl` 的区别
+
+| | `z_rl`（curr） | `next_z_rl`（next） |
+|---|----------------|---------------------|
+| 时间 | 决策前，观测 $o_t$ | 执行 action 后，观测 $o_{t+1}$ |
+| 输入图像/状态 | 动作执行前 | 机器人/物体已移动后的新观测 |
+| 语义 | 「此刻该怎么动」的上下文 | 「动完之后局面如何」的上下文 |
+
+机器人插 peg 的例子：$z_rl$ 可能对应「peg 还在孔外」；执行一段 action 后，`next_z_rl` 对应「peg 更接近孔」—— Critic 靠这个变化判断 action 是否带来进展。
+
+### 在训练中怎么用？
+
+**Critic**（主要消费者）：
+
+```243:272:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        with torch.no_grad():
+            next_actions, _, _ = self.model(
+                forward_type=ForwardType.SAC,
+                obs=next_obs,          # ← 含 next_z_rl, next_proprio, next_ref_chunk
+            )
+            all_qf_next_target = self.target_model(
+                forward_type=ForwardType.SAC_Q,
+                obs=next_obs,
+                actions=next_actions,
+            )
+            q_next = self._min_twin_q(all_qf_next_target)
+            ...
+            target_q_values = reward_target + not_done * bootstrap_discount * q_next
+```
+
+流程：
+
+1. 用 `next_obs`（含 `next_z_rl`）经 actor 采样 `next_actions`  
+2. target Q 网络算 $Q_{\text{targ}}(next\_obs, next\_actions)$  
+3. 与 chunk 折扣奖励相加得 TD target  
+
+**Critic 的 state 部分只用 `{next_z_rl, next_proprio}`**，不用 `next_ref_chunk`（[`rlt_mlp_policy.py:132-133`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py)）。
+
+**Actor 训练**不直接读 `next_z_rl`，只通过 Critic 的 TD target 间接影响 actor。
+
+---
+
+## 4. `next_ref_chunk` 详解
+
+### 是什么？
+
+下一时刻 $o_{t+1}$ 上，冻结 VLA **重新推理** 得到的 reference action chunk——「看到新画面后，VLA 认为接下来该怎么动」。
+
+### 与 `ref_chunk`（curr）的区别
+
+| | `ref_chunk` | `next_ref_chunk` |
+|---|-------------|------------------|
+| 基于观测 | $o_t$ | $o_{t+1}$ |
+| VLA 建议 | 执行 action **前** 的计划 | 执行 action **后** 的新计划 |
+| 是否等于上一步剩余动作 | 否 | 否（完全重算） |
+
+举例（Franka，`ref_num_action_chunks=20`）：
+
+- $t$：`ref_chunk` 可能是「继续下降、对准孔」的 20 步  
+- 执行 10 步 actor/VLA 混合 action 后  
+- $t+1$：`next_ref_chunk` 是 VLA 看 **新图像** 重新生成的 20 步，可能是「微调姿态、插入」——与旧 `ref_chunk` 的后 10 步无直接对应关系
+
+### 在训练中怎么用？
+
+**① Critic bootstrap 时作为 actor 的输入条件**
+
+Actor 的 `sac_forward` 输入是 `[ref_chunk, z_rl, proprio]` 拼接（[`rlt_mlp_policy.py:127-130`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py)）。算 `next_actions` 时用的是 **`next_ref_chunk` + `next_z_rl` + `next_proprio`**，因此：
+
+\[
+next\_actions = \pi_\theta(next\_ref\_chunk,\ next\_z\_rl,\ next\_proprio)
+\]
+
+Q bootstrap 评估的是：**在下一 VLA 参考轨迹下，actor 会怎么修正**。
+
+**② 下一步 transition 的 `curr_obs["ref_chunk"]`**
+
+当前 transition 的 `next_ref_chunk`，在 **下一条** transition 里会变成 `ref_chunk`（新的 `pending_obs` 缓存）。
+
+**③ 不直接参与 BC loss**
+
+BC 只用 **当前步** `curr_obs["ref_chunk"]`（[`fsdp_rlt_ac_policy_worker.py:340-344`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py)）；`next_ref_chunk` 不参与 BC，主要服务于 **下一状态的 Q 估计**。
+
+---
+
+## 5. Episode 终止时的特殊处理
+
+若 transition 已终止（`dones=True`）且 `bootstrap_type: standard`（[`rlt.rst:231`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+```551:556:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+                is_done = (...)
+                if is_done:
+                    next_obs = curr_obs   # 终止步：next := curr
+                else:
+                    next_obs = self._rlt_obs_from_flat_dict(flat, "next_obs", idx)
+```
+
+Critic 侧：
+
+```272:272:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+                target_q_values = reward_target + not_done * bootstrap_discount * q_next
+```
+
+终止时 `not_done=0`，**不加** $Q(next\_obs,\ \cdot)$，避免用 reset 后新 episode 的特征做 bootstrap。此时 `next_z_rl` / `next_ref_chunk` 虽可能被设为 `curr` 副本，但不进入 TD target。
+
+---
+
+## 6. 与 `action` 的关系（易混点）
+
+| 字段 | 含义 |
+|------|------|
+| `action` | route 后 **实际执行** 的动作（可能是 actor / VLA ref / expert） |
+| `ref_chunk` | VLA 在 $t$ 的 **建议**（未必被执行） |
+| `next_ref_chunk` | VLA 在 $t+1$ 的 **新建议**（与 $t$ 的 `action` 无简单代数关系） |
+
+文档（[`rlt.rst:693-696`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：切换前 step 的 `action` 可能就是 VLA `ref_chunk`，但 **`next_ref_chunk` 仍是下一步 VLA 对新观测的重推理**，不是「上一步 ref 减掉已执行部分」。
+
+---
+
+## 7. 整体数据流（从 rollout 到 Critic）
+
+```mermaid
+flowchart TB
+    subgraph Gen["生成 (Rollout, 每 env step)"]
+        O1["obs_t"] --> FM1["extract_rlt_obs"]
+        FM1 --> C1["curr: z_rl, ref_chunk"]
+        O2["obs_{t+1}"] --> FM2["extract_rlt_obs"]
+        FM2 --> N1["next: next_z_rl, next_ref_chunk"]
+    end
+
+    subgraph Store["存储 (Replay)"]
+        T["transition:<br/>curr_obs, action, reward, next_obs"]
+    end
+
+    subgraph Train["训练 (Critic)"]
+        Q1["Q(curr_obs, action)"]
+        NA["next_action = Actor(next_obs)<br/>用 next_ref_chunk + next_z_rl"]
+        Q2["Q_target(next_obs, next_action)"]
+        TD["target = r_disc + γ^H · Q2"]
+    end
+
+    Gen --> Store --> Train
+    Q1 --> TD
+    Q2 --> TD
+```
+
+---
+
+## 8. 总结对照表
+
+| 问题 | `next_z_rl` | `next_ref_chunk` |
+|------|-------------|------------------|
+| **是什么？** | 下一时刻 RL 状态嵌入 | 下一时刻 VLA 参考动作块 |
+| **怎么来？** | 冻结 VLA 对 $o_{t+1}$ 的 `encode_flat` | 同一 VLA 对 $o_{t+1}$ 的 flow matching 采样 + 反归一化 |
+| **与 curr 关系** | 同算法、不同时间步 | 同算法、不同时间步；**非** curr ref 的滑动窗口 |
+| **主要作用** | Critic 的 $s'$ 状态（与 proprio 一起） | Actor 在 $s'$ 上的输入条件；间接决定 `next_actions` 与 Q bootstrap |
+| **Actor loss 直接用？** | 否 | 否（BC 只用 curr `ref_chunk`） |
+| **Critic 直接用？** | 是（Q 网络 state） | 是（经 actor 采样 `next_actions` 间接进入 Q） |
+
+**一句话**：`next_z_rl` 和 `next_ref_chunk` 是 **「动作执行后、新观测下」** VLA 特征模型给出的下一 RL 状态；它们把标准 RL 的 $s_{t+1}$ 落在 RLT 的特征空间里，供 Critic 做 TD bootstrap，并让 actor 在下一时刻的 Q 估计中仍 **以 VLA 新参考轨迹为条件**。
+
+# rlt.rst中哪些模块何时冻结何时更新
+
+整个 rlt 中, 哪些模块是冻结的, 在什么阶段冻结? 哪些模块是可更新权重的 在什么阶段更新, 基于什么输入, label 和 loss 进行更新? 
+
+---
+
+下面按 **Stage 1 → Stage 2 → 推理侧副本** 梳理 RLT 全流程里：**谁冻结、谁可训、用什么输入/标签、什么 loss 更新**。内容以 [`rlt.rst`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 和 RLmm 代码为准。
+
+---
+
+## 总览：两阶段分工
+
+```mermaid
+flowchart TB
+    subgraph S0["预训练基座（非 RLT 训练阶段）"]
+        PI0["π₀.₅ base<br/>lerobot/pi05_base"]
+    end
+
+    subgraph S1["Stage 1：SFT + RLT Token"]
+        VLA["Pi0 VLA<br/>~2.3B"]
+        RLT["RLTTokenTransformer<br/>~轻量"]
+        PI0 --> VLA
+        VLA --> RLT
+    end
+
+    subgraph S2["Stage 2：在线 Actor-Critic"]
+        FM["冻结 feature model<br/>Pi0 + RLTTokenTransformer"]
+        MLP["可训 RLTMLPPolicy<br/>backbone + actor_mean + q_head"]
+        VLA --> FM
+        FM -->|"z_rl, proprio, ref_chunk"| MLP
+    end
+
+    S0 --> S1
+    S1 -->|"checkpoint → rlt_feature_model"| S2
+```
+
+| 阶段 | 入口 | 可训模块 | 冻结模块 |
+|------|------|----------|----------|
+| **Stage 1** | `run_vla_sft.sh` → `SFTRunner` | Pi0 VLA + `rlt_module` | 无（默认全量微调；可选 `train_expert_only`） |
+| **Stage 2** | `train_embodied_agent.py`，`loss_type: rlt_ac` | `RLTMLPPolicy`（actor + critic 分支） | `rollout.rlt_feature_model` 整包；可选 `expert_model` |
+| **推理副本** | rollout worker | 无本地反传 | `rlt_feature_model`、`hf_model`（MLP 副本只同步权重） |
+
+**出处**：[`rlt.rst:4-8, 123-137, 188-191`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)；[`train_embodied_agent.py:59-66`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/train_embodied_agent.py)。
+
+---
+
+## Stage 1：学习 RLT 特征模型
+
+### 1.1 涉及模块
+
+| 模块 | 代码位置 | Stage 1 状态 |
+|------|----------|--------------|
+| **Pi0 VLA**（SigLIP 视觉 + Gemma 2B + 300M action expert + 投影层） | `openpi_rlinf/pi0_model/` | **可训**（默认 `train_expert_only: False`） |
+| **RLTTokenTransformer**（encoder + decoder） | `modules/rlt_token_transformer.py` | **可训**（`use_rlt: True` 时挂载为 `rlt_module`） |
+| **OpenPI transforms / dataloader** | Stage 1 数据管线 | 无参数，仅预处理 |
+
+Stage 1 从 `model_path: /path/to/model`（通常 `lerobot/pi05_base`）加载 π₀.₅，再在任务示范数据上联合微调。**不是**在 Stage 1 里冻结 VLA。
+
+**出处**：[`realworld_rlt_stage1_sft_openpi_pi05.yaml:45-78`](https://github.com/RLinf/RLinf/blob/main/examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml)；[`sft_action_model.py:33-41`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/openpi_rlinf/sft_action_model.py)。
+
+### 1.2 输入数据
+
+| 字段 | 来源 | 含义 |
+|------|------|------|
+| `observation` | LeRobot 示范 | 图像、语言 prompt、机器人 state（经 OpenPI transform + norm） |
+| `actions` | 示范轨迹 | 专家动作 chunk，已归一化并 pad 到 `model_action_dim=32` |
+
+**出处**：[`sft_action_model.py:68-77, 142-157`](https://github.com/RLinf/RLinf/blob/main/rlinf/models/embodiment/openpi_rlinf/sft_action_model.py)。
+
+### 1.3 两个 loss、两套梯度
+
+总 loss（[`rlt.rst:131-135`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+\[
+\mathcal{L}_{\text{Stage1}} = \mathcal{L}_{\text{RLT}} + \alpha \cdot \mathcal{L}_{\text{VLA}},\quad \alpha=\texttt{rlt\_alpha}
+\]
+
+#### （A）`vla_loss` — 更新 Pi0 VLA
+
+- **输入**：`observation` + flow-matching 采样的 `(noise, time, x_t)` + 示范 `actions`
+- **标签（隐式）**：flow matching 速度目标 \(u_t = \text{noise} - \text{actions}\)
+- **Loss**：\(\text{MSE}(v_t, u_t)\)，对 action horizon 求 mean → `vla_loss`
+- **更新谁**：**整条 Pi0 forward**（prefix + suffix + LLM + action head）
+
+```198:207:rlinf/models/embodiment/openpi_rlinf/sft_action_model.py
+        prefix_out, suffix_out = self.model.llm(...)
+        v_t = self.model.velocity_from_suffix(
+            suffix_out[:, -self.model.action_horizon :]
+        )
+        loss = torch.mean(torch.square(v_t - u_t), dim=-1)
+        prefix_out, prefix_mask = self._select_rlt_prefix_embeddings(
+            prefix_out.detach(), prefix_mask, observation.tokenized_prompt
+        )
+```
+
+#### （B）`rlt_loss` — 只更新 `rlt_module`
+
+- **输入**：VLA 的 **prefix hidden states**（已在送入 RLT 前 **`detach()`**）
+- **标签**：同一份 prefix embeddings（自监督重建目标）
+- **Loss**：encoder 得到 `z_rl` token → decoder 重建 prefix → **MSE(reconstructed, prefix)**
+
+```355:379:rlinf/models/embodiment/modules/rlt_token_transformer.py
+    def reconstruct(self, prefix_embs, mask=None):
+        frozen_prefix = prefix_embs.detach()
+        rl_tokens = self.encode(frozen_prefix, mask)
+        reconstructed = self.decode(rl_tokens, frozen_prefix, mask)
+        ...
+    def loss(self, prefix_embs, mask=None):
+        reconstructed, rl_tokens = self.reconstruct(prefix_embs, mask)
+        target = prefix_embs.detach().to(dtype=torch.float32)
+        ...
+        mse = sq_error.mean()  # 或 mask 加权
+        return mse, {"mse": mse, "z_rl": ...}
+```
+
+**梯度隔离要点**：
+
+| Loss | 更新 Pi0 VLA | 更新 `rlt_module` |
+|------|-------------|-------------------|
+| `vla_loss` | ✅ | ❌（prefix 已 detach 后再进 RLT） |
+| `rlt_loss` | ❌（reconstruct 内 prefix 再次 detach） | ✅ |
+
+Stage 1 **输出 checkpoint**：`.../checkpoints/global_step_<N>/actor`，内含 **`model.*`（Pi0）+ `rlt_module.*`**。
+
+---
+
+## Stage 2：在线 Actor-Critic
+
+### 2.1 冻结模块（整段 Stage 2 不反传）
+
+#### （1）`rollout.rlt_feature_model` — 核心冻结对象
+
+即 Stage 1 完整 checkpoint，以 **`OpenPiPytorchEvalActionModel`**（`openpi.task: eval`）加载：
+
+| 子模块 | 作用 | 状态 |
+|--------|------|------|
+| Pi0 VLA | 提取 prefix、采样 `ref_chunk` | `eval()` + `requires_grad_(False)` |
+| `rlt_module` | 编码 `z_rl` | 同上 |
+
+```151:157:rlinf/workers/rollout/hf/huggingface_worker.py
+        if rlt_feature_model_config is not None:
+            self.rlt_feature_model = get_model(copy.deepcopy(rlt_feature_model_config))
+            self.rlt_feature_model.eval()
+            self.rlt_feature_model.requires_grad_(False)
+```
+
+每步 `extract_rlt_obs()` 在 `@torch.no_grad()` 下运行，产出 `{z_rl, proprio, ref_chunk}`，**不参与 Stage 2 优化**。
+
+**出处**：[`rlt.rst:191, 200-204, 755`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)；[`realworld_rlt_stage2_ac_mlp.yaml:177-214`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)。
+
+#### （2）`rollout.expert_model`（可选，ManiSkill expert takeover）
+
+- 独立 π₀.₅ SFT checkpoint，`use_rlt: False`
+- 仅 rollout 推理，`eval()`，**不训练**
+
+**出处**：[`maniskill_rlt_stage2_ac_mlp.yaml:286-314`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/maniskill_rlt_stage2_ac_mlp.yaml)。
+
+#### （3）环境、奖励模型
+
+- 仿真 / 真机环境：非神经网络
+- 默认 `reward.use_reward_model: False`，无奖励网络训练
+
+#### （4）`target_model`（Actor worker 内）
+
+- `RLTMLPPolicy` 的 **副本**，`requires_grad_(False)`
+- 仅用于 Critic TD bootstrap 的 \(Q_{\text{target}}\)
+- 通过 Polyak 软更新（`tau: 0.005`）跟随在线 `q_head`，**自身不通过 loss 直接训练**
+
+```105:110:rlinf/workers/actor/fsdp_sac_policy_worker.py
+            self.target_model = self._strategy.wrap_model(...)
+            self.target_model.requires_grad_(False)
+```
+
+#### （5）`rollout.hf_model`（Stage 2 MLP 的 rollout 副本）
+
+- 从 `actor.model` 构建，`weight_syncer` 同步 actor 权重
+- rollout 侧 **只推理、不反传**
+
+**出处**：[`realworld_rlt_stage2_ac_mlp.yaml:165-168, 755-756`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)。
+
+#### （6）温度参数 α
+
+RLT 固定 `initial_alpha: 0.0`，且 `forward_alpha` 直接 `NotImplementedError` — **不训练 entropy temperature**。
+
+---
+
+### 2.2 可训模块：`RLTMLPPolicy`
+
+Stage 2 `actor.model.model_type: rlt_mlp_policy`，**从零初始化**（`model_path: null`），除非 `resume_dir` / `ckpt_path` 恢复。
+
+| 子模块 | 参数量级 | 优化器 | 用途 |
+|--------|----------|--------|------|
+| **`backbone`** | 3×256 MLP | **Actor optimizer**（`actor.optim`） | 编码 `[ref_chunk, z_rl, proprio]` |
+| **`actor_mean`** | 线性输出层 | **Actor optimizer** | 输出 action chunk 均值 |
+| **`q_head`**（Twin Q，`num_q_heads=2`） | 3×256 + 2 个 Q | **Critic optimizer**（`actor.critic_optim`） | 估计 \(Q(s,a)\) |
+
+Actor / Critic **不共享** trunk：Critic 只吃 `{z_rl, proprio}` + action，**不用 `ref_chunk`**。
+
+```120:133:rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py
+    def _actor_state(...):
+        return torch.cat([ref_chunk, self._get_z(obs), self._get_proprio(obs)], dim=-1)
+    def _critic_state(self, obs):
+        return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
+```
+
+优化器拆分（继承自 `EmbodiedSACFSDPPolicy`）：`q_head` 走 critic optimizer，其余走 actor optimizer。
+
+**更新节奏**（[`realworld_rlt_stage2_ac_mlp.yaml:103-104`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)）：
+
+- 每 step：**Critic 必更新**
+- 每 `critic_actor_ratio=4` 步：**Actor 更新 1 次**
+- 每 step：`target_model` 软更新（`target_update_freq: 1`）
+
+---
+
+### 2.3 Stage 2 训练数据从哪来？
+
+Rollout 在线采集，replay 存 **特征空间 transition**（[`rlt.rst:209-213, 686-690`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）：
+
+```text
+curr_obs = {z_rl, proprio, ref_chunk}      ← 冻结 VLA 在 t 时刻提取
+action   = 实际执行的动作 chunk            ← route 选 actor / ref / expert
+reward   = 环境奖励（chunk 内逐步）
+next_obs = {next_z_rl, next_proprio, next_ref_chunk}  ← 冻结 VLA 在 t+1 提取
+done     = episode 是否终止
+```
+
+`z_rl` / `ref_chunk` 等 **不是** learner 反传算的，而是 rollout 时冻结 feature model 前向得到；learner 只把它们当 **固定输入张量**。
+
+---
+
+### 2.4 Critic 更新
+
+**实现**：`RLTACLossMixin.forward_critic`
+
+| 项目 | 内容 |
+|------|------|
+| **输入** | `curr_obs`，`actions`（replay 里实际执行的），`next_obs`，`rewards`，`dones` |
+| **标签（TD target）** | `discounted_chunk_reward + (1-done) * γ^H * min(Q_target(next_obs, next_action))` |
+| **Loss** | `MSE(Q(curr_obs, action), target)`，对 twin Q 同时回归同一 target |
+| **更新参数** | **`q_head` only**（critic optimizer） |
+
+```266:294:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+            reward_target = self._discounted_chunk_rewards(rewards)
+            bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
+            target_q_values = reward_target + not_done * bootstrap_discount * q_next
+            ...
+            critic_loss = F.mse_loss(all_data_q_values, target_q_values.expand_as(...))
+```
+
+- **`next_action`**：用 **当前 actor** 在 `next_obs` 上采样（含 `next_ref_chunk` 条件）
+- **`Q_target`**：来自 **`target_model.q_head`**，取 twin Q 的 **min**（防过估计）
+- **Chunk 奖励**：chunk 内逐步 reward 按 \(\gamma^0,\gamma^1,...\) 折扣求和（[`rlt.rst:225-229`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）
+- **终止步**：`bootstrap_type: standard` 时不加 bootstrap（[`rlt.rst:231`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）
+
+**无 label 文件**：reward 来自环境；Q 的“标签”是 bootstrapped TD target，不是人工标注。
+
+---
+
+### 2.5 Actor 更新
+
+**实现**：`RLTACLossMixin.forward_actor`
+
+| 项目 | 内容 |
+|------|------|
+| **输入** | `curr_obs = {ref_chunk, z_rl, proprio}`；训练时可 `reference_dropout_prob=0.5` 整段置零 ref |
+| **BC 标签** | 默认 **`ref_chunk`**（VLA 参考）；若有人类/expert 干预 → **实际执行 action** |
+| **Loss** | \(\texttt{-q\_weight}\cdot Q_1(s,\pi(s)) + \texttt{bc\_weight}\cdot \text{MSE}(\pi, \text{bc\_target})\) |
+| **更新参数** | **`backbone` + `actor_mean`**（actor optimizer） |
+
+```123:124:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
+```
+
+```349:351:rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py
+        actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
+```
+
+默认 Franka 配置：`q_weight=0.1`，`bc_weight=5` — **以 BC 锚定 VLA 为主，Q 项做小幅 RL 修正**。
+
+**Actor 用 Q1，Critic bootstrap 用 min(Q1,Q2)** — 非对称 twin-Q 用法（[`RLTACLossMixin` docstring:43`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py)）。
+
+**`z_rl` / `ref_chunk` 在 actor loss 中的角色**：
+
+- 作为 **条件输入**（与 proprio 拼接）
+- `ref_chunk` 同时是 **BC 的监督目标**（非干预步）
+- **梯度不回传到** 冻结 VLA / RLT transformer
+
+---
+
+## 全 pipeline 冻结/可训对照表
+
+| 模块 | Stage 1 | Stage 2 rollout | Stage 2 learner |
+|------|---------|-----------------|-------------------|
+| π₀.₅ VLA（SigLIP+Gemma+expert） | ✅ 训（`vla_loss`） | ❌ 冻结（feature model） | ❌ 不出现 |
+| `rlt_module` | ✅ 训（`rlt_loss`） | ❌ 冻结（feature model） | ❌ 不出现 |
+| `RLTMLPPolicy.backbone` | — | 同步权重，不训 | ✅ 训（actor loss） |
+| `RLTMLPPolicy.actor_mean` | — | 同步权重，不训 | ✅ 训（actor loss） |
+| `RLTMLPPolicy.q_head` | — | 同步但不用于 rollout 动作 | ✅ 训（critic loss）；actor loss 里读 Q |
+| `target_model`（Q 副本） | — | — | ❌ 不反传，EMA 跟随 |
+| `expert_model`（可选） | — | ❌ 冻结推理 | ❌ |
+| 环境 / 奖励网络 | — | — | ❌ |
+
+---
+
+## 数据流：谁产生特征、谁消费特征
+
+```mermaid
+sequenceDiagram
+    participant Env
+    participant FM as 冻结 feature model<br/>(Pi0+RLT)
+    participant Rollout as rollout MLP 副本
+    participant Buffer as Replay
+    participant Learner as actor worker<br/>(RLTMLPPolicy)
+
+    Env->>FM: 原始 obs_t
+    FM-->>Rollout: z_rl, proprio, ref_chunk
+    Rollout->>Env: action_t (route)
+    Env->>FM: 原始 obs_{t+1}
+    FM-->>Buffer: next_z_rl, next_ref_chunk, ...
+
+    Note over FM: Stage 2 全程 no_grad
+    Buffer->>Learner: transition 采样
+    Learner->>Learner: critic: 更新 q_head
+    Learner->>Learner: actor: 更新 backbone+actor_mean
+    Learner->>Rollout: weight_sync MLP 权重
+```
+
+---
+
+## 常见误区
+
+1. **Stage 2 不是继续训 VLA** — VLA+RLT 只在 `rollout.rlt_feature_model` 里冻结推理；可训的只有小 MLP（[`rlt.rst:191`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）。
+2. **不要把 Stage 1 ckpt 填到 `actor.model.model_path`** — Stage 2 actor 是 `rlt_mlp_policy`，与 Stage 1 结构不同（[`rlt.rst:757`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）。
+3. **`ref_chunk` 在 Stage 2 是条件输入 + BC 标签，不是 VLA 的可训输出** — VLA 输出在 Stage 2 被当作固定特征。
+4. **Stage 1 的 `rlt_loss` 不更新 VLA** — 靠 `detach()` 隔离；VLA 仅由 `vla_loss` 更新。
+5. **Expert 模型（ManiSkill）不参与 loss** — 只影响 rollout 执行哪段 action，并可能改写 BC 目标（干预步）。
+
+---
+
+## 一句话总结
+
+- **Stage 1**：在示范数据上 **联合训练 Pi0 VLA（flow matching）+ RLT Token Transformer（prefix 重建）**，产出含 `model.*` 与 `rlt_module.*` 的 checkpoint。  
+- **Stage 2**：**整包冻结** Stage 1 为 feature model，在线只 **训练轻量 MLP 的 actor（backbone+mean）和 critic（q_head）**；输入是 `{z_rl, proprio, ref_chunk}`，Critic 用 **环境 reward + TD bootstrap**，Actor 用 **Q 最大化 + 对 ref_chunk/人类动作的 BC**。  
+
+这样 RLT 把 **表示学习（Stage 1）** 和 **在线控制（Stage 2）** 拆开，避免在线 RL 破坏已学 VLA 表示。
+
+
+# rlt.rst中按b前后的系统变化
+
+## 直接回答：你的理解 **不对**
+
+[`rlt.rst:215-217`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) **不是在说「按 b 前训 π₀.₅ + RLT，按 b 后训 actor + critic」**。
+
+这段话发生在 **Stage 2 在线 RL 的 rollout 阶段**，描述的是：
+
+> **操作员按 `b` 之前 / 之后，真机实际执行哪一路动作**——是冻结 VLA 的 `ref_chunk`，还是 Stage 2 MLP actor 的输出。
+
+在整个 Stage 2 里：
+
+| 模块 | 是否训练 |
+|------|----------|
+| π₀.₅ + RLT Token Transformer（`rollout.rlt_feature_model`） | **始终冻结**，只做特征提取 |
+| MLP actor + critic（`actor.model` / `rlt_mlp_policy`） | **始终可训**（learner 从 replay 采样更新） |
+
+按 `b` 只改变 **发给机器人的动作来源**，不改变「谁在反传梯度」。
+
+文档第 432 行写的「按 `b` 进入 Stage 2 actor **控制阶段**」应理解为：在 **Stage 2 rollout 内部** 从「VLA 执行阶段」切到「Actor 执行阶段」，**不是**才开始 Stage 2 训练。
+
+---
+
+## 这段话在说什么？
+
+```215:217:docs/source-zh/rst_source/examples/embodied/rlt.rst
+Franka 真机配置中，``keyboard_reward_wrapper: rlt_policy_switch`` 会提供
+``rlt_switch_flags`` 标记。在操作员按下 ``b`` 之前，实际执行 VLA 的
+``ref_chunk``；按下 ``b`` 之后，实际执行 Stage 2 actor 的动作。
+```
+
+三层含义：
+
+1. **`keyboard_reward_wrapper: rlt_policy_switch`**：给 Franka 环境包一层键盘 wrapper，监听 **`b` 键**。
+2. **`rlt_switch_flags`**：布尔标记，`False` = 还在 VLA 阶段，`True` = 已进入 actor 阶段（按 `b` 后 **锁存为 True**，直到 episode reset）。
+3. **执行路由**：rollout 根据该标记，在 **整 chunk 级别** 选择下发 `ref_chunk` 还是 MLP actor 动作。
+
+**出处**：[`realworld_rlt_stage2_ac_mlp.yaml:116`](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml)；[`keyboard_rlt_policy_switch_wrapper.py:25-70`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/wrappers/keyboard_rlt_policy_switch_wrapper.py)。
+
+---
+
+## 按 `b` 前后：执行 vs 训练（对照表）
+
+| | 按 `b` **之前** | 按 `b` **之后** |
+|---|----------------|----------------|
+| **机器人实际动作** | VLA 的 `ref_chunk` | Stage 2 MLP actor 动作 |
+| **π₀.₅ + RLT** | 冻结推理（每步算 `z_rl`/`ref_chunk`） | 同上，仍冻结 |
+| **MLP actor** | 每步仍 **前向推理**，但 route **丢弃**其输出 | 前向输出 **被下发**到真机 |
+| **MLP critic / learner** | 从 replay **照常更新**（若有数据） | 同上 |
+| **是否在训 π₀.₅/RLT？** | ❌ 否 | ❌ 否 |
+
+文档也明确：切换前的 step **仍会进 replay、参与训练**，只是 **`action` 字段是 VLA 实际执行的动作**（[`rlt.rst:693-695`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）。
+
+---
+
+## 背后代码与调用流程
+
+### 1. 键盘 wrapper：产生 `rlt_switch_flags`
+
+```58:69:rlinf/envs/realworld/common/wrappers/keyboard_rlt_policy_switch_wrapper.py
+            if key == "b":
+                if not self._rlt_switch_flags:
+                    event = "enter_actor"
+                    self._rlt_switch_flags = True
+                    self._log_info(
+                        "Pedal 'b' pressed; switching RLT rollout to Stage2 actor."
+                    )
+        info["rlt_switch_flags"] = self._rlt_switch_flags
+```
+
+- `reset()` 时 `_rlt_switch_flags = False`
+- 按一次 `b` 后永久为 `True`（本 episode 内）
+- 通过 `info["rlt_switch_flags"]` 传出
+
+挂载方式（[`apply.py:92-93`](https://github.com/RLinf/RLinf/blob/main/rlinf/envs/realworld/common/wrappers/apply.py)）：
+
+```python
+if mode == "rlt_policy_switch":
+    return KeyboardRLTPolicySwitchWrapper(env)
+```
+
+### 2. 环境 → Rollout：传递标志
+
+`RealWorldEnv.chunk_step` 收集每步 `rlt_switch_flags`，stack 后放进 `EnvOutput`；`env_worker` 经 `_build_rollout_input_data` 发给 rollout：
+
+```943:951:rlinf/workers/env/env_worker.py
+    def _build_rollout_input_data(self, env_batch: dict[str, Any]) -> dict[str, Any]:
+        data = {
+            "obs": env_batch["obs"],
+            "final_obs": env_batch["final_obs"],
+        }
+        if self.enable_rlt:
+            data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
+            data["intervene_flags"] = env_batch.get("intervene_flags", None)
+        return data
+```
+
+Rollout worker 调用（[`huggingface_worker.py:691-696`](https://github.com/RLinf/RLinf/blob/main/rlinf/workers/rollout/hf/huggingface_worker.py)）：
+
+```python
+actions, result = self._predict_rollout_actions(
+    env_output["obs"],
+    final_obs=env_output.get("final_obs", None),
+    rlt_switch_flags=env_output.get("rlt_switch_flags", None),
+    ...
+)
+```
+
+### 3. Rollout 核心：`predict_rlt_actions`（每步都跑，与 `b` 无关）
+
+```51:75:rlinf/algorithms/rlt/rollout.py
+    with torch.no_grad():
+        rlt_obs = feature_model.extract_rlt_obs(env_obs)      # ① 冻结 VLA+RLT
+        actions, result = policy_model.predict_action_batch(  # ② MLP actor 推理
+            env_obs=rlt_obs, mode=mode, return_obs=True,
+        )
+        route_output = rlt_route.route(                         # ③ 按 flag 选动作
+            RLTRouteContext(..., rlt_switch_flags=rlt_switch_flags, ...)
+        )
+        actions = route_output.actions                         # ④ 最终下发动作
+```
+
+**要点**：无论是否按 `b`，①② 都会执行；只有 ③ 决定机器人动哪路。
+
+### 4. 真机 Route：`RealworldRLTRoute`
+
+```119:144:rlinf/algorithms/rlt/route.py
+    def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
+        actions = ctx.student_actions          # MLP 输出
+        rlt_switch_flags = _normalize_rlt_switch_flags(...)
+        ref_actions = result["forward_inputs"]["ref_chunk"]  # VLA 参考动作
+        routed_actions = torch.where(
+            rlt_switch_flags,
+            actions,                             # True → actor
+            ref_actions[:, : actions.shape[1], : actions.shape[2]],  # False → ref_chunk
+        )
+        result["forward_inputs"]["record_transition"] = rlt_switch_flags.reshape(...)[:, :1]
+        return RLTRouteOutput(actions=routed_actions, result=result)
+```
+
+逻辑：
+
+- `rlt_switch_flags == False`（按 `b` 前）→ **执行 `ref_chunk`**
+- `rlt_switch_flags == True`（按 `b` 后）→ **执行 MLP `actions`**
+
+### 5. 环境执行 → Replay → Learner
+
+```mermaid
+sequenceDiagram
+    participant Op as 操作员
+    participant KB as KeyboardRLTPolicySwitchWrapper
+    participant Env as RealWorldEnv
+    participant EW as EnvWorker
+    participant Roll as Rollout Worker
+    participant FM as 冻结 feature model<br/>(π₀.₅+RLT)
+    participant MLP as MLP 副本<br/>(rollout.hf_model)
+    participant Route as RealworldRLTRoute
+    participant Buf as Replay Buffer
+    participant Learner as Actor Worker<br/>(RLTMLPPolicy)
+
+    Op->>KB: 按 b（可选）
+    KB->>KB: rlt_switch_flags = True（锁存）
+
+    EW->>Roll: obs + rlt_switch_flags
+    Roll->>FM: extract_rlt_obs(obs)
+    FM-->>Roll: z_rl, proprio, ref_chunk
+    Roll->>MLP: predict_action_batch(rlt_obs)
+    MLP-->>Roll: student_actions
+    Roll->>Route: route(ref_chunk, student_actions, flags)
+    alt flags == False（按 b 前）
+        Route-->>Env: 执行 ref_chunk
+    else flags == True（按 b 后）
+        Route-->>Env: 执行 student_actions
+    end
+
+    Env->>EW: reward, next_obs
+    EW->>Buf: update_rlt_transitions<br/>(curr_obs, action, next_obs)
+
+    Note over FM: 全程 no_grad，不训练
+    Buf->>Learner: 采样 transition
+    Learner->>Learner: 更新 MLP backbone+actor_mean+q_head
+```
+
+真机路径下 `update_rlt_transitions` **不检查** `record_transition`，因此按 `b` 前后的 step **都可以进 replay**（与 [`rlt.rst:694`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 一致）。
+
+---
+
+## 设计意图（为何这样拆？）
+
+Peg insertion 类任务常分两段：
+
+1. **Approach / 对准**（按 `b` 前）：用 Stage 1 训好的 VLA `ref_chunk` 做粗定位，行为相对稳定。
+2. **Critical / 插入**（按 `b` 后）：进入高精度阶段，用 **在线 RL 训好的 MLP actor** 做 residual 修正。
+
+操作员用 `b` 人工确认「可以交给 RL actor 了」，避免 actor 在远离目标时就乱动——这是 **真机安全与任务结构** 的设计，不是训练阶段的切换。
+
+ManiSkill 仿真里用 **`env.*.rlt_policy_switch`** 自动产生 `rlt_switch_flags`（抓 peg、近 hole 等），无需键盘（[`rlt.rst:219-223`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst)）。
+
+---
+
+## 与 RLT 两阶段训练的关系（避免混淆）
+
+| RLT 阶段 | 何时发生 | 训什么 | 与按 `b` 的关系 |
+|----------|----------|--------|----------------|
+| **Stage 1** | `run_vla_sft.sh`，离线 SFT | π₀.₅ + `rlt_module` | **无关**（早已完成） |
+| **Stage 2** | `train_embodied_agent.py`，在线 RL | MLP actor + critic | **全程**；`b` 只影响 rollout **执行哪路动作** |
+
+Stage 2 启动后，**π₀.₅ 和 RLT 就已冻结**；按不按 `b` 都不会再训练它们。
+
+---
+
+## 一句话总结
+
+**[`rlt.rst:215-217`](https://github.com/RLinf/RLinf/blob/main/docs/source-zh/rst_source/examples/embodied/rlt.rst) 描述的是 Stage 2 rollout 的「动作路由策略」：按 `b` 前真机走冻结 VLA 的 `ref_chunk`，按 `b` 后走可训 MLP actor；feature model 每步都在跑但从不更新，actor/critic 在 learner 里持续从 replay 更新——与按键无关。**
+
