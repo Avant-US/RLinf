@@ -28,7 +28,10 @@
 10. [与 Pi RLT 论文及操作指南的对照](#9-与-pi-rlt-论文及操作指南的对照)
 11. [差异根因与设计哲学](#10-差异根因与设计哲学)
 12. [从 RLmm 迁移到 RLiKx Franky 的检查清单](#11-从-rlmm-迁移到-rlikx-franky-的检查清单)
-13. [参考文献与代码索引](#12-参考文献与代码索引)
+13. [RLmm 原生 RLinf：RLT 全链路时序图](#13-rlmm-原生-rlinf-rlt-全链路时序图)
+14. [RLiKx 修改版 RLinf：RLT 全链路时序图](#14-rlikx-修改版-rlinf-rlt-全链路时序图)
+15. [修改类与行为变更索引](#15-修改类与行为变更索引)
+16. [参考文献与代码索引](#16-参考文献与代码索引)
 
 ---
 
@@ -108,20 +111,20 @@ flowchart LR
 状态：
 
 \[
-s = \{z_{rl},\ \text{proprio},\ \text{ref\_chunk}\}
+$$s = \{z_{rl},\ \text{proprio},\ \text{ref\_chunk}\}$$
 \]
 
 Actor 目标（RLinf 实现，非 max-entropy SAC）：
 
 \[
-\mathcal{L}_{actor} = -\lambda_q \cdot Q_1(s, \pi(s)) + \lambda_{bc} \cdot \mathcal{L}_{BC}
+$$\mathcal{L}_{actor} = -\lambda_q \cdot Q_1(s, \pi(s)) + \lambda_{bc} \cdot \mathcal{L}_{BC}$$
 \]
 
 Critic TD（chunk 内折扣）：
 
 \[
-R = \sum_{t=0}^{H-1} \gamma^t r_t,\quad
-\text{target}_Q = R + (1-\text{done})\cdot \gamma^H \cdot \min(Q_1', Q_2')
+$$R = \sum_{t=0}^{H-1} \gamma^t r_t,\quad
+\text{target}_Q = R + (1-\text{done})\cdot \gamma^H \cdot \min(Q_1', Q_2')$$
 \]
 
 默认 Franky/Franka 真机：\(\lambda_{bc}=5, \lambda_q=0.1, \gamma=0.96, H=10\)。
@@ -718,7 +721,494 @@ flowchart TB
 
 ---
 
-## 12. 参考文献与代码索引
+## 13. RLmm 原生 RLinf：RLT 全链路时序图
+
+本节描述 **RLmm**（`/home/nvidia/bt/s/RLmm/`）中 RLT 从启动到单步训练的完整调用链。图中类名与源码一致；**未标注 `[MOD]` 的类/行为与 RLiKx 在真机路径上相同或仅有细微差异**。
+
+### 13.1 图例
+
+| 标记 | 含义 |
+|:---|:---|
+| 普通节点 | RLmm / 两库共享，真机路径行为一致 |
+| **`[RLmm]`** | RLmm 真机路径特有或未在 RLiKx Franky 启用的行为 |
+| 虚线箭头 | Ray Channel 跨 Worker 异步消息 |
+| 实线箭头 | 同进程内函数调用 |
+
+### 13.2 两阶段总览（Stage 1 → Stage 2）
+
+```mermaid
+flowchart TB
+    subgraph S1 ["Stage 1: SFT + RLT Token（离线）"]
+        S1E["examples/sft/run_vla_sft.sh"]
+        S1R["SFTRunner + OpenPiPytorchSFTActionModel"]
+        S1D["LeRobot 示范 data/"]
+        S1E --> S1R
+        S1D --> S1R
+        S1R --> S1OUT["checkpoint/.../actor<br/>含 VLA + rlt_module.*"]
+    end
+
+    subgraph S2 ["Stage 2: 在线 Actor-Critic（真机 / 仿真）"]
+        S2E["train_embodied_agent.py<br/>loss_type=rlt_ac"]
+        S2R["EmbodiedRunner"]
+        S2E --> S2R
+        S2R --> W["Env / Rollout / Actor Workers"]
+    end
+
+    S1OUT -->|"rollout.rlt_feature_model.model_path"| S2W["MultiStepRolloutWorker<br/>加载冻结 Feature Model"]
+    S1OUT -.->|"不加载到 actor.model"| S2A["RLTACFSDPPolicy<br/>RLTMLPPolicy 随机/ resume 初始化"]
+```
+
+**说明**：
+
+- **Stage 1** 入口为 SFT pipeline（`runner.task_type: sft`），联合优化 `vla_loss` 与 `rlt_loss`；产出 **含 `rlt_module` 权重的 actor checkpoint**。
+- **Stage 2** 入口为 `examples/embodiment/train_embodied_agent.py`（或 `run_realworld.sh`）；当 `algorithm.loss_type: rlt_ac` 时选用 `RLTACFSDPPolicy`，**不**走独立 RLT Runner。
+- Stage 1 checkpoint **只**填入 `rollout.rlt_feature_model.model_path`；Stage 2 MLP 头由 `actor.model` 定义，权重来自 `runner.resume_dir` 或随机初始化。
+
+### 13.3 部署拓扑与进程职责（Stage 2 真机）
+
+```mermaid
+flowchart TB
+    subgraph Head ["Head 节点"]
+        TE["train_embodied_agent.py"]
+        ER["EmbodiedRunner"]
+        TE --> ER
+    end
+
+    subgraph GPU ["node_rank=0 GPU"]
+        RW["MultiStepRolloutWorker"]
+        AW["RLTACFSDPPolicy"]
+        FM["OpenPiPytorchEvalActionModel<br/>rlt_feature_model 冻结"]
+        MLP["RLTMLPPolicy hf_model"]
+        RW --> FM
+        RW --> MLP
+    end
+
+    subgraph Robot ["node_rank=1 Robot"]
+        EW["EnvWorker"]
+        RWE["RealWorldEnv"]
+        WRAP["Wrapper 栈<br/>Spacemouse → KeyboardRLT b-only"]
+        EW --> RWE --> WRAP
+    end
+
+    ER -->|"sync_weights"| RW
+    ER -->|"interact ∥ generate ∥ recv_traj"| EW
+    ER -->|"interact ∥ generate"| RW
+    ER -->|"recv_rollout_trajectories"| AW
+    EW <-->|"Channel obs ↔ actions"| RW
+    EW -->|"Trajectory"| AW
+```
+
+**类职责**：
+
+| 类 | 文件 | 职责 |
+|:---|:---|:---|
+| `EmbodiedRunner` | `rlinf/runners/embodied_runner.py` | 训练主循环：权重同步 → rollout 采集 → actor 训练 |
+| `MultiStepRolloutWorker` | `rlinf/workers/rollout/hf/huggingface_worker.py` | 加载 Stage1 feature model + Stage2 MLP；调用 `predict_rlt_actions` |
+| `EnvWorker` | `rlinf/workers/env/env_worker.py` | 驱动真机 env；构建 `Trajectory`；Channel 与 Rollout 握手 |
+| `RLTACFSDPPolicy` | `rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py` | Replay 入库、BC+Q 更新、checkpoint |
+| `RealworldRLTRoute` | `rlinf/algorithms/rlt/route.py` | **[RLmm]** 真机 actor/ref 直接 `torch.where` 替换 |
+
+### 13.4 EmbodiedRunner 单训练步时序（总图）
+
+对应 `EmbodiedRunner.run()` 中每个 `global_step` 的 **同步** 三 Worker 协同（`overlap_env_bootstrap=false` 时无 prefetch）。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ER as EmbodiedRunner
+    participant AW as RLTACFSDPPolicy
+    participant EW as EnvWorker
+    participant RW as MultiStepRolloutWorker
+
+    ER->>AW: set_global_step(N)
+    ER->>RW: set_global_step(N)
+    ER->>ER: update_rollout_weights() 可选
+
+    par 并行启动
+        ER->>EW: interact(env_ch, rollout_ch, actor_ch)
+        ER->>RW: generate(rollout_ch, env_ch)
+        ER->>AW: recv_rollout_trajectories(actor_ch)
+    end
+
+    Note over EW,RW: 见 §13.5 单 epoch 内多 chunk 循环
+
+    EW-->>AW: Trajectory via Channel
+    AW->>AW: _ingest_rollout_trajectories<br/>[RLmm] 真机整 traj 入库
+
+    ER->>AW: compute_advantages_and_returns()
+    Note over AW: RLT 下为空操作/占位
+
+    ER->>AW: run_training()
+    AW->>AW: ReplayBufferDataset 采样
+    AW->>AW: forward_critic / forward_actor<br/>[RLmm] raw action BC+Q
+    AW->>AW: optimizer.step, target 更新
+
+    ER->>ER: global_step += 1
+```
+
+**说明**：
+
+1. **步骤 1–3**：Actor 与 Rollout 共享 `global_step`；周期性 `update_rollout_weights` 将 FSDP actor 权重同步到 Rollout 侧 `hf_model`。
+2. **步骤 4–6 并行**：Env 推 obs、Rollout 回 actions、Actor 收 traj——三者通过 **两个 Channel**（`env_channel` / `rollout_channel` / `actor_channel`）解耦，由 Runner 在同一 step 内 `wait()` 汇合。
+3. **步骤 7–8**：RLT **不使用 GAE**；`compute_advantages_and_returns` 对 `rlt_ac` 基本是 SAC 路径的兼容调用。
+4. **步骤 9–11**：`run_training` 从 replay（+ 可选 demo_buffer）采样，按 `critic_actor_ratio` 交替更新 critic 与 actor。
+
+### 13.5 EnvWorker ↔ RolloutWorker：单 rollout epoch 时序（子图）
+
+真机 RLT 在 `EnvWorker._run_interact_once()` 内循环 `n_train_chunk_steps` 次；每次为一个 **chunk**（默认 10 物理步）。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EW as EnvWorker
+    participant RWE as RealWorldEnv
+    participant KB as KeyboardRLTPolicySwitchWrapper
+    participant SM as SpacemouseIntervention
+    participant RW as MultiStepRolloutWorker
+    participant PR as predict_rlt_actions
+    participant RT as RealworldRLTRoute_RLmm
+
+    EW->>RWE: bootstrap_step() 首包 obs
+    EW->>RW: send obs, rlt_switch_flags
+
+    loop 每个 chunk_step_idx
+        RW->>PR: predict_rlt_actions(env_obs, flags)
+        PR->>PR: feature_model.extract_rlt_obs()
+        PR->>PR: RLTMLPPolicy.predict_action_batch()
+        PR->>RT: route(student, ref, flags)
+        Note over RT: [RLmm] VLA: ref前10步<br/>Actor: student直接替换
+        RT-->>RW: routed_actions, record_transition
+        RW->>EW: PolicyOutput via Channel
+
+        EW->>EW: append_step_result(action+reward 同步)
+        EW->>EW: update_rlt_transitions(cache_current=True)
+        Note over EW: [RLmm] intervene 时改写 ref_chunk
+
+        EW->>RWE: chunk_step(routed_actions)
+        RWE->>SM: step 可能接管 delta
+        SM->>KB: step
+        KB->>RWE: base env.step
+        Note over RWE: [RLmm] 无终止 break<br/>跑满 chunk_size
+
+        EW->>RW: send next obs + flags
+    end
+
+    EW->>EW: finish_rollout → Trajectory
+```
+
+**[RLmm] 真机路径要点**：
+
+- **Keyboard** 仅处理 `b` 键（`KeyboardRLTPolicySwitchWrapper` 78 行）；**奖励/终止** 来自环境 `use_pose_reward` 或另配 `KeyboardRewardDoneWrapper`（`reward_done_wrapper.py`）。
+- **`update_rlt_transitions`**：若 SpaceMouse 接管，**在写入 transition 前把 `ref_chunk` 替换为 human action**（`transition.py:72-88`）。
+- **`append_step_result`**：**同一 chunk** 内 action 与 reward/done **同步写入** trajectory（`env_worker.py:1097-1118`）。
+- **`RealworldRLTRoute`**：非 actor 时下发 `ref_chunk[:, :10, :]`，**不是** 20 步。
+
+### 13.6 Rollout 推理子模块调用链（代码级）
+
+```mermaid
+flowchart LR
+    A["_predict_rollout_actions"] --> B["predict_rlt_actions"]
+    B --> C["OpenPiPytorchEvalActionModel<br/>.extract_rlt_obs()"]
+    C --> C1["build_prefix_cache"]
+    C --> C2["_encode_rlt_flat → z_rl"]
+    C --> C3["_sample_actions → ref_chunk 20x7"]
+    B --> D["RLTMLPPolicy<br/>.predict_action_batch()"]
+    D --> D1["sac_forward → tanh delta/mean"]
+    B --> E["RealworldRLTRoute.route()"]
+    E --> E1["[RLmm] where(actor,student,ref10)"]
+    B --> F["_append_rlt_transition_obs"]
+    F --> F1["forward_inputs += rlt_transition_*"]
+```
+
+| 函数/类 | 输入 | 输出 | 职责 |
+|:---|:---|:---|:---|
+| `extract_rlt_obs` | 原始 env obs（图+state） | `z_rl`, `proprio`, `ref_chunk` | 冻结 Stage1：VLA prefix + flow 采样参考动作 |
+| `RLTMLPPolicy.sac_forward` | `rlt_obs` | `10×7` tanh 输出 | Stage2 可训练 MLP；输入含 ref 前 10 步 |
+| `RealworldRLTRoute` | student, ref, flags | routed_actions, `record_transition` | **[RLmm]** 选择 ref 或 student，**不做** ref+δ |
+| `_append_rlt_transition_obs` | final_obs 可选 | `rlt_transition_*` 键 | 为 learner 准备 `next_obs` |
+
+### 13.7 Learner 训练子模块（RLmm 真机路径）
+
+```mermaid
+sequenceDiagram
+    participant AW as RLTACFSDPPolicy
+    participant RB as TrajectoryReplayBuffer
+    participant DS as ReplayBufferDataset
+    participant M as RLTMLPPolicy FSDP
+
+    AW->>AW: recv_rollout_trajectories
+    AW->>AW: _ingest_rollout_trajectories
+    Note over AW: [RLmm] add_trajectories(recv_list) 整包入库
+
+    loop update_epoch 次
+        AW->>DS: next batch
+        DS->>RB: sample(256)
+        AW->>M: forward_critic(batch)
+        Note over M: actions = batch 原始动作
+        AW->>M: forward_actor(batch)
+        Note over M: BC: pi vs where(human,act,ref)
+        AW->>AW: critic_optim / actor_optim step
+    end
+```
+
+---
+
+## 14. RLiKx 修改版 RLinf：RLT 全链路时序图
+
+本节描述 **RLiKx**（`/home/nvidia/bt/RLiKx/`）Franky 生产路径。图中 **`[MOD]`** 表示相对 RLmm 真机路径 **已修改类或行为**；**`[RLiKx]`** 表示 RLiKx 独有模块/脚本。
+
+### 14.1 图例（在 §13.1 基础上）
+
+| 标记 | 含义 |
+|:---|:---|
+| **`[MOD]`** | 类存在于两库，但 RLiKx 中行为已改（需对照 RLmm） |
+| **`[RLiKx]`** | 仅 RLiKx 存在的文件或运维层 |
+| **`[共享]`** | 与 RLmm 字节级或语义级一致 |
+
+### 14.2 两阶段总览 + 运维层
+
+```mermaid
+flowchart TB
+    subgraph S1 ["Stage 1 [共享]"]
+        S1OUT["trans5090_v2/full_weights.pt<br/>2-view norm_stats"]
+    end
+
+    subgraph Ops ["[RLiKx] b/rlt/ 运维层"]
+        ST["start_stage2.sh 双 Docker"]
+        RS["run_stage2.sh"]
+        OG["操作指南.md"]
+        OFF["compare_offline_stage2.py"]
+        ST --> RS
+        RS --> OG
+    end
+
+    subgraph S2 ["Stage 2 Franky"]
+        S2E["train_embodied_agent.py"]
+        S2E --> ER["EmbodiedRunner"]
+        ER --> GPU["GPU: Rollout+Actor"]
+        ER --> FK["Franka: EnvWorker"]
+    end
+
+    Ops --> S2E
+    S1OUT --> GPU
+```
+
+**与 RLmm 差异**：RLiKx 增加 **宿主机双容器编排**（`rlinf-ray` bridge + Franky host 网络）、**操作指南** 作为运行时契约、**离线 fixed-replay 对照** 工具链；Stage1 权重与 2-view dataconfig 为现场定制。
+
+### 14.3 部署拓扑（RLiKx Franky）
+
+```mermaid
+flowchart TB
+    subgraph Host ["宿主机"]
+        ST["[RLiKx] start_stage2.sh"]
+    end
+
+    subgraph GPU ["rlinf-rlt-gpu 172.30.0.10"]
+        RW["MultiStepRolloutWorker [共享]"]
+        AW["RLTACFSDPPolicy [MOD]"]
+        RT["RealworldRLTRoute [MOD]"]
+    end
+
+    subgraph Franky ["rlinf-rlt-franka host 网络"]
+        EW["EnvWorker [MOD]"]
+        RWE["RealWorldEnv [MOD]"]
+        WRAP["Spacemouse [MOD] → Keyboard b/c/a [MOD]"]
+        ENV["[RLiKx] FrankyPegInsertionEnv-v1<br/>franky_ext.runtime_bootstrap"]
+    end
+
+    ST --> GPU
+    ST --> Franky
+    EW <-->|Ray Channel| RW
+```
+
+### 14.4 EmbodiedRunner 单训练步（与 RLmm 同骨架）
+
+RLiKx 仍使用 **`EmbodiedRunner` + 同步三 Worker**（`run_stage2.sh` 默认 `train_embodied_agent.py`，`overlap_env_bootstrap: false`）。**Runner 层无 `[MOD]`**；差异全部在 Worker 内部。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ER as EmbodiedRunner [共享]
+    participant AW as RLTACFSDPPolicy [MOD]
+    participant EW as EnvWorker [MOD]
+    participant RW as MultiStepRolloutWorker [共享]
+
+    ER->>AW: set_global_step(N)
+    ER->>RW: set_global_step(N)
+    par 并行
+        ER->>EW: interact(...)
+        ER->>RW: generate(...)
+        ER->>AW: recv_rollout_trajectories(...)
+    end
+    EW-->>AW: Trajectory
+    AW->>AW: [MOD] _recorded_chunk_trajectory 过滤
+    AW->>AW: [MOD] demo_buffer 阻塞等待可选
+    ER->>AW: run_training()
+    AW->>AW: [MOD] _actions_to_delta critic<br/>[MOD] conditional BC + valid_mask
+```
+
+### 14.5 EnvWorker ↔ Rollout：RLiKx 单 chunk 时序（核心差异）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EW as EnvWorker [MOD]
+    participant RWE as RealWorldEnv [MOD]
+    participant KB as KeyboardRLTPolicySwitchWrapper [MOD]
+    participant SM as SpacemouseIntervention [MOD]
+    participant RW as MultiStepRolloutWorker [共享]
+    participant RT as RealworldRLTRoute [MOD]
+    participant TR as update_rlt_transitions [MOD]
+
+    EW->>RW: obs + rlt_switch_flags
+
+    RW->>RT: route(delta, ref, flags)
+    alt flags=false VLA模式
+        RT-->>EW: ref_chunk 完整20步 [MOD]
+        Note over RT: record_transition=false
+    else flags=true Actor模式
+        RT-->>EW: ref前10 + delta×scale [MOD]
+        Note over RT: record_transition=true
+    end
+
+    alt chunk_step_idx > 0
+        EW->>EW: [MOD] append_step_result 仅 outcome
+    end
+    EW->>EW: [MOD] append_step_result action rewards=None
+    EW->>TR: update_rlt_transitions
+    Note over TR: [MOD] 不改写 ref_chunk<br/>无 intervene→ref 补丁
+
+    EW->>RWE: chunk_step(actions)
+    alt 中途 terminated
+        RWE->>RWE: [MOD] break 停发命令
+        RWE->>RWE: [MOD] padding + chunk_valid_steps
+    end
+
+    KB->>KB: [MOD] b/c/a MIN_ACTOR_STEPS=20
+    SM->>SM: [MOD] delta→absolute if 接管
+```
+
+**相对 RLmm 的行为变更摘要**：
+
+| 步骤 | RLmm | RLiKx `[MOD]` |
+|:---|:---|:---|
+| 路由 VLA | ref **10 步** | ref **20 步** |
+| 路由 Actor | student **替换** | **ref + δ×scale** |
+| transition | intervene **改 ref_chunk** | ref **保持 VLA**；BC 在 learner 算 δ |
+| traj 写入 | action+reward **同步** | outcome **错开一拍** |
+| chunk_step | 跑满 chunk | **终止即停** + padding |
+| 键盘 | 仅 **b** | **b/c/a** + epoch 上限 |
+
+### 14.6 Rollout 推理链（标注修改点）
+
+```mermaid
+flowchart LR
+    A["predict_rlt_actions [共享]"] --> B["extract_rlt_obs [共享]"]
+    A --> C["RLTMLPPolicy [MOD注释]"]
+    C --> C1["输出语义: delta [-1,1]<br/>delta_scale buffer 文档"]
+    A --> D["RealworldRLTRoute [MOD]"]
+    D --> D1["VLA: 20步 / Actor: ref+δ×scale"]
+    D --> D2["rlt_log 中文现场日志"]
+    A --> E["update_rlt_transitions [MOD]"]
+    E --> E1["无 intervene ref 替换"]
+```
+
+### 14.7 Learner 训练链（RLiKx `[MOD]`）
+
+```mermaid
+sequenceDiagram
+    participant AW as RLTACFSDPPolicy [MOD]
+    participant F as _recorded_chunk_trajectory [RLiKx]
+    participant G as action_geometry [RLiKx]
+    participant M as RLTMLPPolicy
+
+    AW->>F: 过滤 record_transition=True
+    F->>AW: 校验 action/reward 行对齐
+    AW->>AW: replay + demo 各采 128
+
+    AW->>G: [RLiKx] absolute_action_delta RPY
+    AW->>M: forward_critic(delta actions)
+    AW->>M: forward_actor
+    Note over AW: bc_target_mode=conditional_all<br/>_bc_valid_mask 排除 padding
+```
+
+### 14.8 RLiKx Episode 生命周期总图（对照操作指南）
+
+将操作指南 §1 的五步流程展开为 **跨模块** 时序（**`[MOD]`** 标注变更类）。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as 操作员
+    participant KB as Keyboard [MOD]
+    participant Env as RealWorldEnv [MOD]
+    participant EW as EnvWorker [MOD]
+    participant Roll as Rollout [共享]
+    participant LR as RLTAC [MOD]
+
+    Op->>Env: reset 初始位姿
+    rect rgb(240,248,255)
+    Note over Roll,Env: VLA 阶段（未按 b）
+    Roll->>Env: [MOD] 执行 ref 20步
+    Note over LR: 不入 replay
+    end
+
+    Op->>KB: 按 b
+    rect rgb(232,245,233)
+    Note over Roll,Env: Actor 阶段
+    loop 每个 actor chunk
+        Roll->>Env: [MOD] ref10+delta 执行10步
+        EW->>LR: [MOD] record_transition=true 入库
+    end
+    end
+
+    Op->>KB: [MOD] c 或 a（需 actor≥20步）
+    KB->>Env: reward 1/0, terminated
+    Env->>Env: [MOD] chunk 中途 stop+pad
+
+    EW->>Roll: [MOD] terminal inference 无动作
+    EW->>LR: [MOD] 补最后 transition next_obs
+    LR->>LR: [MOD] _recorded_chunk_trajectory
+```
+
+### 14.9 ManiSkill 路径说明（两库 `[共享]`）
+
+RLiKx **未修改** 仿真路径：仍用 `SimulatorRLTRoute`、`rlt_schedule`、`_transition_replay_trajectories` step-level 入库。Franky 生产补丁 **仅作用于** `use_simulator_transition_replay(cfg)==False` 的真机分支。
+
+---
+
+## 15. 修改类与行为变更索引
+
+便于从时序图跳读源码，下表列出 RLiKx 相对 RLmm **真机 RLT 路径** 的全部变更点。
+
+| 类 / 模块 | 文件 | 变更类型 | 行为摘要 |
+|:---|:---|:---|:---|
+| `RealworldRLTRoute` | `rlinf/algorithms/rlt/route.py` | **`[MOD]`** | VLA 20 步；Actor ref+δ×scale；日志 |
+| `update_rlt_transitions` | `rlinf/algorithms/rlt/transition.py` | **`[MOD]`** | 移除 intervene→ref_chunk 替换 |
+| `absolute_action_delta` | `rlinf/algorithms/rlt/action_geometry.py` | **`[RLiKx]`** | RPY 周期差 |
+| `RLTMLPPolicy` | `rlinf/models/.../rlt_mlp_policy.py` | **`[MOD]`** | 增 `delta_scale` buffer；注释明确 delta 语义 |
+| `RLTACLossMixin` | `fsdp_rlt_ac_policy_worker.py` | **`[MOD]`** | `_actions_to_delta`, `_bc_metrics` 三模式, `_bc_valid_mask`, `_truncate_actions` |
+| `RLTACReplayMixin` | 同上 | **`[MOD]`** | `_recorded_chunk_trajectory`, demo 阻塞 |
+| `EnvWorker._run_interact_once` | `rlinf/workers/env/env_worker.py` | **`[MOD]`** | outcome 错开；terminal 无动作 |
+| `RealWorldEnv.chunk_step` | `rlinf/envs/realworld/realworld_env.py` | **`[MOD]`** | break+padding+`chunk_valid_steps` |
+| `KeyboardRLTPolicySwitchWrapper` | `keyboard_rlt_policy_switch_wrapper.py` | **`[MOD]`** | b/c/a, MIN_ACTOR_STEPS, epoch 计数 |
+| `SpacemouseIntervention` | `spacemouse_intervention.py` | **`[MOD]`** | δ→abs, intervene_flag, 1s 超时 |
+| `apply._apply_keyboard_wrapper` | `apply.py` | **`[MOD]`** | 传入 `max_episodes_per_epoch` |
+| `b/rlt/*` | `b/rlt/` | **`[RLiKx]`** | 启动脚本、YAML、离线工具、操作指南 |
+| `EmbodiedRunner` | `embodied_runner.py` | **`[共享]`** | 训练步编排不变 |
+| `predict_rlt_actions` | `rollout.py` | **`[共享]`** | 85 行一致 |
+| `SimulatorRLTRoute` | `route.py` | **`[共享]`** | ManiSkill 仿真不变 |
+
+### 15.1 时序图阅读建议
+
+1. **先读 §13.4 / §14.4** 理解 Runner 如何并行启动三 Worker——两库相同。
+2. **再读 §13.5 vs §14.5** 理解真机 chunk 级差异（这是 replay 错位 bug 与 20/10 语义的分水岭）。
+3. **最后读 §14.8** 将现场操作（操作指南）与代码模块对齐。
+4. 若只关心 **仿真**，读 §14.9 后直接查阅 RLmm `maniskill_rlt_stage2_ac_mlp.yaml` 与 `SimulatorRLTRoute` 源码即可，**无需** RLiKx Franky 补丁。
+
+---
+
+## 16. 参考文献与代码索引
 
 ### 论文与文档
 
@@ -751,4 +1241,4 @@ flowchart TB
 
 ---
 
-*本文以 RLmm 与 RLiKx 仓库 2026-09-13 本地源码为准撰写；关键结论均经逐文件 diff 核实。若操作指南与 RLmm 通用路径冲突，Franky 生产以 RLiKx `操作指南.md` + 本地代码为准。*
+*本文以 RLmm 与 RLiKx 仓库本地源码为准撰写；§13–§15 时序图基于 2026-09-13 代码核对。若操作指南与 RLmm 通用路径冲突，Franky 生产以 RLiKx `操作指南.md` + 本地代码为准。*

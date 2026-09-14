@@ -35,3 +35,33 @@
 - 测试和验收方案要分成"需要连真机"的和"不需要连真机"的两类, 以便不连真机就可以做尽量完善的测试.
 
 请根据我的要求, 对`4wvla_rlinf_eval_2.md`做改良.
+
+# 改良 4wvla_rlinf_eval_3A2.md
+
+我对 4wvla_rlinf_eval_3A2.md 有如下改良意见:
+
+- 即使不用ray也要复用现在的rlinf的docker镜像或容器
+- 尽量采用扩展的方式, 而不是修改 RLinf 原来代码的方式. 如果非要修改 RLinf 代码请详细说明理由. 
+- 扩展的代码或脚本写在 RLmm/b/x/four_dwvla_ext/ 或 RLmm/b/x/franky_ext/ 中, 自己另外建一个目录也行, 但要详细说明理由.
+- 把  @4WVLA/b/d/Frk/dta_4dtrj_plan_0904LOG.md 和 @4WVLA/b/d/Frk/dta_4dtrj_plan.md 提到的`bounding box`或`bbox`相关的问题也要考虑进去, 保证4D信息的一致性, 有效性, 以及数据归一化的一致性和有效性.
+- 要考虑到 @RLmm/b/d/frk1/franka_3LOG.md 和 @RLmm/b/d/frk1/franka_3.md 中提到的 `safety box` 的相关问题.
+- 参考 @RLmm/b/d/frk1/bx_analy_cp25.md , 仔细检查各种 box 的处理有没有问题, 七万不要出错, 或者弄乱了.
+- 增加一个程序,可以让 Franka 机器人摆出 bbox 边缘上的, 或 safe box 边缘上的极限动作.
+- 列出这个方案A"纯VLA评估"方案用了哪些 RLmm (也就是原 RLinf) 中关于 RLT 的代码或配置, 用在什么地方, 怎么用的, 有没有修改或扩展.
+- 要对新增或修改的功能或代码设计可落地的详尽的测试与验收方案, 并且把测试和验收方案分成"不需要连接真机"和"需要连接真机"两类.
+
+---
+请基于我上述的意见, 对 @RLmm/b/d/frk1/4wvla_rlinf_eval_3A2.md 进行改良.
+
+4wvla_rlinf_eval_3A2.md 是一个完整的自包含的方案文档. 不要只引用或提一下其它文档的内容然后让读者去看其它文档, 不要这样! 请把 @RLmm/b/d/frk1/4wvla_rlinf_eval_3A2.md 改成完整且自包含的文档.
+
+# RLmm(RLinf)/RLT
+
+参考RLT算法 ( 参考 RL Token: https://www.pi.website/research/rlt ) , https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/rlt.html 和对应的 @RLmm/docs/source-zh/rst_source/examples/embodied/rlt.rst. 深入分析 @RLmm/ 里的代码和文档, 基于RLmm 中真实的代码和文档, 写一份关于 RLmm(也就是原生的RLinf)是如何实现 RLT 算法的分析报告. 你的同事以前写过一份关于 RLinf 如何实现 RLT 算法的分析报告在 @RLmm/b/d/rltx/rlt_code_analyz2.markdown 中, 但漏了不少细节, 而且有一些分析和解释没有说到本质上也没有说清楚是基于那些代码做的分析和解释, 那份老报告也没有一个从宏观到微观的按照操作和执行过程进行的逐渐分解下去的清晰易懂的分析与解析, 请检查一下你的同事写旧文档有些什么优点和缺点, 缺点弥补一下, 优点进一步发扬, 但你要写一篇更好的关于 RLinf 是如何实现 RLT 算法的分析文档. 该文档要有从宏观到微观的, 整个 rlt 操作和运行流程的UML图(包括但不限于静态的类图, 模块图, 等等, 以及动态的时序图,数据流图, 等等), 以及对这些图的解释, 必要时可以举例说明, 可以有分stage和分模块的总图, 然后有细化到子模块的代码级别的子图, 重点是每个代码或重点类之间是如何划分职责, 如何调用与协同的. 在进行动态方面的分析前, 最好先把静态方面的分析做好, 比如有些什么模块, 各负责什么, 有些什么特别的名词和变量, 各具体指什么意思, 这些模块和类之间的职责划分和协作关系也要从宏观到微观地画出来和解释清楚. 另外, 重要的代码逻辑也要按真实代码去解释. 请把你的深入分析和解析写到在 @RLmm/b/d/rltx/rlt_code_analyz3.markdown 中 .
+
+
+深入分析 @RLiKx/ 里跟RLT算法相关的代码, 以及参考分析报告 @RLiKx/b/d/p/rlt_code_analyz_cdx.markdown @RLiKx/b/d/p/rltx_code_analyz_cdx.markdown 和 @RLiKx/b/d/p/rltx_code_analyz_cdxc2.markdown   @RLiKx/b/rlt/操作指南.md 中在 RLiKx 中的代码实现.  然后再深入分析 @RLmm/ 的代码, 分析 RLmm 的代码时可参考@RLmm/b/d/rltx/rlt_code_analyz.markdown 和 @RLmm/b/d/rltx/rlt_code_analyz2.markdown , 但最终还是要基于 RLmm 的真实的RLT算法的实现代码进入深入分析. 对比 RLiKx 中对 `操作指南.md` 的实现代码 与 RLmm 中对 RLT 算法的实现代码, 详细地深入地分析一下它们的相同点和不同点, 并详细描述一下这些同与不同, 详细解释一下为什么会有这些不同, 这些不同是为了解决什么问题或者说实现什么功能. 你的同事曾经写了两篇对 RLiKx 和 RLmm 的同与不同的分析和解析在 @RLmm/b/d/rltx/rlmm_rlikx_diff_analyz.markdown 和 @RLmm/b/d/rltx/rlmm_rlikx_diff_analyz2.markdown 中, 但我觉得这两篇分析分析漏了不少细节, 而且有一些分析和解释没有说到本质上, 也没有一个从宏观到微观的按照操作和执行过程的清晰易懂的分析与解析, 请检查一下你的同事写的那两篇分析文档有些什么优点和缺点, 缺点弥补一下, 优点进一步发扬, 但你要写一篇更好的对 RLiKx 和 RLmm 两套代码的不同点和相同点的分析, 你能写得比你同事的那篇更好的, 请把你的深入分析和解析写到在 @RLmm/b/d/rltx/rlmm_rlikx_diff_analyz3.markdown 中 .
+
+在 @RLmm/b/d/rltx/rlmm_rlikx_diff_analyz2.markdown  后面分别 增加 RLmm 这个原生 RLinf 和 @\home\nvidia\bt\RLiKx\  这个修改过的RLinf 这两个代码库的 整个 rlt 操作和运行流程的UML图(包括但不限于静态的类图, 模块图, 等等, 以及动态的时序图,数据流图, 等等), 可以有分stage和分模块的总图, 然后有细化到子模块的代码级别的子图, 重点是每个代码或重点类之间是如何划分职责, 如何调用与协同的, 特别是要标注出那些在 RLiKx 中被修改过的类以及被改变过的行为. 当然了, 也要添加对图的详细的说明.
+
+深入分析 @RLiKx/ 里跟RLT算法相关的代码, 以及参考分析报告 @RLiKx/b/d/p/rlt_code_analyz_cdx.markdown @RLiKx/b/d/p/rltx_code_analyz_cdx.markdown 和 @RLiKx/b/d/p/rltx_code_analyz_cdxc2.markdown   @RLiKx/b/rlt/操作指南.md 中在 RLiKx 中的代码实现.  然后再深入分析 @RLmm/ 的代码, 分析 RLmm 的代码时可参考@RLmm/b/d/rltx/rlt_code_analyz.markdown 和 @RLmm/b/d/rltx/rlt_code_analyz2.markdown , 但最终还是要基于 RLmm 的真实的RLT算法的实现代码进入深入分析. 对比 RLiKx 中对 `操作指南.md` 的实现代码 与 RLmm 中对 RLT 算法的实现代码, 详细地深入地分析一下它们的相同点和不同点, 并详细描述一下这些同与不同, 详细解释一下为什么会有这些不同, 这些不同是为了解决什么问题或者说实现什么功能. 这篇对 RLiKx 和 RLmm 的同与不同的分析和解析请写到 @RLmm/b/d/rltx/rlmm_rlikx_diff_analyz.markdown 中.
