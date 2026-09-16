@@ -67,3 +67,31 @@
 hf download --token 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 --cache-dir /home/nvidia/.cache/huggingface/hub "Qwen/Qwen3.5-2B"
 
 参考RLT算法 ( 参考 RL Token: https://www.pi.website/research/rlt ) , https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/rlt.html 和对应的 @RLmm/docs/source-zh/rst_source/examples/embodied/rlt.rst. 深入分析 @RLmm/ 里的代码和文档, 特别是关于RLT算法实现的代码和文档, 也可参考这份关于 RLmm(也就是原生的RLinf)是如何实现 RLT 算法的分析报告 @RLmm/b/d/rltx/rlt_code_analyz3.markdown. 同时深入分析 @4WVLA/ 的代码, 以及参考在 Franka 上用RLmm(也就是RLinf)对 4DWVLA(即4WVLA) 的模型checkpoint进行真机评估的实施方案和操作手册 @RLmm/b/d/frk1/4wvla_rlinf_eval_3A3.md . 深入思考一下如何用 RLmm(即Rlinf) 的 RLT 实现, 对4DWVLA(即4WVLA) 的模型checkpoint 进行 RLT 的 `Stage 1` 训练, 也就是对4DWVLA(即4WVLA) 的模型checkpoint  "VLA SFT + RLT token transformer" 的训练. 然后把对4DWVLA(即4WVLA)进行 RLT 的 `Stage 1` 训练的实施和落地方案写在 @RLmm/b/d/rltx/4dwvla_rlt1_1.markdown 中.
+
+参考RLT算法 ( 参考 RL Token: https://www.pi.website/research/rlt ) , https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/rlt.html 和对应的 @RLmm/docs/source-zh/rst_source/examples/embodied/rlt.rst. 深入分析 @RLmm/ 里的代码和文档, 特别是关于RLT算法实现的代码和文档, 也可参考这份关于 RLmm(也就是原生的RLinf)是如何实现 RLT 算法的分析报告 @RLmm/b/d/rltx/rlt_code_analyz3.markdown. 同时深入分析 @4WVLA/ 的代码, 以及参考在 Franka 上用RLmm(也就是RLinf)对 4DWVLA(即4WVLA) 的模型checkpoint进行真机评估的实施方案和操作手册 @RLmm/b/d/frk1/4wvla_rlinf_eval_3A3.md . 深入思考一下如何用 RLmm(即Rlinf) 的 RLT 实现, 对4DWVLA(即4WVLA) 的模型checkpoint 进行 RLT 的 `Stage 2` 训练, 也就是基于4DWVLA(即4WVLA) 的模型checkpoint做  "轻量级 off-policy actor-critic" 的训练. 然后把基于4DWVLA(即4WVLA)进行 RLT 的 `Stage 2` 训练的实施和落地方案写在 @RLmm/b/d/rltx/4dwvla_rlt2_1.markdown 中.
+
+
+"参考RLT算法 ( 参考 RL Token: https://www.pi.website/research/rlt ) , https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/rlt.html 和对应的 @RLmm/docs/source-zh/rst_source/examples/embodied/rlt.rst. 深入分析 @RLiKx/ 里跟RLT算法相关的代码, 以及参考分析报告 @RLiKx/b/d/p/rlt_code_analyz_cdx.markdown @RLiKx/b/d/p/rltx_code_analyz_cdx.markdown 和 @RLiKx/b/d/p/rltx_code_analyz_cdxc2.markdown @RLiKx/b/rlt/操作指南.md 中在 RLiKx 中的代码实现. 然后再深入分析 @RLmm/ 的代码, 分析 RLmm 的代码时可参考 @RLmm/b/d/rltx/rlt_code_analyz3.markdown , 但最终还是要基于 RLmm 的真实的RLT算法的实现代码进入深入分析. 对比 RLiKx 中对 `操作指南.md` 的实现代码 与 RLmm 中对 RLT 算法的实现代码, 详细地深入地分析一下它们的相同点和不同点, 并详细描述一下这些同与不同, 详细解释一下为什么会有这些不同, 这些不同是为了解决什么问题或者说实现什么功能, 关于这些相同与不同点也可参考 @RLmm/b/d/rltx/rlmm_rlikx_diff_analyz3.markdown. 但最终还是以真实代码为准. 说说 RLiKx 相对 RLmm 而言改了些什么?把相对 RLmm 而言改过的地方列出来. 这些改动的地方有哪些是和 @RLmm/b/d/rltx/4dwvla_rlt1_1.markdown 这份关于"对4DWVLA(即4WVLA) 的模型checkpoint 进行RLT的Stage 1阶段的训练, 也就是'VLA SFT + RLT token transformer' 的训练"的实施落地方案. 然后把"对4DWVLA(即4WVLA)进行 RLT 的 `Stage 1` 训练" 相关的 RLiKx 相对于 RLmm(即RLinf) 的不同点也请标注出来, 写清楚为什么相关, 会有什么影响. 把这些分析和解析写到 @RLmm/b/d/rltx/rlmm_rlikx_diff_forrlt1_1.markdown" 中.
+
+
+ @RLmm/b/d/rltx/4dwvla_rlt1_1.markdown 是一份实施落地方案, 它是关于如何用 RLmm(即Rlinf) 的 RLT 实现, 对4DWVLA(即4WVLA) 的模型checkpoint 进行 RLT 的 `Stage 1` 训练, 也就是对4DWVLA(即4WVLA) 的模型checkpoint 做"VLA SFT + RLT token transformer" 训练的, 对于这个方案, 我有如下改良要求:
+- 参考 @RLmm/b/d/frk1/4wvla_rlinf_eval_3A3.md 的编码规范, 做法和产物.
+- 注意要考虑 @4WVLA/b/d/Frk/dta_4dtrj_plan_0904LOG.md , @4WVLA/b/d/Frk/dta_4dtrj_plan.md 和 `4wvla_rlinf_eval_3A3.md` 提到的`bounding box`或`bbox`相关的问题也要考虑进去, 保证4D信息的一致性, 有效性, 以及数据归一化的一致性和有效性.
+- 要考虑到 @RLmm/b/d/frk1/franka_3LOG.md 和 @RLmm/b/d/frk1/franka_3.md 中提到的 `safety box` 的相关问题.
+- 参考 @RLmm/b/d/frk1/bx_analy_cp25.md 和 `4wvla_rlinf_eval_3A3.md` 中提到的各种 box 和 limit 的处理问题, 七万不要出错, 或者弄乱了.
+- 方案要基于对目前服务器的软硬件环境的深入分析.(该服务器的软硬件环境包括了它连接的Franka机器人和docker上的RLinf相关的image, 以及`4wvla_rlinf_eval_3A3.md`中产生的容器)
+- 代码或项目路径用本代码库的路径, 不要写死, 要能推理出来那种.
+- 要尽量识别和抽象出会根据不同实验, 不同模型的 RLT Stage 1 训练的改变而改变的变量, 并抽取和罗列出来, 写出它们的含义, 作用, 实际生效的值, 以及具体在哪个文件的哪行取这个生效值的.
+- 文档要自包含, 不要引用其它文档的内容, 但要标明内容的出处. 文档是完整的. 文档要包含详细的测试和验收部分.
+- 方案要基于对现有代码的深入分析, 基于实际已有的代码. 同时要尽量复用已有的脚本或代码. 要遵守扩展大于修改的设计原则.扩展或生成的代码可放在 @RLmm/b/x/4dwvla_ext/rlt/ 中.
+- 通过 RLinf 的插件或扩展模式进行功能的增加, 尽量不改 RLinf 原来的代码.
+- 尽量使用或复用docker容器.
+- 参考 @RLmm/b/d/rltx/rlmm_rlikx_diff_forrlt1_1.markdown 中关于 @RLiKx/ 相对于 @RLmm/ (即RLinf) 的不同点中与"对4DWVLA(即4WVLA) 的模型checkpoint 进行 RLT 的 `Stage 1` 训练, 也就是做'VLA SFT + RLT token transformer'训练"相关的点, 参考它们的相关性和影响大小. 深入思考一下如何利用这些相关点, 或者如何消除这些相关点的影响.
+- 文档要把要增删改哪些文件或代码, 以及增删改哪些内容都要列出来, 要细到代码级别, 也要详细解释为什么要做这样的增删改, 也要列出复用了什么, 以及为什么要这样复用. 也要有专门章节描述, 当RLT Stage 1 训练开始后, 各个脚本和代码间的调用顺序, 以及它们各自负责什么工作, 数据是如何流动的, 输入和输出分别涉及什么关键目录等等.
+- 对于每个功能的增加,修改和删除都要有相应的测试用例与验收脚本, 以保证代码的正确与向前兼容.
+- 要对新增或修改的功能或代码设计可落地的详尽的测试与验收方案, 并且把测试和验收方案分成"不需要连接真机"和"需要连接真机"两类.
+- 文档要包括操作手册部分, 操作手册要详细到即使对该项目一无所知的第三方工程师按照该操作手册部分一步一步地执行也能成功解决问题完成SFT训练或eval评估. 除了一步一步的步骤也写清楚外, 也要写清楚做SFT训练或eval评估前, 用户要做什么? 要收集并提供什么信息? 要配置什么? 如何配置? 等等.
+- 最重要的是, 对代码, 配置或其它文件所做的增删改等操作要兼容之前的功能, 不能因为加入一个功能而破坏了以前的功能.
+
+---
+请基于上述要求, 对文档 `4dwvla_rlt1_1.markdown` 进行改良, 写到 4dwvla_rlt1_2.markdown 中.

@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Standalone safe Franka controller -- no Ray dependency.
+
+Replicates the safety mechanisms of FrankyControllerExtended
+(motion guard, watchdog, collision tightening, trip recovery)
+using the same constants from franky_ext.motion_limits,
+but without inheriting from Worker (which requires Ray).
+
+Usage:
+    controller = FrankyControllerDirect("172.16.0.2")
+    controller.set_motion_guard(tcp_min, tcp_max)
+    controller.move_joints(target_q)
+    controller.cleanup()
+"""
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import threading
+import time
+from typing import Optional
+
+import numpy as np
+
+# Import safety constants from franky_ext (Ray-free)
+sys.path.insert(0, os.environ.get("RLINF_EXT_PATH", "/workspace/RLinf/b/x"))
+
+from franky_ext.motion_limits import (
+    GUARD_MARGIN_M_DEFAULT,
+    GUARD_FLOOR_MARGIN_M_DEFAULT,
+    GUARD_MAX_LAG_M_DEFAULT,
+    GUARD_MAX_DQ_RAD_S_DEFAULT,
+    GUARD_RECOVERY_BUDGET_DEFAULT,
+    PANDA_MAX_REACH_M,
+    PANDA_SHOULDER_Z_M,
+    REACH_WARN_FRACTION,
+    guard_margin_m,
+    guard_floor_margin_m,
+    guard_max_lag_m,
+    guard_max_dq_rad_s,
+    guard_recovery_budget,
+    cartesian_collision_thresholds,
+    reach_radius_m,
+)
+
+logger = logging.getLogger(__name__)
+
+# FR3v2.1 joint limits (from rlinf.envs.realworld.franka.franky_controller)
+JOINT_LIMITS_LOWER = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+JOINT_LIMITS_UPPER = np.array([ 2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973])
+JOINT_VEL_LIMITS   = np.array([ 2.075,   2.075,   2.075,   2.075,   2.51,    2.51,    2.51])
+
+# Watchdog and braking constants (from controller_extended.py)
+_WATCHDOG_PERIOD_S = 0.02
+_BRAKE_DWELL_S = 0.25
+_BRAKE_SETTLED_RAD_S = 0.02
+
+
+class FrankyControllerDirect:
+    """Safe Franka controller with motion guard and watchdog.
+
+    Replicates FrankyControllerExtended safety mechanisms:
+    - Collision behavior tightening (_tighten_collision_behavior)
+    - Motion guard: TCP fence with margin (set_motion_guard)
+    - Watchdog thread: 50Hz continuous monitoring (_watchdog_loop)
+    - Joint velocity norm limiting
+    - Trip detection and recovery
+    """
+
+    def __init__(self, robot_ip: str, gripper_type: str = "franka"):
+        import franky
+
+        self._robot = franky.Robot(robot_ip)
+        self._robot.recover_from_errors()
+        self._robot.relative_dynamics_factor = 0.2
+
+        if gripper_type == "franka":
+            self._gripper = franky.Gripper(robot_ip)
+        else:
+            self._gripper = None
+
+        self._prev_target_q = None
+        self._prev_target_ts = 0.0
+
+        # Motion guard state
+        self._guard_min_xyz: Optional[np.ndarray] = None
+        self._guard_max_xyz: Optional[np.ndarray] = None
+        self._guard_max_lag = guard_max_lag_m()
+        self._guard_max_dq = guard_max_dq_rad_s()
+        self._guard_enabled = False
+        self._guard_trip_reason: Optional[str] = None
+        self._guard_trip_lock = threading.Lock()
+        self._guard_recoveries_used = 0
+        self._guard_recovery_budget = guard_recovery_budget()
+
+        # Watchdog
+        self._watchdog: Optional[threading.Thread] = None
+        self._watchdog_stop = threading.Event()
+
+        # Tighten collision behavior (same as FrankyControllerExtended)
+        self._tighten_collision_behavior()
+
+        logger.info(
+            "FrankyControllerDirect: connected to %s, guard_margin=%.3fm, "
+            "guard_max_dq=%.2frad/s, recovery_budget=%d",
+            robot_ip, guard_margin_m(), self._guard_max_dq,
+            self._guard_recovery_budget,
+        )
+
+    # -- Collision behavior (from FrankyControllerExtended) ---------------
+
+    def _tighten_collision_behavior(self):
+        """Replicates FrankyControllerExtended._tighten_collision_behavior()."""
+        thresholds = cartesian_collision_thresholds()
+        torque_lower = [20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0]
+        torque_upper = [20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0]
+        try:
+            self._robot.set_collision_behavior(
+                lower_torque_threshold=torque_lower,
+                upper_torque_threshold=torque_upper,
+                lower_force_threshold=thresholds,
+                upper_force_threshold=thresholds,
+            )
+            logger.info("Collision behavior tightened")
+        except Exception as e:
+            logger.warning("Could not tighten collision behavior: %s", e)
+
+    # -- Motion guard -----------------------------------------------------
+
+    def set_motion_guard(
+        self,
+        limit_min_xyz: np.ndarray,
+        limit_max_xyz: np.ndarray,
+        *,
+        margin: Optional[float] = None,
+        floor_margin: Optional[float] = None,
+    ):
+        """Install TCP position fence.
+        Replicates FrankyControllerExtended.set_motion_guard().
+        """
+        if margin is None:
+            margin = guard_margin_m()
+        if floor_margin is None:
+            floor_margin = guard_floor_margin_m()
+
+        self._guard_min_xyz = np.array(limit_min_xyz, dtype=np.float64) - margin
+        self._guard_min_xyz[2] = limit_min_xyz[2] - floor_margin
+        self._guard_max_xyz = np.array(limit_max_xyz, dtype=np.float64) + margin
+        self._guard_enabled = True
+
+        logger.info(
+            "Motion guard set: min=%s, max=%s (margin=%.3f, floor=%.3f)",
+            np.round(self._guard_min_xyz, 4).tolist(),
+            np.round(self._guard_max_xyz, 4).tolist(),
+            margin, floor_margin,
+        )
+
+        if self._watchdog is None or not self._watchdog.is_alive():
+            self._start_watchdog()
+
+    def clear_motion_guard(self):
+        self._guard_enabled = False
+        self._stop_watchdog()
+
+    def guard_tripped(self) -> Optional[str]:
+        with self._guard_trip_lock:
+            return self._guard_trip_reason
+
+    # -- Watchdog (from FrankyControllerExtended) -------------------------
+
+    def _start_watchdog(self):
+        self._watchdog_stop.clear()
+        self._watchdog = threading.Thread(
+            target=self._watchdog_loop,
+            args=(self._watchdog_stop,),
+            daemon=True,
+            name="motion-guard-watchdog",
+        )
+        self._watchdog.start()
+        logger.info("Watchdog started (%.0f Hz)", 1.0 / _WATCHDOG_PERIOD_S)
+
+    def _stop_watchdog(self):
+        if self._watchdog is not None:
+            self._watchdog_stop.set()
+            self._watchdog.join(timeout=2.0)
+            self._watchdog = None
+
+    def _watchdog_loop(self, stop_event: threading.Event):
+        """50Hz motion guard check.
+        Replicates FrankyControllerExtended._watchdog_loop().
+        """
+        while not stop_event.is_set():
+            try:
+                violation = self._evaluate_guard()
+                if violation is not None:
+                    kind, desc = violation
+                    self._abort_motion(kind, desc)
+            except Exception as e:
+                logger.error("Watchdog error: %s", e)
+            stop_event.wait(_WATCHDOG_PERIOD_S)
+
+    def _evaluate_guard(self) -> Optional[tuple[str, str]]:
+        """Check TCP position against fence + joint velocity.
+        Replicates FrankyControllerExtended._evaluate_guard().
+        """
+        if not self._guard_enabled:
+            return None
+
+        try:
+            state = self._robot.state
+            tcp_xyz = np.array(state.O_T_EE.translation)
+        except Exception:
+            return None
+
+        # Fence check
+        if self._guard_min_xyz is not None and self._guard_max_xyz is not None:
+            below = tcp_xyz < self._guard_min_xyz
+            above = tcp_xyz > self._guard_max_xyz
+            if np.any(below) or np.any(above):
+                axis = ["X", "Y", "Z"]
+                viol = []
+                for i in range(3):
+                    if below[i]:
+                        viol.append(f"{axis[i]}={tcp_xyz[i]:.4f}<{self._guard_min_xyz[i]:.4f}")
+                    elif above[i]:
+                        viol.append(f"{axis[i]}={tcp_xyz[i]:.4f}>{self._guard_max_xyz[i]:.4f}")
+                return ("fence", f"TCP outside fence: {', '.join(viol)}")
+
+        # Joint velocity check
+        try:
+            dq = np.array(state.dq[:7])
+            dq_norm = np.linalg.norm(dq)
+            if dq_norm > self._guard_max_dq:
+                return ("dq", f"|dq|={dq_norm:.3f} > {self._guard_max_dq:.3f} rad/s")
+        except Exception:
+            pass
+
+        # Reach check
+        r = reach_radius_m(tcp_xyz)
+        if r > PANDA_MAX_REACH_M * REACH_WARN_FRACTION:
+            logger.warning("NEAR-SINGULAR: reach=%.3fm (%.0f%% of max)", r, r / PANDA_MAX_REACH_M * 100)
+
+        return None
+
+    def _abort_motion(self, kind: str, reason: str):
+        with self._guard_trip_lock:
+            if self._guard_trip_reason is not None:
+                return
+            self._guard_trip_reason = f"{kind}: {reason}"
+        logger.error("MOTION GUARD TRIP [%s]: %s", kind, reason)
+        self._brake(kind)
+
+    def _brake(self, kind: str):
+        """Replicates FrankyControllerExtended._brake()."""
+        try:
+            if kind in ("fence", "orient"):
+                self._robot.stop()
+            else:
+                try:
+                    import franky
+                    current_q = list(self._robot.state.q[:7])
+                    motion = franky.JointWaypointMotion([franky.JointWaypoint(current_q)])
+                    saved = self._robot.relative_dynamics_factor
+                    self._robot.relative_dynamics_factor = 0.05
+                    self._robot.move(motion)
+                    self._robot.relative_dynamics_factor = saved
+                except Exception:
+                    self._robot.stop()
+        except Exception as e:
+            logger.error("Brake failed: %s", e)
+
+    def recover_from_guard_trip(self) -> dict:
+        """Replicates FrankyControllerExtended.recover_from_guard_trip()."""
+        with self._guard_trip_lock:
+            was_tripped = self._guard_trip_reason
+            if was_tripped is None:
+                return {"recovered": True, "was_tripped": False}
+
+        if self._guard_recoveries_used >= self._guard_recovery_budget:
+            return {"recovered": False, "was_tripped": True, "budget_exhausted": True}
+
+        try:
+            self._robot.recover_from_errors()
+            time.sleep(0.5)
+            violation = self._evaluate_guard()
+            if violation is not None:
+                return {"recovered": False, "was_tripped": True, "reason": str(violation)}
+
+            with self._guard_trip_lock:
+                self._guard_trip_reason = None
+            self._guard_recoveries_used += 1
+            logger.info("Guard recovery %d/%d", self._guard_recoveries_used, self._guard_recovery_budget)
+            return {"recovered": True, "was_tripped": True, "previous_reason": was_tripped}
+        except Exception as e:
+            return {"recovered": False, "was_tripped": True, "error": str(e)}
+
+    # -- Robot control API ------------------------------------------------
+
+    def get_state(self):
+        state = self._robot.state
+        q = np.array(state.q[:7], dtype=np.float64)
+        dq = np.array(state.dq[:7], dtype=np.float64)
+        tcp_xyz = np.array(state.O_T_EE.translation)
+        gw = float(self._gripper.width) if self._gripper else None
+        return {"arm_joint_position": q, "arm_joint_velocity": dq,
+                "tcp_position": tcp_xyz, "gripper_width": gw}
+
+    def move_joints(self, joint_positions: np.ndarray):
+        """Replicates FrankyController.move_joints() with guard check."""
+        tripped = self.guard_tripped()
+        if tripped is not None:
+            raise RuntimeError(f"Motion guard tripped: {tripped}")
+        clipped = np.clip(joint_positions, JOINT_LIMITS_LOWER, JOINT_LIMITS_UPPER)
+        import franky
+        motion = franky.JointWaypointMotion([franky.JointWaypoint(clipped.tolist())])
+        self._robot.move(motion)
+
+    def reset_joint(self, reset_pos: list[float]):
+        """Replicates FrankyController.reset_joint()."""
+        import franky
+        motion = franky.JointWaypointMotion([franky.JointWaypoint(reset_pos)])
+        saved = self._robot.relative_dynamics_factor
+        self._robot.relative_dynamics_factor = 0.1
+        self._robot.move(motion)
+        self._robot.relative_dynamics_factor = saved
+
+    def open_gripper(self):
+        if self._gripper:
+            self._gripper.move(width=0.08, speed=0.05)
+
+    def close_gripper(self, force: float = 20.0):
+        if self._gripper:
+            self._gripper.grasp(width=0.0, speed=0.05, force=force,
+                                epsilon_inner=0.05, epsilon_outer=0.05)
+
+    def gripper_width(self) -> Optional[float]:
+        return float(self._gripper.width) if self._gripper else None
+
+    def stop(self):
+        try:
+            self._robot.stop()
+        except Exception as e:
+            logger.error("stop failed: %s", e)
+
+    def recover_from_errors(self):
+        self._robot.recover_from_errors()
+
+    def freeze_at_current(self) -> bool:
+        try:
+            import franky
+            q = list(self._robot.state.q[:7])
+            saved = self._robot.relative_dynamics_factor
+            self._robot.relative_dynamics_factor = 0.05
+            self._robot.move(franky.JointWaypointMotion([franky.JointWaypoint(q)]))
+            self._robot.relative_dynamics_factor = saved
+            return True
+        except Exception:
+            return False
+
+    def cleanup(self):
+        self._stop_watchdog()
+        self.freeze_at_current()
+        logger.info("FrankyControllerDirect cleanup complete")
