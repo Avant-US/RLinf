@@ -1,6 +1,6 @@
 # 模式 A 纯 VLA 评估 — 基于 Docker 镜像的实施落地方案 (v3A3)
 
-> **版本**: v3A3.12 | **日期**: 2026-09-15
+> **版本**: v3A3.14 | **日期**: 2026-09-16
 > **定位**: 基于本机实际 Docker 镜像 `rlinf/rlinf:agentic-rlinf0.4-franka` 和 `rlinf/rlinf:agentic-rlinf0.4-maniskill_libero` 的**完整自包含**实施落地方案.
 > **适用范围**: 直接使用 4DWVLA (InternVLA-A1.5) 输出动作, 在 Franka FR3v2.1 上执行"仅纯 VLA 评估".
 > **本文档为完整自包含文档**: 所有代码、配置、安全参数和实现细节均已内联, 无需参阅其他文档.
@@ -163,6 +163,19 @@ VLA 评估同时需要:
 4. **GPU 容器需 `--gpus all`**, **Franky 容器需 `--privileged`** — 已有脚本支持
 5. **4DWVLA 需要 `transformers==5.2.0`** — 必须新建 venv, 不能复用现有任何 venv
 6. **检查点**: step 10420, ~5.9GB, `action_mode=abs`, `tokenize_state=True`, `chunk_size=50`
+7. **高效推理额外依赖**: `flash-linear-attention==0.5.0` + `causal-conv1d>=1.7.0` — Qwen3.5-2B 的 `chunk_gated_delta_rule` attention 内核所需; 缺失时退回 naive 循环, VRAM 翻倍、速度下降 ~10x (详见 §5.1 Step 6.5)
+8. **RLT Stage 1 共用容器**: 本方案的 GPU 容器 (`rlinf-4dwvla-gpu`) 同时用于 RLT Stage 1 训练 (见 `4dwvla_rlt1_2.markdown`), venv 和依赖共享, 互不冲突
+9. **当前已运行容器**: `rlinf-4dwvla-gpu` (GPU), `rlinf-4dwvla-franky` (Franky) — 做完后**不要停掉**
+
+**相关 LOG 文件**:
+
+| LOG 文件 | 内容 | 日期 |
+|:---|:---|:---|
+| `4wvla_rlinf_eval_3A3_off0914LOG.md` | 宿主机离线测试 (T2/T3/T10) 通过记录 | 2026-09-14 |
+| `4wvla_rlinf_eval_3A3_offgpudck0914LOG.md` | GPU 容器离线测试 (T1/T4) + Docker 环境排查记录 | 2026-09-14 |
+| `4wvla_rlinf_eval_3A3_off0915LOG.md` | 在线测试 (T5-T8) + franky 0.19.0 适配记录 | 2026-09-15 |
+
+所有 LOG 文件位于 `RLmm/b/d/frk1/` 目录下, 与本文档同目录.
 
 ---
 
@@ -283,6 +296,21 @@ RLmm/b/x/
     │   ├── docker_run_4dwvla_gpu.sh    # GPU 容器启动脚本 (§7.1)
     │   ├── docker_run_4dwvla_franky.sh # Franky 容器启动脚本 (§7.2)
     │   └── setup_4dwvla_venv.sh        # GPU 容器内 venv 搭建 (§5.1)
+    ├── rlt/                            # RLT Stage 1 模块 (见 4dwvla_rlt1_2.markdown)
+    │   ├── __init__.py
+    │   ├── rlt_config.py               # RLTStage1Config 数据类 (含 vla_inference_mode)
+    │   ├── rlt_token_transformer.py    # RLTTokenTransformer 模块
+    │   ├── rlt_stage1_wrapper.py       # RLTStage1TrainingWrapper (VLA forward + RLT loss)
+    │   ├── train_4dwvla_rlt_stage1.py  # RLT Stage 1 训练入口
+    │   ├── launch_rlt_stage1.sh        # 训练启动脚本
+    │   ├── docker_run_rlt_stage1.sh    # RLT 专用容器启动 (共享 rlinf-4dwvla-gpu 容器)
+    │   ├── configs/
+    │   │   └── rlt_stage1_franka_plug.yaml  # RLT 训练配置 (prefix_seq_len=768, vla_inference_mode=true)
+    │   └── tests/
+    │       ├── test_rlt_module_offline.py    # T-RLT1: 模块离线测试
+    │       ├── test_rlt_behavior_equiv.py    # T-RLT7: 行为等价性测试
+    │       ├── test_rlt_compat_offline.py    # T-RLT6: 兼容性测试
+    │       └── test_rlt_compat_online.py     # T-RLT10: 向后兼容性验证 (在线)
     └── tests/
         ├── test_transforms_offline.py       # T1: transform 管线测试
         ├── test_fk_keypoints_offline.py     # T_FK: FK keypoint 计算测试 (28 子测试)
@@ -290,6 +318,7 @@ RLmm/b/x/
         ├── test_safety_offline.py           # T3: 安全逻辑 + gym.Env 合规 (7 子测试)
         ├── test_keyboard_wrapper_offline.py # T10: KeyboardVLAEvalWrapper 逻辑 (5 子测试)
         ├── test_task_prompt_offline.py      # T11: task prompt + 推理配置一致性 (13 子测试)
+        ├── test_stats_composition_offline.py # T12: stats 组合 + 动作维度验证 (23 子测试)
         └── test_robot_online.py             # T5-T9: 在线真机测试
 ```
 
@@ -887,6 +916,44 @@ ${PIP} install \
 echo "=== Installing flash-attn ==="
 ${PIP} install flash-attn==2.8.3 --no-build-isolation 2>/dev/null || \
     echo "WARNING: flash-attn build failed; model will use eager attention (slower)"
+
+# Step 6.5: 安装 flash-linear-attention + causal-conv1d
+# Qwen3.5-2B 的 chunk_gated_delta_rule attention 内核需要这两个包.
+# 缺失时退回 naive Python 循环: VRAM 翻倍 (~12 GB → ~24 GB), 推理速度下降 ~10x.
+# 容器内已有的 starvla venv 中包含兼容版本, 可通过 .pth 链接复用:
+echo "=== Installing flash-linear-attention + causal-conv1d ==="
+STARVLA_SP="/opt/venv/starvla/lib/python3.11/site-packages"
+DWVLA_SP="${VENV_DIR}/lib/python3.11/site-packages"
+if [[ -d "${STARVLA_SP}/fla" && -d "${STARVLA_SP}/causal_conv1d" ]]; then
+    echo "  Linking from starvla venv (flash-linear-attention + causal-conv1d)..."
+    for pkg in fla causal_conv1d causal_conv1d_cuda; do
+        src="${STARVLA_SP}/${pkg}"
+        if [[ -e "${src}" ]]; then
+            ln -sfn "${src}" "${DWVLA_SP}/${pkg}"
+            echo "    Linked: ${pkg}"
+        fi
+    done
+    # 同时链接 .dist-info 目录
+    for di in "${STARVLA_SP}"/flash_linear_attention*.dist-info "${STARVLA_SP}"/causal_conv1d*.dist-info; do
+        [[ -d "${di}" ]] && ln -sfn "${di}" "${DWVLA_SP}/$(basename ${di})"
+    done
+else
+    echo "  starvla venv not found, installing from PyPI (may take 5+ min)..."
+    ${PIP} install flash-linear-attention==0.5.0 --no-build-isolation 2>/dev/null || \
+        echo "WARNING: flash-linear-attention build failed"
+    ${PIP} install 'causal-conv1d>=1.7.0' --no-build-isolation 2>/dev/null || \
+        echo "WARNING: causal-conv1d build failed"
+fi
+
+# 验证 flash-linear-attention
+${PYTHON} -c "
+try:
+    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
+    print('  flash-linear-attention: OK (chunk_gated_delta_rule available)')
+except ImportError as e:
+    print(f'  WARNING: flash-linear-attention not available: {e}')
+    print('  Model will use naive loop (slower, higher VRAM)')
+"
 
 # Step 7: 安装 4DWVLA 包 (editable mode)
 echo "=== Installing 4DWVLA (lerobot) ==="
@@ -3203,6 +3270,14 @@ while ...:
 | N15 | `4dwvla_ext/tests/test_fk_keypoints_offline.py` | 离线测试: FK keypoint 形状/归一化/历史/确定性 (28 子测试) | 否 |
 | N16 | `4dwvla_ext/tests/test_task_prompt_offline.py` | 离线测试: task prompt 与训练数据一致性 + 推理配置验证 (13 子测试, v3A3.11 新增) | 否 |
 | N17 | `4dwvla_ext/tests/test_stats_composition_offline.py` | 离线测试: stats 子字段 → 组合键拼接 + 动作维度裁切验证 (T12, v3A3.12 新增) | 否 |
+| N18 | `4dwvla_ext/rlt/rlt_config.py` | RLT Stage 1 配置数据类 (含 `vla_inference_mode`, RLT 训练用, 见 `4dwvla_rlt1_2.markdown` §7.2) | 否 |
+| N19 | `4dwvla_ext/rlt/rlt_token_transformer.py` | RLTTokenTransformer 模块: 从 VLA prefix 提取 z\_rl 表征 (RLT 训练用) | 否 |
+| N20 | `4dwvla_ext/rlt/rlt_stage1_wrapper.py` | RLT 训练 wrapper: VLA forward + RLT loss, `prefix_out.detach()` 实现梯度隔离 | 否 |
+| N21 | `4dwvla_ext/rlt/train_4dwvla_rlt_stage1.py` | RLT Stage 1 训练入口: 加载 4DWVLA 检查点 + RLT 模块联合训练 | 否 |
+| N22 | `4dwvla_ext/rlt/configs/rlt_stage1_franka_plug.yaml` | RLT 训练配置: `rlt_prefix_seq_len: 768`, `vla_inference_mode: true` | 否 |
+| N23 | `4dwvla_ext/rlt/tests/test_rlt_compat_online.py` | T-RLT10: 向后兼容性验证 (确认 RLT 训练不破坏 VLA 推理) | 否 |
+
+> **N18-N23 说明**: 这些文件属于 RLT Stage 1 训练模块, 与本文档的 Mode A 纯 VLA 评估无直接关系, 但共享同一 GPU 容器 (`rlinf-4dwvla-gpu`) 和同一 venv (`/opt/venv/4dwvla`). 完整设计见 `RLmm/b/d/rltx/4dwvla_rlt1_2.markdown`. RLT 训练使用 `vla_inference_mode=true` 冻结 VLA 权重, 因此 RLT 训练产出的 VLA 检查点与基线检查点行为完全一致 (由 T-RLT10 验证).
 
 ### 12.6 复用对照总结
 
@@ -3316,6 +3391,26 @@ docker exec rlinf-4dwvla-franky bash -c '
   python3 -c "import franky; r=franky.Robot(\"172.16.0.2\"); r.recover_from_errors(); \
     print(\"TCP:\", r.state.O_T_EE.translation); print(\"OK\")"'
 # 预期: 打印当前 TCP 坐标和 "OK"
+
+# 6. 验证 flash-linear-attention + causal-conv1d (GPU 容器内)
+#    这两个包是 Qwen3.5-2B chunk_gated_delta_rule 内核的依赖.
+#    缺失时模型仍可运行 (退回 naive 循环), 但 VRAM 翻倍且推理速度下降 ~10x.
+#    setup_4dwvla_venv.sh 会自动安装 (从 starvla venv 链接或从 PyPI 安装).
+docker exec rlinf-4dwvla-gpu bash -c '
+  source /opt/venv/4dwvla/bin/activate &&
+  python3 -c "
+from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
+import causal_conv1d
+print(\"flash-linear-attention: OK\")
+print(f\"causal-conv1d: {causal_conv1d.__version__}\")
+"'
+# 预期:
+#   flash-linear-attention: OK
+#   causal-conv1d: 1.7.0  (或更高)
+# 如果报 ImportError, 在 GPU 容器内重新执行:
+#   source /opt/venv/4dwvla/bin/activate
+#   bash /workspace/RLinf/b/x/4dwvla_ext/configs/setup_4dwvla_venv.sh
+# 或手动链接 (见 §5.1 Step 6.5)
 ```
 
 ### 13.2 检查点路径映射
@@ -3367,6 +3462,9 @@ docker exec rlinf-4dwvla-franky bash -c '
 | T8 | 全键位真机评估 | 双容器 | T6/T7 通过, RealSense 已接 | 20 min |
 
 > T2/T3/T10 在离线阶段已验证通过, 见 `4wvla_rlinf_eval_3A3_off0914LOG.md`.
+> T1/T4 在 GPU 容器离线阶段已验证通过, 见 `4wvla_rlinf_eval_3A3_offgpudck0914LOG.md`.
+> T5-T8 在线测试记录见 `4wvla_rlinf_eval_3A3_off0915LOG.md`.
+> 所有 LOG 文件位于 `RLmm/b/d/frk1/` 目录下.
 
 ---
 
@@ -3560,7 +3658,7 @@ python3 tests/test_stats_composition_offline.py
 bash /home/nvidia/bt/s/RLmm/b/x/4dwvla_ext/configs/docker_run_4dwvla_gpu.sh
 
 # 步骤 B: 宿主机 — 进入容器
-docker exec -it 4dwvla-gpu bash
+docker exec -it rlinf-4dwvla-gpu bash
 
 # 步骤 C: GPU 容器内 — 激活 4dwvla venv
 source /opt/venv/4dwvla/bin/activate
@@ -3742,7 +3840,7 @@ VRAM:   6.73 GB
 **Franky 容器进入方式**:
 ```bash
 # 宿主机 — 进入 Franky 容器
-docker exec -it 4dwvla-franky bash
+docker exec -it rlinf-4dwvla-franky bash
 # 容器内 — 激活 franky venv
 source /opt/venv/franky-0.19.0/bin/activate
 ```
@@ -4561,7 +4659,7 @@ unset RLINF_GPU_IMAGE RLINF_FRANKA_IMAGE
   (操作员伸手可达)
 ```
 
-### 15.4 软件预检 (5 步)
+### 15.4 软件预检 (6 步)
 
 > 以下所有 Step 在 **宿主机终端**上执行.
 
@@ -4600,7 +4698,32 @@ ping -c 3 172.16.0.2
 # 预期: 3 个包全部成功, 延迟 < 1 ms
 ```
 
-**所有 5 步必须通过. 任一步失败, 请按对应提示排查后重试, 不要跳过.**
+**Step 6: 确认 GPU 容器 venv 和关键依赖**
+
+```bash
+# 如果 GPU 容器已在运行:
+docker exec rlinf-4dwvla-gpu bash -c '
+  source /opt/venv/4dwvla/bin/activate &&
+  python3 -c "
+import torch, transformers
+print(f\"torch={torch.__version__}, CUDA={torch.cuda.is_available()}\")
+print(f\"transformers={transformers.__version__}\")
+try:
+    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
+    print(\"flash-linear-attention: OK\")
+except ImportError:
+    print(\"WARNING: flash-linear-attention missing (VRAM+10x slower)\")
+from lerobot.policies.internvla_a1_5.configuration_internvla_a1_5 import InternVLAA15Config
+print(\"InternVLA-A1.5 config: OK\")
+"'
+# 预期:
+#   torch=2.11.0+cu128, CUDA=True
+#   transformers=5.2.0
+#   flash-linear-attention: OK
+#   InternVLA-A1.5 config: OK
+```
+
+**所有 6 步必须通过. 任一步失败, 请按对应提示排查后重试, 不要跳过.**
 
 ### 15.5 启动双容器
 
@@ -4620,6 +4743,7 @@ bash /workspace/RLinf/b/x/4dwvla_ext/configs/setup_4dwvla_venv.sh
 
 预期输出的最后几行:
 ```
+  flash-linear-attention: OK (chunk_gated_delta_rule available)
 torch 2.11.0, CUDA available: True
   GPU: NVIDIA RTX 5090 D, 32607 MiB
 transformers 5.2.0
@@ -4627,6 +4751,19 @@ lerobot transforms: OK
 InternVLA-A1.5 config: OK
 === Setup complete ===
 ```
+
+> **如果看到 `WARNING: flash-linear-attention not available`**: 模型仍可运行, 但 VRAM 翻倍且推理速度下降 ~10x. 建议在 GPU 容器内手动安装:
+> ```bash
+> source /opt/venv/4dwvla/bin/activate
+> # 方法 A: 从 starvla venv 链接 (推荐, 秒级完成)
+> STARVLA_SP="/opt/venv/starvla/lib/python3.11/site-packages"
+> DWVLA_SP="/opt/venv/4dwvla/lib/python3.11/site-packages"
+> for pkg in fla causal_conv1d causal_conv1d_cuda; do
+>     [[ -e "${STARVLA_SP}/${pkg}" ]] && ln -sfn "${STARVLA_SP}/${pkg}" "${DWVLA_SP}/${pkg}"
+> done
+> # 方法 B: 从 PyPI 安装 (5+ 分钟)
+> uv pip install flash-linear-attention==0.5.0 'causal-conv1d>=1.7.0' --no-build-isolation
+> ```
 
 启动推理服务:
 ```bash
@@ -4915,6 +5052,11 @@ docker ps | grep rlinf-4dwvla
 | KPT 元数据 | `RLmm/b/d/frk1/plug/keypoints_meta.json` | `/workspace/RLinf/b/d/frk1/plug/...` | — |
 | URDF | `RLmm/b/d/frk1/fr3v2_1_franka_hand.urdf` | `/workspace/RLinf/b/d/frk1/...` | — |
 | 控制客户端 | `RLmm/b/x/4dwvla_ext/franka_vla_client.py` | — | `/workspace/RLinf/b/x/4dwvla_ext/...` |
+| RLT Stage 1 模块 | `RLmm/b/x/4dwvla_ext/rlt/` | `/workspace/RLinf/b/x/4dwvla_ext/rlt/` | — |
+| RLT 设计文档 | `RLmm/b/d/rltx/4dwvla_rlt1_2.markdown` | — | — |
+| 测试 LOG (离线) | `RLmm/b/d/frk1/4wvla_rlinf_eval_3A3_off0914LOG.md` | — | — |
+| 测试 LOG (GPU) | `RLmm/b/d/frk1/4wvla_rlinf_eval_3A3_offgpudck0914LOG.md` | — | — |
+| 测试 LOG (在线) | `RLmm/b/d/frk1/4wvla_rlinf_eval_3A3_off0915LOG.md` | — | — |
 
 ### 16.2 操作员按键速查
 
@@ -4937,6 +5079,9 @@ docker ps | grep rlinf-4dwvla
 | 图像 | 2 视角, 224x224 | schema |
 | 通信 | TCP localhost:5555, authkey `b"4dwvla-eval"` | 可配置 |
 | B1 bbox | 0.8361 m (FK keypoint pos 归一化) | `keypoints_meta.json` |
+| GPU 容器名 | `rlinf-4dwvla-gpu` | `docker_run_4dwvla_gpu.sh` |
+| Franky 容器名 | `rlinf-4dwvla-franky` | `docker_run_4dwvla_franky.sh` |
+| GPU 容器软件 | torch 2.11.0+cu128, transformers 5.2.0, flash-attn 2.8.3, flash-linear-attention 0.5.0, causal-conv1d 1.7.0 | `setup_4dwvla_venv.sh` |
 | B3 safety box | ~0.05 m (**Mode A 间接**) | `clip_x_range` |
 
 ### 16.4 快速启动 (一行版)
@@ -4959,6 +5104,7 @@ source /opt/venv/franky-0.19.0/bin/activate && python /workspace/RLinf/b/x/4dwvl
 
 | 版本 | 日期 | 变更 |
 |:---|:---|:---|
+| v3A3.14 | 2026-09-16 | **RLT Stage 1 容器整合 + 依赖补全 + 文档完善**. (1) §2.4 新增 3 条约束: `flash-linear-attention==0.5.0` + `causal-conv1d>=1.7.0` 高效推理依赖 (缺失时 VRAM 翻倍/速度降 10x); RLT Stage 1 共用 `rlinf-4dwvla-gpu` 容器; 容器不停约束. (2) §2.4 新增 LOG 文件索引表 (3 个 LOG 文件及其内容说明). (3) §3.4 目录结构新增 `rlt/` 子目录 (含 `rlt_config.py`, `rlt_stage1_wrapper.py`, `rlt_token_transformer.py`, `train_4dwvla_rlt_stage1.py`, configs, tests 共 11 文件). (4) §5.1 `setup_4dwvla_venv.sh` 嵌入代码新增 Step 6.5: flash-linear-attention + causal-conv1d 安装 (优先从 starvla venv 链接, 回退到 pip install; 含验证脚本). (5) §12.5 新增 N18-N23 (RLT 模块 6 个文件) + 说明段落 (RLT 训练与 Mode A 评估共享容器/venv, `vla_inference_mode=true` 保证 VLA 权重不变). (6) §14 LOG 引用扩展为 3 条 (离线/GPU/在线). (7) §16.1 新增 RLT 模块路径 + RLT 设计文档路径 + 3 个 LOG 文件路径. (8) §16.3 新增容器名和 GPU 容器软件栈 (含 flash-linear-attention + causal-conv1d). (9) 容器名修正: `4dwvla-gpu` → `rlinf-4dwvla-gpu`, `4dwvla-franky` → `rlinf-4dwvla-franky` (2 处). 整合来源: `4dwvla_rlt1_2.markdown` §2.4/§7.5/§9.1/§13.7.1. |
 | v3A3.13 | 2026-09-15 | **T6/T7/T8 实机测试通过 + franky 0.19.0 全面适配**. (1) franky 0.19.0 API 适配: `extreme_pose_explorer.py` 3 处 + `franky_controller_direct.py` 7 处修复 (`Robot.move()` 移除 `dynamic_rel`/`blocking` 改用 `relative_dynamics_factor` 属性; `O_T_EE` 改用 `.translation`; `set_collision_behavior` 参数名改单数). (2) T6 端到端 Dry Run 通过: Qwen3.5-2B 基础权重预下载方案 (替代 monkey-patch), UInput 键盘注入三步法 (创建→mknod→指定设备). (3) T7 极限位姿探测: 13/14 位姿通过 (误差<0.001rad), pose 4 (q2@train\_max) cartesian\_reflex 为已知问题. 验收标准调整为 ≥13/14. (4) T8 真机全键位: 5 键 (a/h/r/b/c) 全部功能正确, 推理延迟 854-1055ms, 运动平滑 0 warnings. 新增 `t8_test_runner.py` 自动化测试脚本. RealSense 多相机 USB 冲突解决 (指定序列号). (5) 新增 §14.4.1 已知问题表 (6 项). §7.3 新增 `RS_GLOBAL_SERIAL` / `RS_WRIST_SERIAL` 配置. T6 UInput 示例更新为 6 键注册. T8 新增相机序列号参数和自动化替代方案说明. |
 | v3A3.12 | 2026-09-15 | **D10 修复 + 训推参数全面对比审计**. 发现致命缺陷 D10: (a) `stats.json` 仅含子字段键 (`observation.state.arm`[7] 等), `load_stats()` 查找组合键 `observation.state`(8D) → `KeyError` 崩溃; (b) 模型 `output_features.action.shape=[32]` (padded), 而 stats 为 8D → unnormalize 维度不匹配. 修复: `load_stats()` 增加 `compose_sub_field_stats()` 回退路径 (通过 schema `feature_mapping` 拼接子字段 mean/std); `serve()` 中 `action_pred[:n_exec, :actual_action_dim]` 裁切到实际维度. 新增 §4.1.4 D10 深度分析 (含数学等价性证明). **新增 §4.6 训推参数全面对比审计**: 46 项参数逐一比对, 分 6 大类 (数据预处理/Prompt构造/模型架构/Keypoint/执行控制/Schema), 每项标注训练有效值 vs 评测有效值 + 一致性判定 + 严重性分级. 3 个关键差异的影响分析 (stats 键/output suffix/keypoint 来源/n\_exec). 新增 T12 测试 (23 子测试, `test_stats_composition_offline.py`): 验证子字段键结构 + 组合正确性 + 动作维度不匹配检测 + 归一化 roundtrip. §4.1 缺陷表新增 D10. §9.4 新增 2 项一致性检查. §12 新增 N17. §14.0/14.1/14.4 更新测试清单. |
 | v3A3.11 | 2026-09-14 | **D9 修复: 任务描述 prompt 不匹配 + FAST/State 架构分析 + 测试覆盖扩展**. 训练数据集 `tasks.parquet` 中 task 为 `"plug into socket"`, 但评测代码和文档使用 `"plug the charger into the socket"`. 修复: `franka_vla_client.py` / `test_ipc_offline.py` / 文档 11 处命令统一为 `"plug into socket"`. §4.1 缺陷表新增 D9 (严重). §4.1.2 新增 D9 深度分析 (task prompt 对 VLM 前缀表征的影响链路). §4.1.3 新增 FAST token 与 state 双通路架构分析 (确认推理方案正确: FAST token 为训练时 auxiliary loss, 推理时不输入; state 通过文本 tokenization 和 `kpt_state_proj` 双通路正确传递). §9.4 新增 6 项一致性检查 (task prompt / FAST token / state 双通路 / system message). 新增 T11 测试 (13 子测试, `test_task_prompt_offline.py`): 自动验证 task prompt 与 `tasks.parquet` 一致 + 训练配置标志匹配 + 推理服务配置正确. §12 新增 N16. §14.0/14.1/14.4 更新测试清单. |

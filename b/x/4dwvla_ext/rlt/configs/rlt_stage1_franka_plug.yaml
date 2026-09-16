@@ -1,0 +1,43 @@
+# RLT Stage 1 Training Config for 4DWVLA Franka Plug Task
+# Profile B: Expert + RLT training on single RTX 5090 D 32GB
+
+# RLT module
+enable_rlt: true
+rlt_alpha: 1.0
+rlt_input_dim: 2048
+rlt_embed_dim: 1024
+rlt_prefix_seq_len: 768
+rlt_num_layers: 2
+rlt_num_heads: 8
+rlt_mlp_ratio: 4.0
+rlt_dropout: 0.0
+rlt_image_only: false
+rlt_lr: 1e-4
+
+# Training profile
+train_profile: "B"
+action_loss_only: true
+freeze_vision_encoder: true
+train_expert_only: true
+freeze_keypoint_modules: false
+vla_inference_mode: true
+
+# VLA training
+vla_lr: 5e-5
+grad_clip_norm: 1.0
+warmup_steps: 200
+max_steps: 20000
+save_freq: 2000
+log_freq: 50
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+
+# Data
+dataset_repo_id: "plug_into_socket_lrb_4D"
+action_mode: "abs"
+task_prompt: "plug into socket"
+
+# Paths (use environment variables)
+base_checkpoint: "/home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp010420"
+dataset_root: ""
+output_dir: "/workspace/RLinf/b/x/4dwvla_ext/rlt/outputs"

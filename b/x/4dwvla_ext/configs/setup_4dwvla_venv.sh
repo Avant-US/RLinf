@@ -62,6 +62,41 @@ echo "=== Installing flash-attn ==="
 ${PIP} install flash-attn==2.8.3 --no-build-isolation 2>/dev/null || \
     echo "WARNING: flash-attn build failed; model will use eager attention (slower)"
 
+# Step 6.5: 安装 flash-linear-attention + causal-conv1d
+# Qwen3.5-2B 的 chunk_gated_delta_rule attention 内核需要这两个包.
+# 缺失时退回 naive Python 循环: VRAM 翻倍 (~12 GB → ~24 GB), 推理速度下降 ~10x.
+echo "=== Installing flash-linear-attention + causal-conv1d ==="
+STARVLA_SP="/opt/venv/starvla/lib/python3.11/site-packages"
+DWVLA_SP="${VENV_DIR}/lib/python3.11/site-packages"
+if [[ -d "${STARVLA_SP}/fla" && -d "${STARVLA_SP}/causal_conv1d" ]]; then
+    echo "  Linking from starvla venv (flash-linear-attention + causal-conv1d)..."
+    for pkg in fla causal_conv1d causal_conv1d_cuda; do
+        src="${STARVLA_SP}/${pkg}"
+        if [[ -e "${src}" ]]; then
+            ln -sfn "${src}" "${DWVLA_SP}/${pkg}"
+            echo "    Linked: ${pkg}"
+        fi
+    done
+    for di in "${STARVLA_SP}"/flash_linear_attention*.dist-info "${STARVLA_SP}"/causal_conv1d*.dist-info; do
+        [[ -d "${di}" ]] && ln -sfn "${di}" "${DWVLA_SP}/$(basename ${di})"
+    done
+else
+    echo "  starvla venv not found, installing from PyPI (may take 5+ min)..."
+    ${PIP} install flash-linear-attention==0.5.0 --no-build-isolation 2>/dev/null || \
+        echo "WARNING: flash-linear-attention build failed"
+    ${PIP} install 'causal-conv1d>=1.7.0' --no-build-isolation 2>/dev/null || \
+        echo "WARNING: causal-conv1d build failed"
+fi
+
+${PYTHON} -c "
+try:
+    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
+    print('  flash-linear-attention: OK (chunk_gated_delta_rule available)')
+except ImportError as e:
+    print(f'  WARNING: flash-linear-attention not available: {e}')
+    print('  Model will use naive loop (slower, higher VRAM)')
+"
+
 # Step 7: 安装 4DWVLA 包 (editable mode)
 echo "=== Installing 4DWVLA (lerobot) ==="
 if [[ -d "/workspace/4WVLA" ]]; then
