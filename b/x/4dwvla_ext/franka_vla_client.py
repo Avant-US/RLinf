@@ -29,6 +29,7 @@ sys.path.insert(0, "/workspace/RLinf/b/x/4dwvla_ext")
 
 from franky_joint_env import FrankyJointEnv
 from keyboard_vla_eval import KeyboardVLAEvalWrapper
+from vla_debug_logging import configure_logging, format_array, summarize_array
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger("vla-client")
@@ -51,6 +52,7 @@ class VLAEvalController:
         self._abort = False
         self._step_count = 0
         self._total_warnings = 0
+        self._inference_count = 0
         signal.signal(signal.SIGINT, lambda s, f: setattr(self, '_abort', True))
 
     def connect(self):
@@ -66,15 +68,41 @@ class VLAEvalController:
             self._conn = None
 
     def _request_inference(self, images, state):
+        state_arr = np.asarray(state, dtype=np.float64)
+        logger.info(
+            "[inference %d] request: state=%s image_meta=%s task=%r",
+            self._inference_count,
+            format_array(state_arr),
+            {name: summarize_array(image) for name, image in images.items()},
+            self._task,
+        )
         self._conn.send({
             "images": images,
-            "state": {"arm": state[:7].tolist(), "gripper": [float(state[7])]},
+            "state": {"arm": state_arr[:7].tolist(), "gripper": [float(state_arr[7])]},
             "task": self._task,
         })
         resp = self._conn.recv()
         if resp["status"] != "ok":
             raise RuntimeError(f"Server error: {resp['status']}")
-        return resp["actions"]
+        actions = np.asarray(resp["actions"], dtype=np.float64)
+        if actions.ndim != 2 or actions.shape[1] != 8:
+            raise ValueError(f"Expected actions with shape [N, 8], got {actions.shape}")
+        if not np.isfinite(actions).all():
+            raise ValueError("Inference response contains NaN or infinite actions")
+
+        state_to_plan = np.vstack([state_arr, actions])
+        plan_delta = np.diff(state_to_plan, axis=0)
+        logger.info(
+            "[inference %d] response: shape=%s full_actions=%s "
+            "delta_from_previous=%s action_meta=%s",
+            self._inference_count,
+            list(actions.shape),
+            format_array(actions),
+            format_array(plan_delta),
+            summarize_array(actions),
+        )
+        self._inference_count += 1
+        return actions.tolist()
 
     def run(self):
         logger.info("Starting: task=%r, max_steps=%d, n_exec=%d", self._task, self._max_steps, self._n_exec)
@@ -91,9 +119,31 @@ class VLAEvalController:
 
             action = self._action_queue.popleft()
             action_arr = np.array(action, dtype=np.float64)
+            state_before = np.asarray(obs["state"], dtype=np.float64)
+            action_delta = action_arr - state_before
+            logger.info(
+                "[step %d] execute: action=%s state_before=%s delta=%s",
+                self._step_count,
+                format_array(action_arr),
+                format_array(state_before),
+                format_array(action_delta),
+            )
 
             if not self._dry_run:
                 obs, reward, terminated, truncated, info = self._env.step(action_arr)
+                state_after = np.asarray(obs["state"], dtype=np.float64)
+                logger.info(
+                    "[step %d] result: state_after=%s realized_delta=%s "
+                    "reward=%s terminated=%s truncated=%s warnings=%s info=%s",
+                    self._step_count,
+                    format_array(state_after),
+                    format_array(state_after - state_before),
+                    reward,
+                    terminated,
+                    truncated,
+                    info.get("warnings", []),
+                    info,
+                )
                 if truncated:
                     reason = info.get("motion_guard_trip") or info.get("abort_reset") or "unknown"
                     logger.info("Episode truncated: %s", reason)
@@ -103,9 +153,13 @@ class VLAEvalController:
                     continue
                 self._total_warnings += len(info.get("warnings", []))
             else:
-                logger.info("[step %d] DRY RUN: q1=%.3f grip=%.2f",
-                            self._step_count, action_arr[0],
-                            action_arr[7] if len(action_arr) > 7 else 0.5)
+                state_after = np.asarray(obs["state"], dtype=np.float64)
+                logger.info(
+                    "[step %d] DRY RUN: state_after=%s realized_delta=%s",
+                    self._step_count,
+                    format_array(state_after),
+                    format_array(state_after - state_before),
+                )
 
             self._step_count += 1
 
@@ -124,23 +178,33 @@ def main():
     p.add_argument("--use-realsense", action="store_true")
     p.add_argument("--global-camera-serial", default=None)
     p.add_argument("--wrist-camera-serial", default=None)
+    p.add_argument(
+        "--log-dir",
+        default=None,
+        help="Directory for timestamped client logs (default: VLA_LOG_DIR or extension/logs)",
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
-    env = FrankyJointEnv(
-        robot_ip=args.robot_ip, control_hz=args.control_hz,
-        is_dummy=args.dry_run, use_realsense=args.use_realsense,
-        camera_serials={"global": args.global_camera_serial, "wrist": args.wrist_camera_serial}
-        if args.use_realsense else None,
-    )
-    env = KeyboardVLAEvalWrapper(env)
-
-    ctrl = VLAEvalController(
-        env=env, server_address=(args.server_host, args.server_port),
-        task=args.task, n_exec=args.n_exec, max_steps=args.max_steps, dry_run=args.dry_run,
-    )
-
+    configure_logging("client", args.log_dir)
+    env = None
+    ctrl = None
     try:
+        env = FrankyJointEnv(
+            robot_ip=args.robot_ip, control_hz=args.control_hz,
+            is_dummy=args.dry_run, use_realsense=args.use_realsense,
+            camera_serials={"global": args.global_camera_serial, "wrist": args.wrist_camera_serial}
+            if args.use_realsense else None,
+        )
+        if not args.dry_run:
+            env = KeyboardVLAEvalWrapper(env)
+        else:
+            logger.info("Dry-run enabled: keyboard controls are disabled.")
+
+        ctrl = VLAEvalController(
+            env=env, server_address=(args.server_host, args.server_port),
+            task=args.task, n_exec=args.n_exec, max_steps=args.max_steps, dry_run=args.dry_run,
+        )
         ctrl.connect()
         ctrl.run()
     except KeyboardInterrupt:
@@ -149,8 +213,16 @@ def main():
         logger.error("Fatal: %s: %s", type(exc).__name__, exc)
         raise
     finally:
-        ctrl.disconnect()
-        env.close()
+        if ctrl is not None:
+            try:
+                ctrl.disconnect()
+            except Exception as exc:
+                logger.warning("Controller disconnect failed: %s", exc)
+        if env is not None:
+            try:
+                env.close()
+            except Exception as exc:
+                logger.warning("env.close() failed: %s", exc)
 
 
 if __name__ == "__main__":

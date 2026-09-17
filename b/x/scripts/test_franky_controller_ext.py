@@ -36,9 +36,10 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "b", "x"))
 
 from franky_ext.controller_extended import FrankyControllerExtended
+from franky_ext.dsplug.home_pose import load_home_joints
 from franky_ext.motion_limits import describe_authority
 
-HOME_JOINTS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+HOME_JOINTS = load_home_joints().tolist()
 
 #: Per-call joint step cap for ``nudge``. ``stream`` already capped its *total*
 #: displacement at 0.5 rad while ``nudge`` had no cap at all, so a mistyped
@@ -119,12 +120,12 @@ def main() -> int:
                 print(controller.motion_health().wait()[0])
             elif cmd == "home":
                 # A blocking JointMotion from wherever the arm happens to be to
-                # the factory pose. Near the table, holding a cube, that is a
+                # the plug-task HOME pose. Near the table, holding a cube, that is a
                 # long unplanned sweep -- and the calibration procedure explicitly
                 # says not to use it, so require the intent to be spelled out.
                 if len(parts) != 2 or parts[1].lower() != "yes":
                     print(
-                        "home sweeps from the CURRENT pose to the factory joint "
+                        "home sweeps from the CURRENT pose to the plug-task joint "
                         "position in one blocking motion. It will drag a grasped "
                         "cube across the table and it invalidates the H1 start "
                         "pose. Type `home yes` if that is really what you want."

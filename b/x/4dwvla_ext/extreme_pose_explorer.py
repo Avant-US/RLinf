@@ -25,9 +25,17 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
+
+_BX_ROOT = Path(__file__).resolve().parents[1]
+if str(_BX_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BX_ROOT))
+
+from franky_ext.dsplug.home_pose import load_home_joints  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,7 +48,6 @@ logger = logging.getLogger("extreme-pose")
 
 TRAIN_ARM_MIN  = np.array([-0.4842, -0.1030, -0.2025, -2.2044, -0.2041, 1.5702, 0.4843])
 TRAIN_ARM_MAX  = np.array([ 0.0452,  0.3120,  0.4789, -1.5347,  0.0806, 2.4536, 0.9807])
-TRAIN_ARM_MEAN = np.array([-0.2406,  0.1457,  0.1872, -2.0600, -0.0553, 2.2011, 0.6998])
 
 # Training data TCP envelope (from abs_stats.json observation.state.ee_pos)
 TRAIN_TCP_MIN  = np.array([0.534, -0.140, 0.178])
@@ -52,7 +59,7 @@ FR3V2_LOWER = np.array([-2.9007, -1.8361, -2.9007, -3.0770, -2.8763, 0.4398, -3.
 FR3V2_UPPER = np.array([ 2.9007,  1.8361,  2.9007, -0.1169,  2.8763, 4.6216,  3.0508])
 
 JOINT_NAMES = ["q1", "q2", "q3", "q4", "q5", "q6", "q7"]
-HOME = TRAIN_ARM_MEAN.copy()
+HOME = load_home_joints()
 
 # BBox R_pad (B1, informational only)
 BBOX_RADIUS = 0.8361
@@ -72,7 +79,7 @@ def build_workspace_corners():
                 "name": f"{JOINT_NAMES[i]}@{label} ({val:.4f})",
                 "joints": pose,
                 "box_type": "B2-workspace",
-                "description": f"Joint {i+1} at training data {label}, others at mean",
+                "description": f"Joint {i+1} at training data {label}, others at HOME",
             })
     return corners
 
@@ -159,10 +166,14 @@ def report_pose(joints):
     margin_lo = joints - FR3V2_LOWER
     margin_hi = FR3V2_UPPER - joints
     min_margin = np.minimum(margin_lo, margin_hi)
-    dist = joints - TRAIN_ARM_MEAN
+    dist = joints - HOME
     logger.info("  Joints: %s", np.round(joints, 4).tolist())
     logger.info("  Min URDF margin: %.4f rad (joint %d)", np.min(min_margin), np.argmin(min_margin)+1)
-    logger.info("  Max |delta| from mean: %.4f rad (joint %d)", np.max(np.abs(dist)), np.argmax(np.abs(dist))+1)
+    logger.info(
+        "  Max |delta| from HOME: %.4f rad (joint %d)",
+        np.max(np.abs(dist)),
+        np.argmax(np.abs(dist)) + 1,
+    )
 
 def report_tcp(tcp):
     """Print TCP diagnostics with B1/B6 context."""
@@ -206,7 +217,7 @@ def main():
     robot = None
     gripper = None
     if not args.dry_run:
-        import franky
+        import franky  # pyright: ignore[reportMissingImports]
         robot = franky.Robot(args.robot_ip)
         robot.recover_from_errors()
         robot.relative_dynamics_factor = args.speed_factor
@@ -237,7 +248,7 @@ def main():
             logger.info("  Skipped")
             continue
 
-        import franky
+        import franky  # pyright: ignore[reportMissingImports]
         logger.info("  Moving...")
         motion = franky.JointWaypointMotion([franky.JointWaypoint(corner["joints"].tolist())])
         try:
@@ -258,7 +269,7 @@ def main():
     if robot is not None:
         resp = input("\nReturn to HOME position? [y/n]: ").strip().lower()
         if resp == "y":
-            import franky
+            import franky  # pyright: ignore[reportMissingImports]
             motion = franky.JointWaypointMotion([franky.JointWaypoint(HOME.tolist())])
             robot.move(motion)
             logger.info("Returned to HOME")

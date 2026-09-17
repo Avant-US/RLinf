@@ -61,6 +61,7 @@ from lerobot.transforms.core import (
     compose,
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from vla_debug_logging import configure_logging, format_array, summarize_array
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -322,6 +323,13 @@ def serve(args: argparse.Namespace):
         state_stat[OBS_STATE]["mean"].shape[0],
         actual_action_dim,
     )
+    logger.info(
+        "Action stats: mean=%s std=%s min=%s max=%s",
+        format_array(action_stat[ACTION]["mean"]),
+        format_array(action_stat[ACTION]["std"]),
+        format_array(action_stat[ACTION].get("min", [])),
+        format_array(action_stat[ACTION].get("max", [])),
+    )
 
     # 3. Load model
     policy, device, config = load_model(ckpt, dtype)
@@ -367,6 +375,7 @@ def serve(args: argparse.Namespace):
         policy.reset()
         if fk_computer is not None:
             fk_computer.reset()
+        request_index = 0
 
         try:
             while True:
@@ -384,9 +393,28 @@ def serve(args: argparse.Namespace):
                 t0 = time.perf_counter()
 
                 arm_q = np.asarray(msg["state"]["arm"], dtype=np.float32)
+                gripper = np.asarray(msg["state"]["gripper"], dtype=np.float32).reshape(-1)
+                input_state = np.concatenate([arm_q, gripper])
+                image_meta = {
+                    name: summarize_array(image)
+                    for name, image in msg["images"].items()
+                }
+                logger.info(
+                    "[request %d] input: state=%s image_meta=%s task=%r",
+                    request_index,
+                    format_array(input_state),
+                    image_meta,
+                    msg["task"],
+                )
                 kpt_data = None
                 if fk_computer is not None:
                     kpt_data = fk_computer.step(arm_q)
+                    logger.info(
+                        "[request %d] keypoints: history_shape=%s history_len=%s",
+                        request_index,
+                        list(np.asarray(kpt_data[0]).shape),
+                        kpt_data[1],
+                    )
 
                 sample = build_sample(
                     images={
@@ -408,20 +436,30 @@ def serve(args: argparse.Namespace):
                 if action_pred.ndim == 3:
                     action_pred = action_pred[0]
 
-                action_pred = action_pred[:n_exec, :actual_action_dim]
-                action_pred = unnormalize_fn({ACTION: action_pred})[ACTION]
-                actions = action_pred.detach().float().cpu().numpy().tolist()
+                normalized_action = action_pred[:n_exec, :actual_action_dim]
+                normalized_actions = normalized_action.detach().float().cpu().numpy()
+                physical_action = unnormalize_fn({ACTION: normalized_action})[ACTION]
+                actions = physical_action.detach().float().cpu().numpy()
+                plan_delta = np.diff(
+                    np.vstack([input_state, actions]),
+                    axis=0,
+                )
 
                 t_ms = (time.perf_counter() - t0) * 1000
                 logger.info(
-                    "Inference: %.1fms, %d actions, "
-                    "q1_range=[%.3f,%.3f]",
+                    "[request %d] inference: %.1fms, %d actions, "
+                    "normalized_actions=%s physical_actions=%s "
+                    "delta_from_previous=%s action_meta=%s",
+                    request_index,
                     t_ms, len(actions),
-                    min(a[0] for a in actions),
-                    max(a[0] for a in actions),
+                    format_array(normalized_actions),
+                    format_array(actions),
+                    format_array(plan_delta),
+                    summarize_array(actions),
                 )
 
-                conn.send({"status": "ok", "actions": actions})
+                conn.send({"status": "ok", "actions": actions.tolist()})
+                request_index += 1
 
         except EOFError:
             logger.info("Client disconnected")
@@ -449,7 +487,13 @@ def main():
                         help="Number of actions per inference (from chunk of 50)")
     parser.add_argument("--dtype", choices=("float32", "bfloat16"),
                         default="bfloat16")
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Directory for timestamped server logs (default: VLA_LOG_DIR or extension/logs)",
+    )
     args = parser.parse_args()
+    configure_logging("server", args.log_dir)
     serve(args)
 
 if __name__ == "__main__":

@@ -9,8 +9,13 @@ import sys
 import threading
 import time
 from multiprocessing.connection import Client, Listener
+from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from franky_ext.dsplug.home_pose import load_home_joints
 
 PASS = 0
 FAIL = 0
@@ -67,7 +72,7 @@ def test_ipc_roundtrip():
 
 def test_ipc_message_format():
     print("\n=== T2.2: Message Format Validation ===")
-    state_arm = [-0.24, 0.15, 0.19, -2.06, -0.06, 2.20, 0.70]
+    state_arm = load_home_joints().tolist()
     state_grip = [0.04]
     msg = {
         "images": {"global": np.zeros((480, 640, 3), dtype=np.uint8),

@@ -25,3 +25,5 @@ PKG-INFO
 results
 logs/
 outputs/
+.cache/
+*.bak

@@ -21,7 +21,9 @@ is already connected to the same arm will fail.
 """
 
 import os
+import sys
 import time
+from pathlib import Path
 
 # Silence Ray actor stdout capture BEFORE any ray import — otherwise the
 # actor's logger writes are forwarded to the driver and interleave with
@@ -41,8 +43,13 @@ from rlinf.envs.realworld.franka.franky_controller import (  # noqa: E402
     FrankyController,
 )
 
-# Franka Emika Panda factory "ready" pose.
-HOME_JOINTS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+_BX_ROOT = Path(__file__).resolve().parents[2] / "b" / "x"
+if str(_BX_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BX_ROOT))
+
+from franky_ext.dsplug.home_pose import load_home_joints  # noqa: E402
+
+HOME_JOINTS = load_home_joints().tolist()
 
 
 def _print_help() -> None:

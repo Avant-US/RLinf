@@ -739,3 +739,608 @@ python b/x/4dwvla_ext/rlt/tests/test_rlt_z_extraction_online.py
 
 - 修改前：2469 行
 - 修改后：3166 行（+697 行，主要为操作命令、预期输出、E4-E11 教训注释）
+
+---
+
+## 16. 2026-09-17：20 epoch Stage 1 训练执行日志
+
+### 16.1 用户目标与执行口径
+
+本次目标是使用：
+
+- Stage0 4DWVLA checkpoint：
+  `/home/nvidia/bt/ckp/4wvlaFrk/plug/4wvlaFrkPlugCkp010420/`
+- 8-episode 数据集：
+  `/home/nvidia/bt/dt/plug_into_socket_lrb_4D_8sml/`
+- 训练方法：4DWVLA VLA SFT + RLT Token Transformer；
+- 训练时长：20 个数据集 epoch；
+- 训练后：检查所有 checkpoint、RLT 权重、训练报告和 z_rl 提取结果。
+
+原训练入口只有 `max_steps`，没有 `epochs` 参数。根据
+`meta/info.json` 的 4777 帧和 checkpoint `train_config.json` 的 batch size
+16，20 epoch 的目标迭代数按：
+
+```text
+ceil(4777 / 16) × 20 = 299 × 20 = 5980 dataloader iterations
+```
+
+执行时必须显式记录实际 dataloader length；如果运行时 `len(dataloader)` 与
+299 不同，以运行时值 ×20 为准，并在本节追加修正。
+
+### 16.2 初始环境检查
+
+执行命令：
+
+```bash
+cd /home/nvidia/bt/s/RLmm
+command -v python
+command -v python3
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
+```
+
+实际结果：
+
+```text
+python: /usr/bin/python3
+GPU: NVIDIA GeForce RTX 5090 D
+GPU total: 32607 MiB
+GPU free: 31410 MiB
+```
+
+宿主机 `python3` 没有直接作为训练解释器使用。可用训练环境为：
+
+```text
+/home/nvidia/miniconda3/envs/lingbotvla/bin/python
+Python 3.12
+PyTorch 2.8.0+cu128
+PyYAML 6.0.2
+accelerate 1.7.0
+lerobot 0.4.2
+transformers 4.57.3
+CUDA available: True
+GPU: NVIDIA GeForce RTX 5090 D
+```
+
+`draccus` 在该环境中未安装，但 Stage1 自定义入口直接使用
+`train_config.json`、`draccus.decode`，因此在 smoke test 前必须确认
+`lerobot` 的依赖是否通过源码路径提供；如果 import 失败，按第 16.4 节
+记录错误并修复，不绕过配置解析。
+
+### 16.3 checkpoint 与数据集检查
+
+Stage0 checkpoint 配置检查结果：
+
+```text
+config.json: present
+train_config.json: present
+stats.json: present
+config.chunk_size: 50
+config.action_expert_hidden_size: 1024
+config.enable_keypoint_predictor: true
+```
+
+8-episode 数据集检查结果：
+
+```text
+dataset: /home/nvidia/bt/dt/plug_into_socket_lrb_4D_8sml
+total_episodes: 8
+total_frames: 4777
+fps: 30
+action.arm: [7] absolute joint action
+action.gripper: [1]
+observation.keypoint_3d: [56] = 8 × 7
+bbox_radius: 0.8361004471778869
+```
+
+该数据集的 `keypoints_meta.json` 使用：
+
+```text
+normalization: base_link_origin_isotropic
+rotation: quaternion_xyzw_hemisphere
+keypoints: 8
+```
+
+这与 Stage0 checkpoint 的 4D keypoint 处理契约必须保持一致。
+
+### 16.4 离线回归测试
+
+执行命令：
+
+```bash
+source /home/nvidia/miniconda3/etc/profile.d/conda.sh
+conda activate lingbotvla
+export PYTHONPATH=/home/nvidia/bt/s/RLmm:/home/nvidia/bt/s/4WVLA/src:${PYTHONPATH:-}
+bash b/x/4dwvla_ext/rlt/tests/run_all_offline.sh
+```
+
+结果：
+
+```text
+T-RLT1: 13 passed, 0 failed
+T-RLT7: 5 passed, 0 failed
+T-RLT2: 8 passed, 0 failed
+T-RLT3: 7 passed, 0 failed
+T-RLT4: 6 passed, 0 failed
+T-RLT5: 6 passed, 0 failed
+T-RLT6: 7 passed, 0 failed
+=== All test groups passed ===
+exit_code=0
+elapsed=46.065s
+```
+
+此次离线回归没有修改源代码。它确认了 RLT Transformer 构造/前向、
+deploy-view mask、loss/gradient isolation、checkpoint round-trip、Stage0
+配置和 bbox/keypoint 统计的一致性。
+
+### 16.5 离线测试产物与清理行为
+
+T-RLT5 的 `rlt_module.pt` 是临时目录中的单元测试文件；T-RLT8 的训练
+checkpoint 也是由 `tempfile.mkdtemp()` 创建。T-RLT8 在测试结束时执行
+`shutil.rmtree(_t8_output_dir, ignore_errors=True)`，所以测试通过只证明
+保存/加载逻辑正确，并不保留可供 Stage2 使用的 checkpoint。
+
+本次正式 20 epoch 训练将使用独立、持久化的输出目录，不能使用 T-RLT8 的
+临时目录。
+
+### 16.6 Smoke test 第一次失败：缺少 draccus
+
+执行的首次持久化 smoke test：
+
+```bash
+source /home/nvidia/miniconda3/etc/profile.d/conda.sh
+conda activate lingbotvla
+export PYTHONPATH=/home/nvidia/bt/s/RLmm:/home/nvidia/bt/s/4WVLA/src:${PYTHONPATH:-}
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+/home/nvidia/miniconda3/envs/lingbotvla/bin/python \
+  b/x/4dwvla_ext/rlt/train_4dwvla_rlt_stage1.py \
+  --config b/x/4dwvla_ext/rlt/configs/rlt_stage1_franka_plug.yaml \
+  --max_steps 1 \
+  --dataset_root /home/nvidia/bt/dt \
+  --dataset_repo_id plug_into_socket_lrb_4D_8sml \
+  --save_freq 1 --log_freq 1 \
+  --output_dir b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917_smoke
+```
+
+错误：
+
+```text
+ModuleNotFoundError: No module named 'draccus'
+```
+
+根因：训练环境中的 `lerobot` 来自 `/home/nvidia/bt/s/4WVLA/src`，其
+`lerobot.configs.default` 在导入时依赖 `draccus`；当前
+`lingbotvla` 环境虽然有 torch/accelerate/lerobot，但没有安装该依赖。
+`/home/nvidia/bt/s/4WVLA/pyproject.toml` 要求
+`draccus>=0.10.0,<0.11.0`。
+
+修复方案：只在 `lingbotvla` 环境安装该缺失依赖，不改训练逻辑和仓库代码：
+
+```bash
+source /home/nvidia/miniconda3/etc/profile.d/conda.sh
+conda activate lingbotvla
+python -m pip install 'draccus>=0.10.0,<0.11.0'
+```
+
+### 16.7 dataloader 计数探测失败：Transformers 缺少 Qwen3.5
+
+安装 `draccus` 后，为了确定 20 epoch 对应的实际 dataloader iteration
+数，执行了只构建配置/数据集的探测脚本。该探测没有加载 VLA 权重，但在导入
+4DWVLA transform 时失败：
+
+```text
+ModuleNotFoundError: No module named 'transformers.models.qwen3_5'
+```
+
+根因：当前 `lingbotvla` 环境的 Transformers 为 `4.57.3`，而 4DWVLA
+`transform_internvla_a1_5.py` 依赖 Qwen3.5。仓库提供的
+`src/lerobot/policies/internvla_a1_5/transformers_replace/models/qwen3_5/`
+只有模型实现覆盖文件，不能替代完整 Qwen3.5 Transformers 模块；当前环境
+也没有已安装的 `transformers.models.qwen3_5`。
+
+修复方向：按照 4WVLA 项目安装基线切换到 `transformers==5.2.0`，然后再
+验证 Qwen3.5 import；不修改 4WVLA 源码。
+
+执行修复：
+
+```bash
+source /home/nvidia/miniconda3/etc/profile.d/conda.sh
+conda activate lingbotvla
+python -m pip install 'transformers==5.2.0'
+```
+
+安装结果：
+
+```text
+transformers 5.2.0
+transformers.models.qwen3_5: import succeeded
+Qwen3_5Tokenizer: present
+```
+
+pip 同时将 `huggingface-hub` 更新为 1.31.0；环境提示
+`lingbotvla` 原元数据要求 0.34.3，但当前训练设置为离线模式，后续必须
+通过实际 checkpoint/config 加载验证兼容性。
+
+### 16.8 dataloader 计数探测第二次失败：缺少 diffusers
+
+Qwen3.5 import 修复后再次构建配置/数据集，错误变为：
+
+```text
+ModuleNotFoundError: No module named 'diffusers'
+```
+
+根因：导入 `InternVLAA15Policy` 时会导入 WAN video branch 的
+`wan_model.py`，即使 Stage1 将 `action_loss_only=true`，Python import
+阶段仍需要 `diffusers.configuration_utils`。
+
+修复方案：安装 4DWVLA/`lerobot` 约束范围内的 diffusers，不修改 WAN 或
+4DWVLA 代码：
+
+```bash
+source /home/nvidia/miniconda3/etc/profile.d/conda.sh
+conda activate lingbotvla
+python -m pip install 'diffusers>=0.27.2,<0.36.0'
+```
+
+### 16.9 dataloader 计数探测第三次失败：peft 版本过旧
+
+安装 diffusers 后，导入阶段继续失败：
+
+```text
+ImportError: peft>=0.17.0 is required for a normal functioning of this module,
+but found peft==0.15.2.
+```
+
+根因：当前安装的 `diffusers==0.35.2` 在 import 时检查 PEFT 版本；环境原有
+`peft==0.15.2` 不满足检查。
+
+修复方案：
+
+```bash
+source /home/nvidia/miniconda3/etc/profile.d/conda.sh
+conda activate lingbotvla
+python -m pip install 'peft>=0.17.0'
+```
+
+### 16.10 宿主数据集路径失败：缓存 symlink 指向容器路径
+
+PEFT 修复后，配置/数据集探测继续执行到数据集 symlink 阶段，出现：
+
+```text
+FileExistsError:
+[Errno 17] File exists:
+'/home/nvidia/.cache/huggingface/lerobot/plug_into_socket_lrb_4D_8sml'
+```
+
+检查发现已有 symlink：
+
+```text
+/home/nvidia/.cache/huggingface/lerobot/plug_into_socket_lrb_4D_8sml
+    -> /home/nvidia/data/plug_into_socket_lrb_4D_8sml
+```
+
+但宿主机实际数据在：
+
+```text
+/home/nvidia/bt/dt/plug_into_socket_lrb_4D_8sml
+```
+
+`/home/nvidia/data` 是容器内路径，且宿主机不存在。原代码只判断
+`not link.exists()`；对 dangling symlink，`exists()` 为 false，但
+`symlink_to()` 仍因链接目录项存在而抛出 `FileExistsError`。
+
+修复内容：修改
+`b/x/4dwvla_ext/rlt/train_4dwvla_rlt_stage1.py` 的数据集链接逻辑：
+
+- 发现 dangling/stale symlink 时，只删除该 symlink；
+- 发现 symlink 指向不同真实数据集时替换；
+- 发现真实目录而非 symlink 且指向不同数据集时 fail-fast；
+- 不隐式删除真实数据集目录；
+- 创建指向 `/home/nvidia/bt/dt/...` 的新链接。
+
+这是宿主机/容器路径兼容性修复，不改变数据内容或训练算法。
+
+### 16.11 stale symlink 权限问题与最终处理
+
+再次运行时，代码正确识别出 stale symlink，但删除时出现：
+
+```text
+PermissionError: [Errno 13] Permission denied:
+/home/nvidia/.cache/huggingface/lerobot/plug_into_socket_lrb_4D_8sml
+```
+
+原因是该缓存目录和 symlink 属于 `root:root`，而当前执行用户是
+`nvidia`；无密码 sudo 也不可用。不能强行删除或修改 root-owned 文件。
+
+最终处理：宿主训练命令显式设置：
+
+```bash
+export HF_LEROBOT_HOME=/home/nvidia/bt/s/RLmm/.cache/lerobot
+```
+
+`lerobot.utils.constants.HF_LEROBOT_HOME` 在 import 时读取该变量，训练脚本
+会在仓库内可写目录创建指向真实数据集的 symlink。容器运行仍使用其默认的
+`/home/nvidia/.cache/huggingface/lerobot`，两套缓存互不覆盖。
+
+### 16.12 dataloader 长度测量结果
+
+在设置 `HF_LEROBOT_HOME` 后，配置和数据集加载成功：
+
+```text
+dataset_root=/home/nvidia/bt/dt
+dataset_repo_id=plug_into_socket_lrb_4D_8sml
+dataset_len=4777
+dataloader_len=299
+batch_size=16
+twenty_epoch_iterations=5980
+```
+
+因此正式训练使用 `--max_steps 5980`，每 299 次 iteration 保存一次，
+即保存每个 epoch 的 checkpoint，并在第 5980 次保存最终 checkpoint。
+这是在修复前、沿用原始 batch size 16 的估算；由于正式 VLA SFT smoke
+证明 batch16 OOM，后续改为 batch8，正式值已在 §16.16 修正为
+`max_steps=11960`、`save_freq=598`。
+
+此前有一次用于构造探测脚本的命令语法错误：
+
+```text
+SyntaxError: invalid syntax
+```
+
+原因是临时 inline Python 中误写了无效的占位 import；该错误未触及训练
+代码，随后删除该占位行并使用 `import train_4dwvla_rlt_stage1` 重试。
+
+### 16.13 按用户修正切换到 `rlinf-4dwvla-gpu` 容器
+
+曾启动一次宿主机单步 VLA-SFT+RLT smoke：
+
+```bash
+... train_4dwvla_rlt_stage1.py \
+  --config rlt_stage1_franka_plug_host_20epoch.yaml \
+  --max_steps 1 --save_freq 1
+```
+
+该进程在模型初始化阶段被用户终止，未执行 optimizer step，也未产生有效
+checkpoint。最后输出只有：
+
+```text
+The fast path is not available because one of the required library is not installed.
+Falling back to torch implementation.
+```
+
+随后用户明确要求全部训练在已有容器
+`rlinf-4dwvla-gpu` 中运行。因此后续不再使用宿主机 `lingbotvla` 作为训练
+执行环境，改用容器内：
+
+```text
+RLinf repository: /workspace/RLinf
+4WVLA repository: /workspace/4WVLA:ro
+checkpoint: /home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp010420
+dataset: /home/nvidia/data/plug_into_socket_lrb_4D_8sml
+output: /workspace/RLinf/b/x/4dwvla_ext/rlt/outputs
+host output: /home/nvidia/bt/s/RLmm/b/x/4dwvla_ext/rlt/outputs
+```
+
+宿主机临时配置中的 `/home/nvidia/bt/...` 路径只用于之前的探测，不用于
+后续容器训练；容器训练使用仓库中原有的
+`configs/rlt_stage1_franka_plug.yaml`，其路径与容器挂载一致。
+
+### 16.14 容器离线测试首次失败：T-RLT6 硬编码宿主路径
+
+在 `rlinf-4dwvla-gpu` 中执行：
+
+```bash
+source /opt/venv/4dwvla/bin/activate
+cd /workspace/RLinf
+export PYTHONPATH=/workspace/RLinf:/workspace/4WVLA/src:${PYTHONPATH:-}
+bash b/x/4dwvla_ext/rlt/tests/run_all_offline.sh
+```
+
+T-RLT1/2/3/4/5 全部通过，但 T-RLT6 的 6 个检查失败。错误路径为：
+
+```text
+/home/nvidia/bt/ckp/4wvlaFrk/plug/4wvlaFrkPlugCkp010420/config.json
+/home/nvidia/bt/ckp/4wvlaFrk/plug/4wvlaFrkPlugCkp010420/stats.json
+/home/nvidia/bt/s/RLmm/b/d/frk1/plug/keypoints_meta.json
+```
+
+这些是宿主机路径；容器内对应路径分别是：
+
+```text
+/home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp010420/
+/workspace/RLinf/b/d/frk1/plug/keypoints_meta.json
+```
+
+修复：将
+`b/x/4dwvla_ext/rlt/tests/test_rlt_compat_offline.py` 的固定路径改为
+读取：
+
+```text
+RLT_STAGE1_BASE_CHECKPOINT
+RLT_STAGE1_KPT_META
+```
+
+未设置环境变量时仍保留原宿主机默认值，兼容原宿主执行方式。容器内重新
+执行：
+
+```bash
+docker exec \
+  -e RLT_STAGE1_BASE_CHECKPOINT=/home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp010420 \
+  -e RLT_STAGE1_KPT_META=/workspace/RLinf/b/d/frk1/plug/keypoints_meta.json \
+  rlinf-4dwvla-gpu bash -lc '
+    source /opt/venv/4dwvla/bin/activate
+    cd /workspace/RLinf
+    export PYTHONPATH=/workspace/RLinf:/workspace/4WVLA/src:${PYTHONPATH:-}
+    python b/x/4dwvla_ext/rlt/tests/test_rlt_compat_offline.py'
+```
+
+结果：`T-RLT6: 7 passed, 0 failed`。
+
+### 16.15 容器 VLA-SFT smoke 第一次失败：原始 batch size 导致 OOM
+
+在容器中使用 `vla_inference_mode=false` 执行单步 smoke，以确保本次确实
+包含 VLA SFT loss。模型加载、数据集构造和两个 optimizer 均成功，但第一
+次 forward 失败：
+
+```text
+torch.OutOfMemoryError: Tried to allocate 82.00 MiB
+GPU memory in use: approximately 30.60 GiB / 31.35 GiB
+```
+
+根因：Stage0 `train_config.json` 的原始 `batch_size=16` 被
+`load_train_pipeline_config()` 保留；`RLTStage1Config.micro_batch_size=1`
+此前只打印/记录，没有真正覆盖 dataloader batch size。VLA SFT 需要保存
+反向传播激活，batch 16 在 32GB RTX 5090 D 上不可行。此前
+`vla_inference_mode=true` 的 12GB 结果不能用于本次 VLA SFT 目标，因为它
+通过 `torch.no_grad()` 冻结了 VLA。
+
+修复：在训练入口把 checkpoint batch size 覆盖为
+`rlt_cfg.micro_batch_size`，并保留 gradient accumulation：
+
+```python
+train_cfg.batch_size = rlt_cfg.micro_batch_size
+```
+
+这样默认 `micro_batch_size=1` 才真正生效；不是通过关闭 VLA 反向传播规避
+问题。
+
+### 16.16 batch8 smoke 通过与 20 epoch 迭代修正
+
+为降低总训练时间，在仍满足显存安全的前提下，将两个 20 epoch 配置的
+`micro_batch_size` 从 1 调整为 8：
+
+```text
+batch_size=8
+frames=4777
+dataloader_len=598
+20 epochs=598 × 20=11960 iterations
+```
+
+容器 batch8 单步 smoke：
+
+```text
+Training: max_steps=1, batch=8, accum=8, profile=B
+step=1 loss_total=10.6404 loss_rlt=10.1976 loss_vla=0.4428
+z_rl_norm=46.386 prefix_len=650 dt=22.28s vram=20.60GB
+Training complete: 1 steps
+```
+
+产物已成功写入：
+
+```text
+container:
+/workspace/RLinf/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917_b8_smoke/
+host:
+/home/nvidia/bt/s/RLmm/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917_b8_smoke/
+```
+
+该 smoke 同时证明 `loss_vla` 非零，故确实执行了 VLA SFT forward/backward；
+没有退回 `vla_inference_mode=true`。
+
+### 16.17 正式 20 epoch 训练启动
+
+正式训练配置：
+
+```text
+config:
+/workspace/RLinf/b/x/4dwvla_ext/rlt/configs/rlt_stage1_franka_plug_container_20epoch.yaml
+
+base checkpoint (container):
+/home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp010420
+
+dataset (container):
+/home/nvidia/data/plug_into_socket_lrb_4D_8sml
+
+output (container):
+/workspace/RLinf/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917
+
+output (host):
+/home/nvidia/bt/s/RLmm/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917
+
+training:
+vla_inference_mode=false
+micro_batch_size=8
+gradient_accumulation_steps=8
+max_steps=11960
+save_freq=598
+```
+
+启动命令：
+
+```bash
+docker exec rlinf-4dwvla-gpu bash -lc '
+  set -o pipefail
+  source /opt/venv/4dwvla/bin/activate
+  cd /workspace/RLinf
+  export PYTHONPATH=/workspace/RLinf:/workspace/4WVLA/src:${PYTHONPATH:-}
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  OUT=/workspace/RLinf/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917
+  mkdir -p "$OUT"
+  python b/x/4dwvla_ext/rlt/train_4dwvla_rlt_stage1.py \
+    --config b/x/4dwvla_ext/rlt/configs/rlt_stage1_franka_plug_container_20epoch.yaml \
+    2>&1 | tee "$OUT/training_console.log"
+'
+```
+
+`training_console.log` 和 `training_run_meta.txt` 通过
+`/workspace/RLinf ↔ /home/nvidia/bt/s/RLmm` bind mount 同时可从容器和宿主机
+读取。训练进程当前已启动，初始日志已确认进入 Stage1 入口；后续每个保存点、
+异常、恢复和最终报告继续追加到本日志。
+
+### 16.18 第 1 个 epoch 保存点
+
+训练运行正常，未发生新的异常。容器日志显示：
+
+```text
+Training: max_steps=11960, batch=8, accum=8, profile=B
+step=590 loss_total=3.4811 loss_rlt=3.2832 loss_vla=0.1979
+step=598 checkpoint saved
+```
+
+第 1 个 epoch checkpoint：
+
+```text
+container:
+/workspace/RLinf/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917/step_000598
+
+host:
+/home/nvidia/bt/s/RLmm/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917/step_000598
+```
+
+该目录包含 VLA checkpoint、RLT module checkpoint 和 `rlt_config.yaml`；
+完整控制台日志在同一输出目录的 `training_console.log`。
+
+### 16.19 容器 stop 后 checkpoint 持久性核验
+
+用户询问停止 `rlinf-4dwvla-gpu` 后 checkpoint 是否会丢失，已实际核验
+Docker 挂载：
+
+```text
+/home/nvidia/bt/s/RLmm -> /workspace/RLinf       RW=true
+/home/nvidia/bt/s/4WVLA -> /workspace/4WVLA      RW=true
+/home/nvidia/bt/ckp     -> /home/nvidia/ckpts    RW=false
+```
+
+正式输出目录位于第一个挂载的宿主机路径：
+
+```text
+container: /workspace/RLinf/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917
+host:      /home/nvidia/bt/s/RLmm/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917
+```
+
+容器内和宿主机通过同一个 bind-mounted inode 访问，因此普通
+`docker stop`/容器重启不会删除已经写入宿主机的 checkpoint。已验证最近
+保存的 step 5980：
+
+```text
+.../step_005980/rlt/rlt_module.pt
+exists=True, size=770047861 bytes
+training_console.log
+exists=True, size=115049 bytes
+```
+
+当前训练日志已推进到 step 6540；`save_freq=598`，因此最新完整可恢复点
+是 step 5980，约丢失 step 5980 到当前内存中的未保存进度，而不是丢失已有
+checkpoint。若要最大限度避免“正在写文件”时被硬杀，应在下一个保存点后再
+停止；即使在保存点之间停止，step 5980 及此前保存点仍在宿主机。

@@ -37,6 +37,7 @@ import numpy as np
 # 4dwvla_ext 以数字开头, 不能用 from 4dwvla_ext.X import Y
 # 直接把本目录加入 sys.path 后按模块名导入
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from franky_controller_direct import (
     FrankyControllerDirect,
@@ -44,16 +45,16 @@ from franky_controller_direct import (
     JOINT_LIMITS_UPPER,
     JOINT_VEL_LIMITS,
 )
+from franky_ext.dsplug.home_pose import load_home_joints
 
 logger = logging.getLogger(__name__)
 
 # Training data range (from abs_stats.json)
 TRAIN_ARM_MIN  = np.array([-0.4842, -0.1030, -0.2025, -2.2044, -0.2041, 1.5702, 0.4843])
 TRAIN_ARM_MAX  = np.array([ 0.0452,  0.3120,  0.4789, -1.5347,  0.0806, 2.4536, 0.9807])
-TRAIN_ARM_MEAN = np.array([-0.2406,  0.1457,  0.1872, -2.0600, -0.0553, 2.2011, 0.6998])
 TRAIN_TCP_MIN  = np.array([0.534, -0.140, 0.178])
 TRAIN_TCP_MAX  = np.array([0.602,  0.053, 0.517])
-HOME_JOINTS = TRAIN_ARM_MEAN.copy()
+HOME_JOINTS = load_home_joints()
 
 SAFETY_MARGIN_RAD = 0.15
 ACTION_LIMIT_LOWER = np.maximum(TRAIN_ARM_MIN - SAFETY_MARGIN_RAD, JOINT_LIMITS_LOWER)
@@ -138,7 +139,7 @@ class FrankyJointEnv(gym.Env):
 
     def _init_cameras(self, serials):
         try:
-            import pyrealsense2 as rs
+            import pyrealsense2 as rs  # pyright: ignore[reportMissingImports]
         except ImportError:
             logger.warning("pyrealsense2 not available")
             return

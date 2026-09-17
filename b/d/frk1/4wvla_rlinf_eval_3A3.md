@@ -1,6 +1,6 @@
 # 模式 A 纯 VLA 评估 — 基于 Docker 镜像的实施落地方案 (v3A3)
 
-> **版本**: v3A3.14 | **日期**: 2026-09-16
+> **版本**: v3A3.17 | **日期**: 2026-09-17
 > **定位**: 基于本机实际 Docker 镜像 `rlinf/rlinf:agentic-rlinf0.4-franka` 和 `rlinf/rlinf:agentic-rlinf0.4-maniskill_libero` 的**完整自包含**实施落地方案.
 > **适用范围**: 直接使用 4DWVLA (InternVLA-A1.5) 输出动作, 在 Franka FR3v2.1 上执行"仅纯 VLA 评估".
 > **本文档为完整自包含文档**: 所有代码、配置、安全参数和实现细节均已内联, 无需参阅其他文档.
@@ -29,6 +29,7 @@
 - [15. 操作手册 (面向第三方工程师)](#15-操作手册-面向第三方工程师)
 - [16. 速查卡](#16-速查卡)
 - [17. 版本历史](#17-版本历史)
+- [18. 容器内键盘与鼠标：每次启动 / 进入时的操作](#18-容器内键盘与鼠标每次启动--进入时的操作)
 
 ---
 
@@ -4836,12 +4837,22 @@ python /workspace/RLinf/b/x/4dwvla_ext/franka_vla_client.py \
 
 **Level 1: 保守真机** (机器人会运动! 手握 E-stop!)
 
+先按 [§18](#18-容器内键盘与鼠标每次启动--进入时的操作) 在 Franky 容器里执行：
+
+```bash
+source /workspace/RLinf/b/x/4dwvla_ext/setup_container_input.sh
+```
+
+看到 `[setup-input] OK` 后再启动下面的客户端。不要 `export RLINF_KEYBOARD_DEVICE=/dev/input/eventN`。
+
 ```bash
 # [Franky 容器内]
 python /workspace/RLinf/b/x/4dwvla_ext/franka_vla_client.py \
     --robot-ip 172.16.0.2 \
     --task "plug into socket" \
     --use-realsense \
+    --global-camera-serial 250222073513 \
+    --wrist-camera-serial 420122070525 \
     --max-steps 30 \
     --control-hz 5
 ```
@@ -4879,6 +4890,8 @@ python /workspace/RLinf/b/x/4dwvla_ext/franka_vla_client.py \
     --robot-ip 172.16.0.2 \
     --task "plug into socket" \
     --use-realsense \
+    --global-camera-serial 250222073513 \
+    --wrist-camera-serial 420122070525 \
     --max-steps 300 --control-hz 10 --n-exec 10
 ```
 
@@ -5104,6 +5117,9 @@ source /opt/venv/franky-0.19.0/bin/activate && python /workspace/RLinf/b/x/4dwvl
 
 | 版本 | 日期 | 变更 |
 |:---|:---|:---|
+| v3A3.17 | 2026-09-17 | **§18 收成一条脚本**. 新增 `setup_container_input.sh`：进新容器、进已运行容器、键盘鼠标失效时 `source` 一次即可（同步节点、拉起 watcher、验收、写入 `/run/rlt-input/env.sh`）。 |
+| v3A3.16 | 2026-09-17 | **§18 改为每次进容器的操作清单**. 区分新启动容器与进入已运行容器；验收以 `by-id` + `/run/rlt-input/keyboard` 为准，禁止 `eventN` 和 `/dev/input/by-rlt/keyboard`；热插拔只重同步并重启该程序，不重启容器. |
+| v3A3.15 | 2026-09-17 | **键盘稳定 alias 改到 `/run/rlt-input`**. `RLINF_KEYBOARD_DEVICE=/dev/input/by-rlt/keyboard` 在 alias 被 udev 清掉后会硬失败；`KeyboardListener` 对缺失 override 回退发现；同步器把 canonical alias 写到 tmpfs 并如实记录是否创建成功；`franka_vla_client.py` 在键盘初始化失败时关闭 Franka FCI/watchdog. 新增 `tests/test_sync_input_devices_offline.py`. |
 | v3A3.14 | 2026-09-16 | **RLT Stage 1 容器整合 + 依赖补全 + 文档完善**. (1) §2.4 新增 3 条约束: `flash-linear-attention==0.5.0` + `causal-conv1d>=1.7.0` 高效推理依赖 (缺失时 VRAM 翻倍/速度降 10x); RLT Stage 1 共用 `rlinf-4dwvla-gpu` 容器; 容器不停约束. (2) §2.4 新增 LOG 文件索引表 (3 个 LOG 文件及其内容说明). (3) §3.4 目录结构新增 `rlt/` 子目录 (含 `rlt_config.py`, `rlt_stage1_wrapper.py`, `rlt_token_transformer.py`, `train_4dwvla_rlt_stage1.py`, configs, tests 共 11 文件). (4) §5.1 `setup_4dwvla_venv.sh` 嵌入代码新增 Step 6.5: flash-linear-attention + causal-conv1d 安装 (优先从 starvla venv 链接, 回退到 pip install; 含验证脚本). (5) §12.5 新增 N18-N23 (RLT 模块 6 个文件) + 说明段落 (RLT 训练与 Mode A 评估共享容器/venv, `vla_inference_mode=true` 保证 VLA 权重不变). (6) §14 LOG 引用扩展为 3 条 (离线/GPU/在线). (7) §16.1 新增 RLT 模块路径 + RLT 设计文档路径 + 3 个 LOG 文件路径. (8) §16.3 新增容器名和 GPU 容器软件栈 (含 flash-linear-attention + causal-conv1d). (9) 容器名修正: `4dwvla-gpu` → `rlinf-4dwvla-gpu`, `4dwvla-franky` → `rlinf-4dwvla-franky` (2 处). 整合来源: `4dwvla_rlt1_2.markdown` §2.4/§7.5/§9.1/§13.7.1. |
 | v3A3.13 | 2026-09-15 | **T6/T7/T8 实机测试通过 + franky 0.19.0 全面适配**. (1) franky 0.19.0 API 适配: `extreme_pose_explorer.py` 3 处 + `franky_controller_direct.py` 7 处修复 (`Robot.move()` 移除 `dynamic_rel`/`blocking` 改用 `relative_dynamics_factor` 属性; `O_T_EE` 改用 `.translation`; `set_collision_behavior` 参数名改单数). (2) T6 端到端 Dry Run 通过: Qwen3.5-2B 基础权重预下载方案 (替代 monkey-patch), UInput 键盘注入三步法 (创建→mknod→指定设备). (3) T7 极限位姿探测: 13/14 位姿通过 (误差<0.001rad), pose 4 (q2@train\_max) cartesian\_reflex 为已知问题. 验收标准调整为 ≥13/14. (4) T8 真机全键位: 5 键 (a/h/r/b/c) 全部功能正确, 推理延迟 854-1055ms, 运动平滑 0 warnings. 新增 `t8_test_runner.py` 自动化测试脚本. RealSense 多相机 USB 冲突解决 (指定序列号). (5) 新增 §14.4.1 已知问题表 (6 项). §7.3 新增 `RS_GLOBAL_SERIAL` / `RS_WRIST_SERIAL` 配置. T6 UInput 示例更新为 6 键注册. T8 新增相机序列号参数和自动化替代方案说明. |
 | v3A3.12 | 2026-09-15 | **D10 修复 + 训推参数全面对比审计**. 发现致命缺陷 D10: (a) `stats.json` 仅含子字段键 (`observation.state.arm`[7] 等), `load_stats()` 查找组合键 `observation.state`(8D) → `KeyError` 崩溃; (b) 模型 `output_features.action.shape=[32]` (padded), 而 stats 为 8D → unnormalize 维度不匹配. 修复: `load_stats()` 增加 `compose_sub_field_stats()` 回退路径 (通过 schema `feature_mapping` 拼接子字段 mean/std); `serve()` 中 `action_pred[:n_exec, :actual_action_dim]` 裁切到实际维度. 新增 §4.1.4 D10 深度分析 (含数学等价性证明). **新增 §4.6 训推参数全面对比审计**: 46 项参数逐一比对, 分 6 大类 (数据预处理/Prompt构造/模型架构/Keypoint/执行控制/Schema), 每项标注训练有效值 vs 评测有效值 + 一致性判定 + 严重性分级. 3 个关键差异的影响分析 (stats 键/output suffix/keypoint 来源/n\_exec). 新增 T12 测试 (23 子测试, `test_stats_composition_offline.py`): 验证子字段键结构 + 组合正确性 + 动作维度不匹配检测 + 归一化 roundtrip. §4.1 缺陷表新增 D10. §9.4 新增 2 项一致性检查. §12 新增 N17. §14.0/14.1/14.4 更新测试清单. |
@@ -5122,4 +5138,281 @@ source /opt/venv/franky-0.19.0/bin/activate && python /workspace/RLinf/b/x/4dwvl
 
 ---
 
-*本文档为完整自包含文档. 所有代码、配置、安全参数和实现细节均已内联. 执行时先按 §13 部署, 再按 §14 测试验收全部通过后, 最后按 §15 操作手册进行正式真机评估.*
+*本文档为完整自包含文档. 所有关键代码、配置、安全参数和操作步骤均已说明，并标注对应源文件. 执行时先按 §13 部署, 再按 §14 测试验收全部通过后, 最后按 §15 操作手册进行正式真机评估.*
+
+---
+
+## 18. 容器内键盘与鼠标：每次启动 / 进入时的操作
+
+GPU 容器不需要本章。只对 **Franky 容器** (`rlinf-4dwvla-franky`) 执行。Level 0 `--dry-run` 不打开键盘，可跳过。
+
+**以后默认只做一件事**：在将要启动评估程序的那个 shell 里运行一次
+
+```bash
+source /workspace/RLinf/b/x/4dwvla_ext/setup_container_input.sh
+```
+
+适用于：刚 `docker run` 的新容器、`docker exec` 进已有容器、键盘鼠标拔插后、以及 `KeyboardListener` / evdev 打不开设备。脚本可重复执行。通过后再启动 `franka_vla_client.py`。
+
+```mermaid
+flowchart TD
+    A[进 Franky 容器] --> B["source setup_container_input.sh"]
+    B -->|OK| C[启动 franka_vla_client 等程序]
+    B -->|FAILED| D[禁止启动真机客户端]
+    C --> E{中途拔插?}
+    E -->|是| B
+```
+
+### 18.1 每次都必须遵守的规则
+
+1. **不要把 `/dev/input/eventN` 写进 `export`、文档或脚本。** `event2` 今天是 Dell 键盘，拔插后可能变成 `event18`，旧节点还会变成 `ENXIO` (errno 6)。
+2. **身份优先用 udev `by-id`，便利别名用 `/run/rlt-input/`。** 本工位键盘验收目标：
+
+   ```text
+   /dev/input/by-id/usb-413c_Dell_KB216_Wired_Keyboard-event-kbd
+   /run/rlt-input/keyboard   ->  当前 event 节点
+   /run/rlt-input/mouse      ->  当前鼠标 event 节点
+   ```
+
+   `by-id` 随 USB 身份稳定；`/run/rlt-input/keyboard` 名字不变，只改指向。两者都有效时，第三方 evdev 程序优先打开 `/run/rlt-input/*`。
+3. **不要使用 `/dev/input/by-rlt/keyboard`。** 短名写在 `/dev/input` 下会被 udev 清掉。曾经因此出现 `override path '/dev/input/by-rlt/keyboard' does not exist`，同时 FCI 已被占用。
+4. **每个新 shell 先处理环境变量。** `docker exec` 通常是干净环境；最初那个 `docker run -it` 的 bash 会记住上次的 `export`。错误示例：
+
+   ```bash
+   export RLINF_KEYBOARD_DEVICE=/dev/input/event2          # 禁止
+   export RLINF_KEYBOARD_DEVICE=/dev/input/by-rlt/keyboard  # 禁止
+   ```
+
+   允许：
+
+   ```bash
+   unset RLINF_KEYBOARD_DEVICE
+   # 或
+   export RLINF_KEYBOARD_DEVICE=/run/rlt-input/keyboard
+   # 或（长期身份，热插拔后仍是同一条路径）
+   export RLINF_KEYBOARD_DEVICE=/dev/input/by-id/usb-413c_Dell_KB216_Wired_Keyboard-event-kbd
+   ```
+
+5. **先同步 input，再启动会 `InputDevice(...)` 的程序。** 已经打开旧 `eventN` 的进程不会自动跟上；重同步后只重启该程序，不要重启整个 Franky 容器，也不要用 `kill -9` 误伤机器人控制器。
+6. **键盘失败时不要并行再开一个真机客户端。** 先看 `172.16.0.2:1337` 是否仍被占着。
+
+### 18.2 一条命令（新容器 / 已运行容器 / 设备失效）
+
+脚本：`RLmm/b/x/4dwvla_ext/setup_container_input.sh`
+
+必须 **`source`**，不要只 `bash` 它。`bash` 能修好容器里的节点和守护进程，但清不掉当前交互 shell 里错误的 `RLINF_KEYBOARD_DEVICE`。
+
+**容器内（推荐，三种场景同一条）**：
+
+```bash
+source /opt/venv/franky-0.19.0/bin/activate
+source /workspace/RLinf/b/x/4dwvla_ext/setup_container_input.sh
+```
+
+看到 `[setup-input] OK` 后再启动评估客户端。若输出 `FAILED`，不要上真机。
+
+**宿主机**（容器已在跑，人还在宿主机；只修容器内节点，修不了容器里已经打开的 bash 的 `export`）：
+
+```bash
+bash /home/nvidia/bt/s/RLmm/b/x/4dwvla_ext/setup_container_input.sh
+```
+
+若你人已经在容器的交互 bash 里，仍要在**那个** shell 里再 `source` 一次，以免残留 `eventN` 或 `by-rlt/keyboard`。
+
+可选：
+
+| 项 | 作用 |
+|:---|:---|
+| `--restart-watch` | 停掉旧的同步守护进程再拉一个 |
+| `RLT_KEYBOARD_MATCH="Dell KB216"` | 本工位默认。换键盘时改这一项，不要改 `eventN` |
+| `RLT_MOUSE_MATCH=...` | 多个鼠标时再设 |
+| `CONTAINER_NAME=rlinf-4dwvla-franky` | 宿主机 `docker exec` 的目标容器 |
+
+本工位操作键盘是 **Dell KB216**。脚本默认带 `--keyboard-match "Dell KB216"`。
+
+新启动容器仍然用 `docker_run_4dwvla_franky.sh`。该脚本**不会**自动同步键盘；进容器后第一件事就是 `source setup_container_input.sh`。已有容器不要再 `docker run`，`docker exec` 进去后同样 `source` 一次。
+
+### 18.3 脚本实际做了什么
+
+可重复执行，顺序固定：
+
+1. 若在宿主机：对 `rlinf-4dwvla-franky` 做 `docker exec -u 0` 后走下面步骤。
+2. `python sync_input_devices.py --once --repair-nodes --keyboard-match "Dell KB216"`，按 sysfs 补 `/dev/input/eventN`，写入 `/run/rlt-input/keyboard` 与 `mouse`。
+3. 若还没有 `--watch` 守护进程，则 `nohup` 拉起一个（每个容器只应有一个）。
+4. 验收：别名必须是指向真实节点的符号链接；尽量用 franky venv 的 evdev 打开键盘。
+5. 写入 `/run/rlt-input/env.sh`。若当前是 `source`，则 `unset` 错误覆盖并 `export RLINF_KEYBOARD_DEVICE=/run/rlt-input/keyboard`。
+6. 若 1337 被占用，打印警告，**不会**自动杀掉机器人进程。
+
+它**不会**：改内核 event 编号、重启 Franky/GPU 容器、`kill -9` 评估客户端、默认 `--prune-stale`。
+
+已经打开旧 `eventN` 的进程不会自动换 fd，脚本结束时会提示重启那些程序。
+
+### 18.4 看脚本输出即可，不必再手敲验收命令
+
+通过时应类似：
+
+```text
+[setup-input] keyboard alias: /run/rlt-input/keyboard -> /dev/input/event2
+[setup-input] mouse alias: /run/rlt-input/mouse -> /dev/input/event3
+[setup-input] evdev ok: /run/rlt-input/keyboard name='Dell KB216 Wired Keyboard' ...
+[setup-input] sourced /run/rlt-input/env.sh in this shell
+[setup-input] OK. Programs should open /run/rlt-input/keyboard and /run/rlt-input/mouse
+```
+
+手工复核（脚本失败时才需要）：
+
+```bash
+ls -l /run/rlt-input/keyboard /run/rlt-input/mouse
+readlink -f /run/rlt-input/keyboard
+echo "$RLINF_KEYBOARD_DEVICE"
+```
+
+`ls /dev/input/by-rlt` 没有 `keyboard` 是预期现象。不要改去 export 那条路径。
+
+验收通过后启动（示例，Level 1）：
+
+```bash
+python /workspace/RLinf/b/x/4dwvla_ext/franka_vla_client.py \
+    --robot-ip 172.16.0.2 \
+    --task "plug into socket" \
+    --use-realsense \
+    --global-camera-serial 250222073513 \
+    --wrist-camera-serial 420122070525 \
+    --max-steps 30 \
+    --control-hz 5
+```
+
+`source` 过脚本则不必再手写 `export RLINF_KEYBOARD_DEVICE`。
+
+### 18.5 键盘或鼠标中途被拔插
+
+不要重启 Franky 容器，也不要重启 GPU 推理服务。插好设备后，在评估用的那个 shell 里再执行同一条：
+
+```bash
+source /workspace/RLinf/b/x/4dwvla_ext/setup_container_input.sh
+```
+
+然后只重启已经打开旧节点的程序（例如评估客户端）。先看脚本里关于 1337 的警告，不要并行两个真机客户端。
+
+若 `--watch` 已在跑，别名会很快改指向；**当初打开 `eventN` 的进程仍必须重启**。当初打开 `/run/rlt-input/keyboard` 或 `by-id` 的 `KeyboardListener` 会按同一条路径重开。
+
+### 18.6 程序应该打开哪条路径
+
+| 用途 | 打开 | 不要打开 |
+|:---|:---|:---|
+| RLinf `KeyboardListener` / `franka_vla_client.py` | `/run/rlt-input/keyboard` 或 Dell 的 `by-id` `*-event-kbd` | `/dev/input/eventN`、`/dev/input/by-rlt/keyboard` |
+| 自己写的 evdev 鼠标 | `/run/rlt-input/mouse` | `/dev/input/event3` |
+| 自动化 T6/T8 的 UInput 虚拟键盘 | 测试脚本创建后的那个节点，且仅用于该次测试 | 物理 Dell 键盘的 `eventN` |
+| SpaceMouse | `pyspacemouse` HID `device_index`，见 §18.8 | `/run/rlt-input/mouse` |
+
+`sync_input_devices.py` 以 `/sys/class/input/event*` 为权威来源，做这些事：
+
+1. 按 sysfs 的 major:minor 创建或修复 `/dev/input/eventN`（容器里没有 udevd 时必需）；
+2. 用 python-evdev 判断 keyboard / mouse；
+3. 在 **tmpfs** `/run/rlt-input/` 写下 `event-*`、`keyboard`、`mouse`；
+4. 镜像到 `/dev/input/by-rlt/`（其中短名 `keyboard`/`mouse` 可能被 udev 删掉，验收时忽略该目录）；
+5. 状态写到 `/run/rlt-input-devices.json`。
+
+它**不会**改内核分配的 event 编号。第三方程序不会因为你跑了同步器就自动换设备；必须打开稳定路径，或重启进程。
+
+`KeyboardListener` 当前查找顺序：
+
+1. `RLINF_KEYBOARD_DEVICE`（仅当该路径存在）；
+2. `/run/rlt-input/keyboard`；
+3. `/dev/input/by-rlt/keyboard`（兼容，不可靠）；
+4. 唯一的 `/dev/input/by-id/*-event-kbd`；
+5. 扫描 `/dev/input/event*`。多个键盘且未设置身份路径时会拒绝启动。
+
+### 18.7 同步器启停与参数
+
+| 参数 | 何时用 |
+|:---|:---|
+| `--once` | 每次进入容器、每次拔插后，立刻跑一遍 |
+| `--watch` | 容器要开很久，键盘可能再被拔；每个容器只应有一个 |
+| `--repair-nodes` | **建议默认打开**。sysfs 有设备但容器 `/dev` 缺节点或 major:minor 不对时 `mknod` |
+| `--keyboard-match "Dell KB216"` | 本工位默认。多个键盘时必须指定 |
+| `--mouse-match ...` | 多个鼠标时再加 |
+| `--prune-stale` | 仅容器私有 `/dev/input` 且确认有僵尸节点 |
+| `--force-prune` | 几乎不要用 |
+
+以后默认用 `setup_container_input.sh`，不必手敲这些参数。需要停掉 watcher 时用 `source setup_container_input.sh --restart-watch`，或：
+
+```bash
+if [ -f /run/rlt-input-sync/pid ]; then
+  kill "$(cat /run/rlt-input-sync/pid)" 2>/dev/null || true
+  rm -f /run/rlt-input-sync/pid
+fi
+pgrep -af sync_input_devices
+```
+
+多个副本时先 `pgrep -af sync_input_devices`，再只结束同步器 PID。
+
+### 18.8 多设备、权限、Dry Run、SpaceMouse
+
+**多个键盘**：同步器不会猜。日志出现 `Multiple keyboard devices found` 时不要启动真机评估，加上 `--keyboard-match`。本工位用 `"Dell KB216"`。
+
+**权限**：同步器需要 root 或 `CAP_MKNOD`。评估进程需要读 `/dev/input/event*`。
+
+```bash
+id
+stat -c '%A %U %G %n' /dev/input/event*
+getent group input
+```
+
+不要在生产环境长期 `chmod 666`。当前启动脚本是 `--privileged`，但没有写死 `--device=/dev/input/eventN`（也不应该写死）。
+
+**Level 0 Dry Run**：`franka_vla_client.py --dry-run` 不创建 `KeyboardVLAEvalWrapper`，不需要同步器，也不需要键盘。
+
+**SpaceMouse**：`pyspacemouse.open(device_index=...)` 走 HID，不是 `/run/rlt-input/mouse`。热插拔后要单独验证 HID 枚举。
+
+### 18.9 常见故障
+
+**`KeyboardListener override path '.../by-rlt/keyboard' does not exist`**
+
+当前 shell 仍 `export` 了已不存在的路径。在**同一个** shell 里：
+
+```bash
+source /workspace/RLinf/b/x/4dwvla_ext/setup_container_input.sh
+```
+
+同时检查 1337：旧客户端先连机器人再包键盘，失败后可能仍占 FCI；现客户端会在 `finally` 里 `env.close()`。
+
+**`[Errno 6] No such device or address` / `ENOENT` 打开 `event18`**
+
+程序绑的是过期 event 编号。不要改代码里的数字去追。再 `source setup_container_input.sh`，然后重启该程序。
+
+**`ls /dev/input/by-rlt` 只有 `event-*`，没有 `keyboard`**
+
+预期现象，不是同步失败。以 `/run/rlt-input/keyboard` 和日志里的 `keyboard alias:` 为准。
+
+**`Cannot create /dev/input/eventN: run the synchronizer as root`**
+
+```bash
+docker exec -u 0 -it rlinf-4dwvla-franky bash
+```
+
+**`ss` 显示 1337 仍被占用**
+
+```bash
+pgrep -af franka_vla_client
+# 只结束评估客户端，不要 kill -9 无关进程
+```
+
+空闲后再启动新客户端。不要并行两个真机客户端。
+
+**新插入的键盘在容器里看不见**
+
+容器 `/dev` 可能落后于 sysfs。`setup_container_input.sh` 默认带 `--repair-nodes`。若 sysfs 里也没有该设备，是 USB/主机问题，不是 Python 脚本能修的。
+
+### 18.10 文件出处与验证状态
+
+| 内容 | 文件 |
+|:---|:---|
+| **每次进容器只跑这一条** | `RLmm/b/x/4dwvla_ext/setup_container_input.sh` |
+| 热插拔同步（由上一脚本调用） | `RLmm/b/x/4dwvla_ext/sync_input_devices.py` |
+| 键盘稳定路径与回退 | `RLmm/rlinf/envs/realworld/common/keyboard/keyboard_listener.py` |
+| 评估客户端（键盘失败时释放 FCI） | `RLmm/b/x/4dwvla_ext/franka_vla_client.py` |
+| 稳定 alias 离线测试 | `RLmm/b/x/4dwvla_ext/tests/test_sync_input_devices_offline.py` |
+| Franky 容器启动 | `RLmm/b/x/4dwvla_ext/configs/docker_run_4dwvla_franky.sh` |
+
+离线 alias 测试与 `bash -n setup_container_input.sh` 已通过。每次真机评估以脚本打印 `[setup-input] OK` 为准，再进入 Level 1。

@@ -1,0 +1,41 @@
+# Container-side 20-epoch RLT Stage 1 training configuration.
+#
+# The trainer counts dataloader iterations, not epochs. The 8-episode dataset
+# has 598 batches at batch_size=8, so 20 epochs = 11960 iterations.
+
+enable_rlt: true
+rlt_alpha: 1.0
+rlt_input_dim: 2048
+rlt_embed_dim: 1024
+rlt_prefix_seq_len: 768
+rlt_num_layers: 2
+rlt_num_heads: 8
+rlt_mlp_ratio: 4.0
+rlt_dropout: 0.0
+rlt_image_only: false
+rlt_lr: 1e-4
+
+train_profile: "B"
+action_loss_only: true
+freeze_vision_encoder: true
+train_expert_only: true
+freeze_keypoint_modules: false
+# false is intentional: this run includes the VLA SFT loss and optimizer.
+vla_inference_mode: false
+
+vla_lr: 5e-5
+grad_clip_norm: 1.0
+warmup_steps: 200
+max_steps: 11960
+save_freq: 598
+log_freq: 10
+micro_batch_size: 8
+gradient_accumulation_steps: 8
+
+dataset_repo_id: "plug_into_socket_lrb_4D_8sml"
+action_mode: "abs"
+task_prompt: "plug into socket"
+
+base_checkpoint: "/home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp010420"
+dataset_root: "/home/nvidia/data"
+output_dir: "/workspace/RLinf/b/x/4dwvla_ext/rlt/outputs/rlt1_20epoch_20260917"

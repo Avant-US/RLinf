@@ -13,13 +13,16 @@ import numpy as np
 
 _ext_dir = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ext_dir)
+_bx_root = str(Path(__file__).resolve().parents[2])
+sys.path.insert(0, _bx_root)
 
 from fk_keypoints import FKKeypointComputer
+from franky_ext.dsplug.home_pose import load_home_joints
 
 URDF = "/workspace/RLinf/b/d/frk1/fr3v2_1_franka_hand.urdf"
 KPT_META = "/workspace/RLinf/b/d/frk1/plug/keypoints_meta.json"
 
-HOME_Q = np.array([-0.24, 0.15, 0.19, -2.06, -0.06, 2.20, 0.70])
+HOME_Q = load_home_joints()
 
 PASS = 0
 FAIL = 0

@@ -6,6 +6,7 @@ and that keypoint normalization is well-defined.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -16,8 +17,18 @@ import torch
 PASS = 0
 FAIL = 0
 
-CKPT_DIR = Path("/home/nvidia/bt/ckp/4wvlaFrk/plug/4wvlaFrkPlugCkp010420")
-KPT_META = Path("/home/nvidia/bt/s/RLmm/b/d/frk1/plug/keypoints_meta.json")
+CKPT_DIR = Path(
+    os.environ.get(
+        "RLT_STAGE1_BASE_CHECKPOINT",
+        "/home/nvidia/bt/ckp/4wvlaFrk/plug/4wvlaFrkPlugCkp010420",
+    )
+)
+KPT_META = Path(
+    os.environ.get(
+        "RLT_STAGE1_KPT_META",
+        "/home/nvidia/bt/s/RLmm/b/d/frk1/plug/keypoints_meta.json",
+    )
+)
 
 
 def run_test(name, fn):

@@ -27,6 +27,19 @@ class KeyboardListener:
     """Headless keyboard listener backed by Linux evdev input devices."""
 
     REQUIRED_KEY_NAMES = ("KEY_A", "KEY_B", "KEY_C", "KEY_Q")
+    # Prefer tmpfs aliases from sync_input_devices.py. /dev/input/by-rlt/keyboard
+    # is kept as a compatibility path, but udev may delete non-event* names there.
+    STABLE_KEYBOARD_PATH = "/run/rlt-input/keyboard"
+    STABLE_KEYBOARD_PATHS = (
+        "/run/rlt-input/keyboard",
+        "/dev/input/by-rlt/keyboard",
+    )
+    TRANSIENT_DEVICE_ERRNOS = {
+        errno.ENOENT,
+        errno.ENODEV,
+        errno.ENXIO,
+        errno.EIO,
+    }
 
     def __init__(self):
         try:
@@ -58,15 +71,37 @@ class KeyboardListener:
     def _open_keyboard_device(self):
         override_path = os.environ.get("RLINF_KEYBOARD_DEVICE")
         if override_path:
-            device = self._open_device(override_path, is_override=True)
-            if not self._is_keyboard_device(device):
-                device.close()
-                raise RuntimeError(
-                    "KeyboardListener device set by "
-                    f"RLINF_KEYBOARD_DEVICE='{override_path}' does not look like a "
-                    "keyboard device. Point it to the correct /dev/input/eventX path."
-                )
-            return device
+            if os.path.exists(override_path):
+                device = self._open_device(override_path, is_override=True)
+                if not self._is_keyboard_device(device):
+                    device.close()
+                    raise RuntimeError(
+                        "KeyboardListener device set by "
+                        f"RLINF_KEYBOARD_DEVICE='{override_path}' does not look like a "
+                        "keyboard device. Point it to the correct /dev/input/eventX path."
+                    )
+                return device
+            _logger.warning(
+                "RLINF_KEYBOARD_DEVICE=%s does not exist; falling back to "
+                "stable aliases and event-device discovery.",
+                override_path,
+            )
+
+        # Prefer stable aliases maintained by sync_input_devices.py. If a USB
+        # device is between unplug/replug states, fall back to discovery
+        # instead of failing the whole listener construction.
+        for stable_path in self.STABLE_KEYBOARD_PATHS:
+            device = self._try_open_keyboard_path(stable_path, label="stable keyboard link")
+            if device is not None:
+                return device
+
+        by_id_keyboards = self._by_id_keyboard_paths()
+        if len(by_id_keyboards) == 1:
+            device = self._try_open_keyboard_path(
+                by_id_keyboards[0], label="udev by-id keyboard"
+            )
+            if device is not None:
+                return device
 
         permission_denied_paths: list[str] = []
         keyboards: list = []  # (path, device) for every device that has KEY_A/B/C/Q
@@ -76,6 +111,15 @@ class KeyboardListener:
             except PermissionError:
                 permission_denied_paths.append(device_path)
                 continue
+            except OSError as exc:
+                if exc.errno in self.TRANSIENT_DEVICE_ERRNOS:
+                    _logger.debug(
+                        "Skipping transient input device %s: %s",
+                        device_path,
+                        exc,
+                    )
+                    continue
+                raise
 
             if self._is_keyboard_device(device):
                 keyboards.append((device_path, device))
@@ -113,6 +157,44 @@ class KeyboardListener:
             "correct /dev/input/eventX path."
         )
 
+    def _try_open_keyboard_path(self, device_path: str, *, label: str):
+        if not os.path.exists(device_path):
+            return None
+        try:
+            device = self._open_device(device_path, is_override=True)
+        except RuntimeError as exc:
+            _logger.warning(
+                "%s %s is temporarily unavailable: %s; falling back.",
+                label,
+                device_path,
+                exc,
+            )
+            return None
+        if self._is_keyboard_device(device):
+            return device
+        device.close()
+        _logger.warning(
+            "%s %s is not keyboard-capable; falling back.",
+            label,
+            device_path,
+        )
+        return None
+
+    @staticmethod
+    def _by_id_keyboard_paths() -> list[str]:
+        by_id_dir = "/dev/input/by-id"
+        if not os.path.isdir(by_id_dir):
+            return []
+        try:
+            names = os.listdir(by_id_dir)
+        except OSError:
+            return []
+        return sorted(
+            os.path.join(by_id_dir, name)
+            for name in names
+            if name.endswith("-event-kbd")
+        )
+
     def _open_device(self, device_path: str, is_override: bool = False):
         try:
             return self._input_device_cls(device_path)
@@ -136,6 +218,8 @@ class KeyboardListener:
                     "KeyboardListener failed to open the device set by "
                     f"RLINF_KEYBOARD_DEVICE='{device_path}': {exc}"
                 ) from exc
+            if exc.errno in self.TRANSIENT_DEVICE_ERRNOS:
+                raise
             raise RuntimeError(
                 f"KeyboardListener failed to open input device '{device_path}': {exc}"
             ) from exc
@@ -174,7 +258,7 @@ class KeyboardListener:
                             if self.latest_data["key"] == key:
                                 self.latest_data["key"] = None
             except OSError as exc:
-                if exc.errno != errno.ENODEV:
+                if exc.errno not in self.TRANSIENT_DEVICE_ERRNOS:
                     _logger.error(
                         "Keyboard device %s read failed (errno=%s): %s",
                         device_path,
@@ -197,7 +281,11 @@ class KeyboardListener:
                 while True:
                     time.sleep(0.5)
                     try:
-                        self.device = self._input_device_cls(device_path)
+                        device = self._input_device_cls(device_path)
+                        if not self._is_keyboard_device(device):
+                            device.close()
+                            continue
+                        self.device = device
                         break
                     except (FileNotFoundError, OSError):
                         continue

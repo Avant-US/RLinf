@@ -92,10 +92,24 @@ def load_train_pipeline_config(ckpt_path: str, dataset_root: str | None, repo_id
         from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME
         link = HF_LEROBOT_HOME / repo_id
         real = Path(dataset_root) / repo_id if not Path(dataset_root, "meta", "info.json").exists() else Path(dataset_root)
-        if real.exists() and not link.exists():
+        if real.exists():
             HF_LEROBOT_HOME.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(real)
-            logger.info("Symlinked %s → %s", link, real)
+            # A previous container run can leave a dangling symlink or a link
+            # pointing at a path that only exists inside the container. Replace
+            # that link, but never remove a real dataset directory implicitly.
+            if link.is_symlink():
+                current_target = link.resolve(strict=False)
+                if current_target != real.resolve():
+                    link.unlink()
+                    logger.info("Replaced stale dataset symlink %s → %s", link, real)
+            elif link.exists() and link.resolve() != real.resolve():
+                raise FileExistsError(
+                    f"Dataset cache path exists and is not the requested dataset: "
+                    f"{link} (requested {real}). Remove it explicitly before retrying."
+                )
+            if not link.exists():
+                link.symlink_to(real)
+                logger.info("Symlinked %s → %s", link, real)
         cfg.dataset.root = None
     if repo_id:
         cfg.dataset.repo_id = repo_id
@@ -345,6 +359,11 @@ def main():
         dataset_root=rlt_cfg.dataset_root,
         repo_id=args.dataset_repo_id or rlt_cfg.dataset_repo_id,
     )
+    # The checkpoint's train_config.json contains the original SFT batch size
+    # (16 for the base run). Stage1 exposes micro_batch_size specifically so a
+    # single GPU can trade dataloader batch size for gradient accumulation.
+    # Leaving the checkpoint value untouched can OOM before the first step.
+    train_cfg.batch_size = rlt_cfg.micro_batch_size
     train_cfg.steps = rlt_cfg.max_steps
 
     report = train(rlt_cfg, train_cfg)

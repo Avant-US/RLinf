@@ -95,3 +95,7 @@ hf download --token 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 --cache-dir /home/nvid
 
 ---
 请基于上述要求, 对文档 `4dwvla_rlt1_1.markdown` 进行改良, 写到 4dwvla_rlt1_2.markdown 中.
+
+@RLmm/b/d/frk1/4wvla_rlinf_eval_3A3.md 也一样的, 每一个涉及具体实现和操作的章节都要写详细点, 要写得别人一看就知道要怎么一步一步操作, 要细化到代码, 脚本或命令行怎么写, 测试结果怎么获取和判断, 别他妈就给我几句话. 请结合当前 @RLmm/ 和 @4WVLA/ 的代码, 以及相关的`*LOG.md`文件, 要结合本机的软硬件环境, 结合实际用到的数据与checkpoint, 也要把 @RLmm/b/d/rltx/4dwvla_rlt1_2.markdown 中在容器方面的改动也整合进来. OK, 按照我的意思把 `4wvla_rlinf_eval_3A3.markdown` 中类似这样的问题全给我改掉. 而且文档要完整, 要自包含.
+
+对 `b/d/rltx/4dwvla_rlt2_1.markdown` 进行细化和改良, 要求每一个涉及具体实现和操作的地方都要写详细点, 要写得别人一看就知道要怎么一步一步操作, 要细化到代码, 脚本或命令行怎么写, 运行结果和测试结果怎么获取和做结果评估. 写的时候结合当前 @RLmm/ 和 @4WVLA/ 的代码, 以及相关的`*LOG.md`文件, 要结合本机的软硬件环境, 结合实际用到的数据与checkpoint. 参考 @RLmm/b/d/rltx/4dwvla_rlt1_2.markdown 和 @RLmm/b/d/frk1/4wvla_rlinf_eval_3A3.md 中对容器的修改和使用, 尽量做到容器复用和相关的脚本代码复用. 因为`b/d/rltx/4dwvla_rlt2_1.markdown`是 RLT Stage 2 的实施落地方案, 因此参考 RLT Stage 1 训练的实施方案 `b/d/rltx/4dwvla_rlt1_2.markdown`以正确获取VLA权重和 RL Token, 以及其它 Stage 2 所需要的输入. 同时要加入关于如何在 RLT Stage 2 中进行操作的操作手册, 要一步一步细化到让对不了解相关知识的第三方工程师也知道怎么照着操作手册去做, 细化到代码脚本命令行怎么写, 细化到什么角色的人, 容器, 系统模块在什么时候该做些什么. 别忘了加入覆盖面广的测试与验收脚本, 以及这些测试的详细操作. 而且文档要完整, 要自包含. 按我的要求. 对 @RLmm/b/d/rltx/4dwvla_rlt2_1.markdown 进行细化和改良吧.

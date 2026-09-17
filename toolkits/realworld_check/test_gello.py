@@ -34,6 +34,7 @@ import math
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -53,6 +54,12 @@ from rlinf.envs.realworld.franka.franky_controller import (  # noqa: E402
     FrankyController,
 )
 from rlinf.envs.realworld.franka.utils import wrap_to_pi  # noqa: E402
+
+_BX_ROOT = Path(__file__).resolve().parents[2] / "b" / "x"
+if str(_BX_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BX_ROOT))
+
+from franky_ext.dsplug.home_pose import load_home_joints  # noqa: E402
 
 # ───────────────────────── shared helpers ──────────────────────────────
 
@@ -328,15 +335,7 @@ ALIGN_SEQ_TOL = 0.10  # rad — joint considered aligned when |Δ| < this
 ALIGN_SEQ_STABLE_TICKS = 8  # consecutive frames inside tol → advance
 ALIGN_SEQ_REFRESH_HZ = 10.0
 
-ALIGN_SEQ_HOME_JOINTS_DEFAULT = [
-    math.pi / 4,  # J1: base rotated 45°
-    0.0,  # J2: upper arm vertical
-    0.0,  # J3: no shoulder roll
-    -math.pi / 2,  # J4: elbow at right angle
-    0.0,  # J5: no forearm roll
-    math.pi / 2,  # J6: wrist at right angle
-    0.0,  # J7: no flange roll
-]
+ALIGN_SEQ_HOME_JOINTS_DEFAULT = load_home_joints().tolist()
 
 
 def _parse_align_home_env() -> list[float]:
@@ -381,9 +380,7 @@ def _print_align_seq_home_pose(home: list[float]) -> None:
         print(f"  J{i + 1} = {_format_angle(v)}")
     print()
     print(
-        "  Geometric intent: J2 vertical, J4 at right angle (forearm\n"
-        "  perpendicular to upper arm), J6 at right angle (wrist 90°\n"
-        "  from forearm), and J1 rotated 45° as an asymmetric reference.\n"
+        "  Default HOME is loaded from b/x/franky_ext/dsplug/home_pose.json.\n"
         "  Override via the ALIGN_HOME env var if you want a different pose."
     )
 
