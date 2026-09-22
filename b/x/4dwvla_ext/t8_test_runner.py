@@ -270,14 +270,18 @@ def main():
 
     results = {}
 
+    # Confirmed mapping (grperr_1.md §4 修复 F): global=250222073513,
+    # wrist=420122070525. Overridable via $RS_GLOBAL_SERIAL/$RS_WRIST_SERIAL
+    # (see configs/franka_plug_eval.env) so this script stays in sync with
+    # franka_vla_client.py's own fallback without needing a code edit here.
     cmd = [
         sys.executable,
         "/workspace/RLinf/b/x/4dwvla_ext/franka_vla_client.py",
         "--robot-ip", "172.16.0.2",
         "--task", "plug into socket",
         "--use-realsense",
-        "--global-camera-serial", "420122070525",
-        "--wrist-camera-serial", "250222073513",
+        "--global-camera-serial", os.environ.get("RS_GLOBAL_SERIAL", "250222073513"),
+        "--wrist-camera-serial", os.environ.get("RS_WRIST_SERIAL", "420122070525"),
         "--max-steps", "50",
         "--control-hz", "5",
     ]

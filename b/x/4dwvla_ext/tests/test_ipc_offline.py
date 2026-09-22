@@ -87,6 +87,45 @@ def test_ipc_message_format():
     check("gripper length", len(msg["state"]["gripper"]) == 1)
     check("task is str", isinstance(msg["task"], str))
 
+def test_ipc_state_history_field():
+    """修复 A: franka_vla_client.py now sends 'state_history' -- the poses
+    executed since the previous inference -- so the server can replay them
+    through FKKeypointComputer.step() and advance observation.his_len at the
+    correct (per control step) rate. Old clients (no field) and old/mock
+    servers that ignore unknown keys must still interoperate.
+    """
+    print("\n=== T2.4: state_history Field (修复 A) ===")
+    port = 15557
+    srv = threading.Thread(target=mock_server, args=(port,), daemon=True)
+    srv.start()
+    time.sleep(0.2)
+
+    conn = Client(("localhost", port), authkey=AUTHKEY)
+
+    # n_exec=10: 9 poses executed since the last inference, plus the
+    # current one sent separately as msg["state"]["arm"].
+    msg = {
+        "images": {"global": np.zeros((480, 640, 3), dtype=np.uint8),
+                   "wrist": np.zeros((480, 640, 3), dtype=np.uint8)},
+        "state": {"arm": [0.0] * 7, "gripper": [0.04]},
+        "state_history": [[0.0] * 7 for _ in range(9)],
+        "task": "plug into socket",
+    }
+    conn.send(msg)
+    resp = conn.recv()
+    check("server tolerates state_history field", resp["status"] == "ok",
+          f"got {resp['status']}")
+
+    # A message without the field (old client) must still round-trip.
+    msg_no_history = {k: v for k, v in msg.items() if k != "state_history"}
+    conn.send(msg_no_history)
+    resp2 = conn.recv()
+    check("server tolerates missing state_history field (old client)",
+          resp2["status"] == "ok", f"got {resp2['status']}")
+
+    conn.send({"command": "shutdown"})
+    conn.close()
+
 def test_ipc_shutdown():
     print("\n=== T2.3: Graceful Shutdown ===")
     port = 15556
@@ -102,6 +141,7 @@ def test_ipc_shutdown():
 if __name__ == "__main__":
     test_ipc_roundtrip()
     test_ipc_message_format()
+    test_ipc_state_history_field()
     test_ipc_shutdown()
     print(f"\n=== Results: {PASS} passed, {FAIL} failed ===")
     sys.exit(1 if FAIL > 0 else 0)

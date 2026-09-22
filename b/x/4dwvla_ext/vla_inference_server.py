@@ -11,6 +11,22 @@ joint angles at each step, maintains a sliding-window keypoint history, and
 feeds ``observation.his_kpts`` / ``observation.his_len`` into the model —
 matching the training-time 3-path MoT architecture.
 
+修复 A (b/d/frk1/grperr_1.md R1, why the gripper never closed): training's
+``Extract3DKeypointTransformFn`` advances ``observation.his_len`` once per
+30 Hz dataset frame, i.e. once per *control step*. Because inference (and
+therefore ``FKKeypointComputer.step()``) only happens once every ``n_exec``
+control steps, the naive "call step() once per request" implementation made
+``his_len`` advance ``n_exec`` times slower than training -- at 700 control
+steps / n_exec=10 it only reached his_len=70, while the earliest gripper
+close in the demonstration data happens at his_len>=120. The client (see
+``franka_vla_client.py`` / ``state_history_buffer.py``) now reports every
+pose it actually executed since the previous inference in the optional
+``state_history`` request field; this server replays each of them through
+``FKKeypointComputer.step()`` before computing the keypoints for the current
+frame, so ``his_len`` advances at the correct (per control step) rate. Old
+clients that omit ``state_history`` still work (empty list is a no-op),
+just with the original (too slow) history rate.
+
 Usage (inside GPU container):
     source /opt/venv/4dwvla/bin/activate
     python /workspace/RLinf/b/x/4dwvla_ext/vla_inference_server.py \
@@ -384,9 +400,18 @@ def serve(args: argparse.Namespace):
                     logger.info("Client requested shutdown")
                     break
                 if msg.get("command") == "reset":
+                    # 修复 E: client now calls this on every env.reset(), so
+                    # an aborted episode's keypoint history / policy KV cache
+                    # does not leak into the next episode.
                     policy.reset()
                     if fk_computer is not None:
                         fk_computer.reset()
+                    logger.info(
+                        "[request %d] Reset command received: policy and "
+                        "keypoint history cleared",
+                        request_index,
+                    )
+                    request_index = 0
                     conn.send({"status": "ok", "actions": []})
                     continue
 
@@ -408,12 +433,24 @@ def serve(args: argparse.Namespace):
                 )
                 kpt_data = None
                 if fk_computer is not None:
-                    kpt_data = fk_computer.step(arm_q)
+                    executed_history = msg.get("state_history", ())
+                    proto = msg.get("protocol", 1)
+                    if proto >= 2:
+                        for executed_q in executed_history:
+                            fk_computer.append(np.asarray(executed_q, dtype=np.float32))
+                        kpt_data = fk_computer.snapshot()
+                    else:
+                        for executed_q in executed_history:
+                            fk_computer.step(np.asarray(executed_q, dtype=np.float32))
+                        kpt_data = fk_computer.step(arm_q)
                     logger.info(
-                        "[request %d] keypoints: history_shape=%s history_len=%s",
+                        "[request %d] keypoints: history_shape=%s history_len=%s "
+                        "(replayed %d executed poses, protocol=%d)",
                         request_index,
                         list(np.asarray(kpt_data[0]).shape),
                         kpt_data[1],
+                        len(executed_history),
+                        proto,
                     )
 
                 sample = build_sample(
@@ -435,6 +472,15 @@ def serve(args: argparse.Namespace):
 
                 if action_pred.ndim == 3:
                     action_pred = action_pred[0]
+
+                full_chunk = unnormalize_fn(
+                    {ACTION: action_pred[:, :actual_action_dim]}
+                )[ACTION]
+                full_grip = full_chunk.detach().float().cpu().numpy()[:, -1]
+                logger.info(
+                    "[request %d] full_chunk_grip=%s (executing first %d)",
+                    request_index, format_array(full_grip), n_exec,
+                )
 
                 normalized_action = action_pred[:n_exec, :actual_action_dim]
                 normalized_actions = normalized_action.detach().float().cpu().numpy()

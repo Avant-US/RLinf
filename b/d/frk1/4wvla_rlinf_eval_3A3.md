@@ -4175,7 +4175,7 @@ python /workspace/RLinf/b/x/4dwvla_ext/franka_vla_client.py \
     --max-steps 50 \
     --control-hz 5
 ```
-> 将 `<GLOBAL_SN>` 和 `<WRIST_SN>` 替换为步骤 1 查到的序列号. 例: `--global-camera-serial 420122070525 --wrist-camera-serial 250222073513`
+> 将 `<GLOBAL_SN>` 和 `<WRIST_SN>` 替换为步骤 1 查到的序列号. 例: `--global-camera-serial 250222073513 --wrist-camera-serial 420122070525`
 
 > **自动化替代方案 — `t8_test_runner.py`**:
 >
@@ -4771,11 +4771,11 @@ InternVLA-A1.5 config: OK
 # [GPU 容器内]
 source /opt/venv/4dwvla/bin/activate
 python /workspace/RLinf/b/x/4dwvla_ext/vla_inference_server.py \
-    --ckpt-path /home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp010420 \
+    --ckpt-path /home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp041680 \
     --schema-path /workspace/4WVLA/b/s/Frk/cfg/franka_plug.yaml \
     --kpt-meta-path /workspace/RLinf/b/d/frk1/plug/keypoints_meta.json \
     --urdf-path /workspace/RLinf/b/d/frk1/fr3v2_1_franka_hand.urdf \
-    --n-exec 10 --dtype bfloat16
+    --n-exec 5 --dtype bfloat16
 ```
 
 等待看到 `Inference server listening on port 5555` 后, **不要关闭此终端**.
@@ -4853,8 +4853,8 @@ python /workspace/RLinf/b/x/4dwvla_ext/franka_vla_client.py \
     --use-realsense \
     --global-camera-serial 250222073513 \
     --wrist-camera-serial 420122070525 \
-    --max-steps 30 \
-    --control-hz 5
+    --max-steps 800 \
+    --control-hz 30
 ```
 
 **观察**:

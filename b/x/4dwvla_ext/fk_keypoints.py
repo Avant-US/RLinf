@@ -75,11 +75,22 @@ class FKKeypointComputer:
 
         return kpts
 
-    def step(self, arm_q7: np.ndarray) -> tuple[np.ndarray, int]:
-        """Compute keypoints, append to history, return (his_kpts, his_len)."""
-        kpt = self.compute(arm_q7)
-        self._history.append(kpt)
+    def append(self, arm_q7: np.ndarray) -> int:
+        """Record a frame into history without treating it as the current frame."""
+        self._history.append(self.compute(arm_q7))
+        return len(self._history)
+
+    def snapshot(self) -> tuple[np.ndarray, int]:
+        """Pack history as-is: training's his_kpts excludes the current frame."""
         return self._pack()
+
+    def step(self, arm_q7: np.ndarray) -> tuple[np.ndarray, int]:
+        """Compute keypoints, append to history, return (his_kpts, his_len).
+
+        Backward-compatible: combines append + snapshot.
+        """
+        self.append(arm_q7)
+        return self.snapshot()
 
     def reset(self) -> None:
         """Clear the history buffer (call at episode start)."""

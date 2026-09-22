@@ -19,12 +19,23 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-# Import safety constants from franky_ext (Ray-free)
-sys.path.insert(0, os.environ.get("RLINF_EXT_PATH", "/workspace/RLinf/b/x"))
+# franky_ext is Ray-free; FrankaLibfrankaGripper still imports rlinf.BaseGripper.
+_EXT_PATH = os.environ.get("RLINF_EXT_PATH", "/workspace/RLinf/b/x")
+_REPO_PATH = os.environ.get("REPO_PATH", str(Path(_EXT_PATH).resolve().parent))
+for _p in (_EXT_PATH, _REPO_PATH):
+    if _p and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# Cube-place placeholder. A ~15 mm charger body is outside 0.046 ± 0.012.
+_PLACEHOLDER_CUBE_WIDTH_M = "0.046"
+_PLUG_WIDTH_M = "0.010"
+_PLUG_HOLD_TOL_M = "0.008"
+_PLUG_GRASP_FORCE_N = "20"
 
 from franky_ext.motion_limits import (
     GUARD_MARGIN_M_DEFAULT,
@@ -45,6 +56,41 @@ from franky_ext.motion_limits import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_plug_gripper_env() -> None:
+    """Pin the InternVLA plug-eval grasp window unless the operator already set one.
+
+    RLiKx ``setup_franky.sh`` uses ``FRANKA_CUBE_WIDTH_M=0.015``. Hold tolerance
+    is 10 mm so an empty hand at ~0 m is *not* counted as holding (0.015 ± 0.015
+    would include empty-closed).
+
+    修复 D (b/d/frk1/grperr_1.md R4/§4 修复 D): this window has NOT been
+    verified against the real plug. Demonstration data closes to <1mm width
+    87% of the time (mean 2.6mm); if the real robot does the same,
+    ``FrankaLibfrankaGripper.close()``/``gripper_holding()`` will silently
+    treat every real grasp as a miss. Override ``FRANKA_CUBE_WIDTH_M`` /
+    ``FRANKA_HOLD_TOL_M`` (e.g. via
+    ``configs/franka_plug_eval.env``) once the plug has been measured with
+    calipers -- do not just trust these defaults.
+    """
+    os.environ.setdefault("FRANKA_GRASP_FORCE", _PLUG_GRASP_FORCE_N)
+    current_w = os.environ.get("FRANKA_CUBE_WIDTH_M")
+    if current_w is None or current_w.strip() in ("", _PLACEHOLDER_CUBE_WIDTH_M):
+        os.environ["FRANKA_CUBE_WIDTH_M"] = _PLUG_WIDTH_M
+        logger.info(
+            "plug eval: FRANKA_CUBE_WIDTH_M=%s (replaced unset/placeholder 0.046)",
+            _PLUG_WIDTH_M,
+        )
+    os.environ.setdefault("FRANKA_HOLD_TOL_M", _PLUG_HOLD_TOL_M)
+    logger.info(
+        "plug eval grasp window: FRANKA_CUBE_WIDTH_M=%s +/- FRANKA_HOLD_TOL_M=%s "
+        "(UNVERIFIED against the real plug -- see grperr_1.md R4 before "
+        "trusting close()/gripper_holding() results; override via "
+        "configs/franka_plug_eval.env)",
+        os.environ["FRANKA_CUBE_WIDTH_M"], os.environ["FRANKA_HOLD_TOL_M"],
+    )
+
 
 # FR3v2.1 joint limits (from rlinf.envs.realworld.franka.franky_controller)
 JOINT_LIMITS_LOWER = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
@@ -76,7 +122,10 @@ class FrankyControllerDirect:
         self._robot.relative_dynamics_factor = 0.2
 
         if gripper_type == "franka":
-            self._gripper = franky.Gripper(robot_ip)
+            _ensure_plug_gripper_env()
+            from franky_ext.franka_libfranka_gripper import FrankaLibfrankaGripper
+
+            self._gripper = FrankaLibfrankaGripper(robot_ip)
         else:
             self._gripper = None
 
@@ -302,7 +351,7 @@ class FrankyControllerDirect:
         q = np.array(state.q[:7], dtype=np.float64)
         dq = np.array(state.dq[:7], dtype=np.float64)
         tcp_xyz = np.array(state.O_T_EE.translation)
-        gw = float(self._gripper.width) if self._gripper else None
+        gw = self.gripper_width()
         return {"arm_joint_position": q, "arm_joint_velocity": dq,
                 "tcp_position": tcp_xyz, "gripper_width": gw}
 
@@ -326,16 +375,75 @@ class FrankyControllerDirect:
         self._robot.relative_dynamics_factor = saved
 
     def open_gripper(self):
-        if self._gripper:
-            self._gripper.move(width=0.08, speed=0.05)
+        if self._gripper is None:
+            return
+        self._gripper.open(speed=0.05)
 
     def close_gripper(self, force: float = 20.0):
-        if self._gripper:
-            self._gripper.grasp(width=0.0, speed=0.05, force=force,
-                                epsilon_inner=0.05, epsilon_outer=0.05)
+        """Calibrated-width grasp via FrankaLibfrankaGripper.
+
+        Skip-if-holding, 6 s timeout, and 20 N hold force live in that class.
+        A miss (empty hand, wrong object size) is logged rather than aborting
+        the VLA episode — the policy often commands close before contact.
+        A hung hand (timeout) still raises.
+        """
+        if self._gripper is None:
+            return
+        try:
+            self._gripper.close(speed=0.05, force=force)
+        except RuntimeError as exc:
+            if "did not finish" in str(exc):
+                raise
+            logger.warning("close_gripper: %s", exc)
+        except Exception as exc:
+            logger.warning("close_gripper failed: %s", exc)
 
     def gripper_width(self) -> Optional[float]:
-        return float(self._gripper.width) if self._gripper else None
+        if self._gripper is None:
+            return None
+        try:
+            return float(self._gripper.position)
+        except Exception:
+            inner = getattr(self._gripper, "_gripper", None)
+            if inner is None:
+                return None
+            return float(inner.width)
+
+    def gripper_move_width_m(self, width_m: float, speed: float = 0.05) -> None:
+        if self._gripper is None:
+            return
+        fn = getattr(self._gripper, "move_width_m", None)
+        if not callable(fn):
+            raise RuntimeError("gripper does not support move_width_m()")
+        fn(width_m, speed)
+
+    def gripper_max_width(self) -> Optional[float]:
+        """Width the hand reports as fully open, in libfranka's own units.
+
+        This can differ from the caliper-measured finger gap when the hand's
+        homing offset is stale; callers must clamp commands to this value, not
+        to the physical measurement (see grperr_1.2.md Q1).
+        """
+        if self._gripper is None:
+            return None
+        try:
+            value = getattr(self._gripper, "max_width", None)
+            return None if value is None else float(value)
+        except Exception:
+            return None
+
+    def gripper_is_open(self) -> bool:
+        if self._gripper is None:
+            return True
+        return bool(getattr(self._gripper, "is_open", True))
+
+    def gripper_holding(self) -> bool:
+        if self._gripper is None:
+            return False
+        fn = getattr(self._gripper, "_hardware_holding", None)
+        if callable(fn):
+            return bool(fn())
+        return False
 
     def stop(self):
         try:
@@ -361,4 +469,7 @@ class FrankyControllerDirect:
     def cleanup(self):
         self._stop_watchdog()
         self.freeze_at_current()
+        gripper_cleanup = getattr(self._gripper, "cleanup", None)
+        if callable(gripper_cleanup):
+            gripper_cleanup()
         logger.info("FrankyControllerDirect cleanup complete")

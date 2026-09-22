@@ -99,3 +99,30 @@ hf download --token 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 --cache-dir /home/nvid
 @RLmm/b/d/frk1/4wvla_rlinf_eval_3A3.md 也一样的, 每一个涉及具体实现和操作的章节都要写详细点, 要写得别人一看就知道要怎么一步一步操作, 要细化到代码, 脚本或命令行怎么写, 测试结果怎么获取和判断, 别他妈就给我几句话. 请结合当前 @RLmm/ 和 @4WVLA/ 的代码, 以及相关的`*LOG.md`文件, 要结合本机的软硬件环境, 结合实际用到的数据与checkpoint, 也要把 @RLmm/b/d/rltx/4dwvla_rlt1_2.markdown 中在容器方面的改动也整合进来. OK, 按照我的意思把 `4wvla_rlinf_eval_3A3.markdown` 中类似这样的问题全给我改掉. 而且文档要完整, 要自包含.
 
 对 `b/d/rltx/4dwvla_rlt2_1.markdown` 进行细化和改良, 要求每一个涉及具体实现和操作的地方都要写详细点, 要写得别人一看就知道要怎么一步一步操作, 要细化到代码, 脚本或命令行怎么写, 运行结果和测试结果怎么获取和做结果评估. 写的时候结合当前 @RLmm/ 和 @4WVLA/ 的代码, 以及相关的`*LOG.md`文件, 要结合本机的软硬件环境, 结合实际用到的数据与checkpoint. 参考 @RLmm/b/d/rltx/4dwvla_rlt1_2.markdown 和 @RLmm/b/d/frk1/4wvla_rlinf_eval_3A3.md 中对容器的修改和使用, 尽量做到容器复用和相关的脚本代码复用. 因为`b/d/rltx/4dwvla_rlt2_1.markdown`是 RLT Stage 2 的实施落地方案, 因此参考 RLT Stage 1 训练的实施方案 `b/d/rltx/4dwvla_rlt1_2.markdown`以正确获取VLA权重和 RL Token, 以及其它 Stage 2 所需要的输入. 同时要加入关于如何在 RLT Stage 2 中进行操作的操作手册, 要一步一步细化到让对不了解相关知识的第三方工程师也知道怎么照着操作手册去做, 细化到代码脚本命令行怎么写, 细化到什么角色的人, 容器, 系统模块在什么时候该做些什么. 别忘了加入覆盖面广的测试与验收脚本, 以及这些测试的详细操作. 而且文档要完整, 要自包含. 按我的要求. 对 @RLmm/b/d/rltx/4dwvla_rlt2_1.markdown 进行细化和改良吧.
+
+
+
+对于"夹爪不闭合"的问题的分析与解决方案已写入 @RLmm/b/d/frk1/grperr_1.2.md 。
+
+综合的结果
+老解决方案 `grperr_1.1.md` 中 1.1节 的主因判定我认为是对的，证据链闭合：策略已站在插头上方，给出的是与"开口 66.4 mm"匹配的示教动作，而评测在等 0.5——这构成动力学吸收态。我在此之上做了三处实质性改动。
+
+一、把方案核心从"降低阈值"换成"宽度增量判据"。 1.1 建议把门限从 0.5 降到 0.18，方向对但这个数不可标定：在 66.4 mm 满开下，"保持张开"这个命令本身就是 $a_{\text{hold}}=0.170$，0.18 只比它高 0.010，噪声就会误触发；而一旦硬件满开恢复到示教的 79.4 mm，$a_{\text{hold}}$ 掉到 0.0075，0.18 就等价于"要求 13.8 mm 的收拢才触发"，从过敏直接翻成几乎不可能触发。改用 $\Delta w = w_{\text{meas}} - 0.08(1-a)$，两边用同一把尺，硬件满开偏差被完整解耦，换硬件不用重标定。
+
+这个换算还顺带推翻了一个偏悲观的表述：真机峰值 0.227 对应 $\Delta w = +4.6$ mm，是一个明确的收拢命令，比示教斜坡里任何单帧的 1.75 mm 都大 2.6 倍。不是"策略差一点点不够自信"，而是它一直在喊收拢、执行器翻译成了"什么都不做"。据此可以给出可验收的定量预期：闭环接上后约 7 步能从 66.4 收到 38 mm，13–20 步接近闭合。
+
+二、补了两个会让 1.1 方案失效的前置缺陷。 _get_observation() 里 g = state["gripper_width"] or 0.04，Python 的 0.0 是假值，所以完全闭合会被上报成 0.04 m——恰好在斜坡终点切断 1.1 实验 2 所依赖的宽度反馈。另外修复 A 之后 his_len 仍不等于训练语义：训练是"严格早于当前帧"的 $\min(t,200)$，评测把当前帧算进历史且每周期重复计数一格，真机日志 1→12→23 而非 0→10→20，快约 10%。所以 1.1 §4.5 那句"格数对了、只有格间距还错"只说对了后半句。
+
+三、修正了 q7 的裁剪建议。 1.1 实验 5 想把下限从 0.4343 抬到 0.4843，但那个数来自观测分布，而安全层裁的是动作；训练 action.arm[6] 实际低到 0.3695（$q_{01}=0.4258$），抬到 0.4843 会裁掉约 10% 的训练动作分布，方向上是更不像训练。这里有真实的目标冲突（动作保真 vs 状态保真），我把它拆成 L2a 裁剪 + L2b 只告警，并作为开放问题 Q4 留给实验定。
+
+结构
+实施分四阶段：阶段 0 全部零风险离线（含三项 bug 修复、全 chunk 日志、FK 与数据集逐帧对齐校验、示教回放 A/B 台架、分布监控模块）；阶段 1 是两次卡尺测量；阶段 2 才是执行语义（连续宽度为主、$\Delta w$ 二值为备，由实测延迟决定）；阶段 3/4 是 chunk 长度和运动特征。配置全部收敛到 franka_plug_eval.env，并明确列出哪些值来自 checkpoint、不该提供覆盖入口。
+
+§8 列了 8 个待实验问题，其中 Q1（满开为什么差 13 mm）、Q2（move_width_m 延迟是否允许逐步控制）、Q5（闭合落在 chunk 哪一段）是卡点——三者都能在一天内做完，且都不需要机械臂运动。
+
+现在请根据`grperr_1.2.md`的指示,做出修改, 并进行测试和验收。过程中若遇到error就fix, 直到所有测试和验收都通过. 记录所有训练过程中的一切细节, 包括但不限于:所有的error及其根因分析, fix方案, 记录所有的操作, 命令, 关键路径和任何文件的增删改以及做这些操作的原因, 过程中的一切细节都记录在 @RLmm/b/d/frk1/grperr_1.2LOG.md 后面. 
+
+
+
+
+我按照你的 @RLmm/b/d/frk1/grperr_1.2.md 对代码做了修改, 然后在`rlinf-4dwvla-gpu`容器内执行了`python /workspace/RLinf/b/x/4dwvla_ext/vla_inference_server.py     --ckpt-path /home/nvidia/ckpts/4wvlaFrk/plug/4wvlaFrkPlugCkp041680     --schema-path /workspace/4WVLA/b/s/Frk/cfg/franka_plug.yaml     --kpt-meta-path /workspace/RLinf/b/d/frk1/plug/keypoints_meta.json     --urdf-path /workspace/RLinf/b/d/frk1/fr3v2_1_franka_hand.urdf     --n-exec 5 --dtype bfloat16` , 在`rlinf-4dwvla-franky`容器内执行了`python /workspace/RLinf/b/x/4dwvla_ext/franka_vla_client.py     --robot-ip 172.16.0.2     --task "plug into socket"     --use-realsense     --global-camera-serial 250222073513     --wrist-camera-serial 420122070525     --max-steps 600     --control-hz 30`, 怎么效果比之前还差?!! Franka机器臂一直在抖, 夹爪一直下不到放插头的地方.

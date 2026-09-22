@@ -91,7 +91,37 @@ Reflex 或 Desk 急停通常仍应先由人工在 Desk 中处理。脚本会检�
 
    输入 `WRITE_HOME` 后，原文件会先备份为 `home_pose.json.bak`。
 
-之后使用普通 `--execute` 时，脚本会读取新的
-`home_pose.json`。如果训练/评测代码也要使用新 HOME，还必须同步更新
-`b/x/4dwvla_ext/franky_joint_env.py` 中的 `HOME_JOINTS`；否则脚本和评测
-环境会各自使用不同的 home。
+之后使用普通 `--execute` 时，脚本会读取新的 `home_pose.json`。评测环境
+`b/x/4dwvla_ext/franky_joint_env.py` 已改为通过 `home_pose.load_home_joints()`
+读取同一个文件，所以不需要再在别处同步关节角。
+
+## 夹爪 homing 标定
+
+`gripper_homing.py` 检查、并在确认后重跑 Franka Hand 的 homing。它解决的是
+**报告宽度与物理宽度不一致**的问题：libfranka 报告的 `max_width` 来自上一次
+homing，本工位上它报告 66.4 mm，而卡尺实测张开为 80 mm。这 13.6 mm 偏差会整体
+平移夹爪通道，因为训练用的映射是 $a = 1 - w / 0.08$：真实张开 79 mm 时"保持张开"
+对应 $a = 0.008$，而按 66.4 mm 报告则变成 $a = 0.170$。详见
+`b/d/frk1/grperr_1.2.md` Q1。
+
+默认只读：
+
+```bash
+# 只读，打印报告宽度、当前宽度，以及与示教数据的差异
+python b/x/franky_ext/dsplug/gripper_homing.py --robot-ip 172.16.0.2
+
+# 确认手指之间无异物、未夹持后重跑 homing（输入 HOME_GRIPPER 确认）
+python b/x/franky_ext/dsplug/gripper_homing.py --robot-ip 172.16.0.2 --execute
+```
+
+homing 会让手指走完整行程，因此手指之间不能有插头或任何物体；脚本在检测到
+`holding` 时会直接拒绝执行。输出 `RESULT DSPLUG_GRIPPER_INSPECT PASS` 或
+`RESULT DSPLUG_GRIPPER_HOMING PASS`。
+
+**homing 之后必须同步配置。** `FRANKA_GRIPPER_MAX_WIDTH_M` 的语义是
+"libfranka 报告的宽度"，不是卡尺实测的手指间距。把实测值填进去会让钳位失效，
+这正是 2026-09-18 那次机械臂抖动的直接原因。脚本结束时会打印应当写入
+`b/x/4dwvla_ext/configs/franka_plug_eval.env` 的数值。运行时环境还会再取一次
+`min(配置值, 硬件报告值)`，所以配置填大了不会重现该故障，但**填小了会限制夹爪
+的最大张开**——homing 成功把报告值恢复到 ~0.079 后若忘记更新配置，夹爪将永远
+打不开到位。

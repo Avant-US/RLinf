@@ -258,6 +258,11 @@ class FrankaLibfrankaGripper(BaseGripper):
             )
         self._is_open_flag = False
 
+    def move_width_m(self, width_m: float, speed: float = 0.05) -> None:
+        """Position-control fingers to a width in meters."""
+        w = max(0.0, min(float(width_m), _MAX_WIDTH_M))
+        self._call("move_width", self._gripper.move, w, _close_speed_m_s(speed))
+
     def move(self, position: float, speed: float = 0.3) -> None:
         """Move to a width given as ``BaseGripper``'s 0-255 integer.
 
@@ -304,6 +309,30 @@ class FrankaLibfrankaGripper(BaseGripper):
     @property
     def position(self) -> float:
         return float(self._gripper.width)
+
+    @property
+    def max_width(self) -> float | None:
+        """Full-open width as libfranka reports it, or None if unavailable.
+
+        Established by the hand's last homing, so it can drift away from the
+        physically measured finger gap. Command clamps must use this value.
+        """
+        try:
+            value = getattr(self._gripper, "max_width", None)
+            return None if value is None else float(value)
+        except Exception:
+            return None
+
+    def homing(self) -> float | None:
+        """Re-run the hand's homing routine and return the new reported max width.
+
+        Blocking, and the fingers traverse their whole range: nothing may be
+        between them and nothing may be held. Callers are responsible for
+        confirming that with the operator.
+        """
+        self._call("homing", self._gripper.homing)
+        self._is_open_flag = True
+        return self.max_width
 
     @property
     def is_open(self) -> bool:

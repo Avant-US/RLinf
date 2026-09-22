@@ -21,6 +21,7 @@ from franky_joint_env import (
     JOINT_LIMITS_LOWER, JOINT_LIMITS_UPPER,
     ACTION_LIMIT_LOWER, ACTION_LIMIT_UPPER,
     MAX_JOINT_STEP_RAD, HOME_JOINTS,
+    TRAIN_ARM_MIN, TRAIN_ARM_MAX, SAFETY_MARGIN_RAD, TRAIN_EDGE_WARN_RAD,
 )
 
 PASS = 0
@@ -154,6 +155,68 @@ def test_home_joints_in_bounds():
     check("HOME has 7 joints", HOME_JOINTS.shape == (7,))
 
 
+def test_q7_has_no_training_margin():
+    """Regression: q7 must not be allowed outside the demonstrated range.
+
+    The 600-step run of 2026-09-18 stalled with q7 = 0.4579, which is 0.026 rad
+    below TRAIN_ARM_MIN[6] and therefore legal under the old 0.05 rad margin.
+    Sweeping q7 against the checkpoint (tests/diag_pose_attractor.py) put the
+    sign flip of the predicted action direction exactly at the training bound,
+    so that margin permitted the whole inverted region. q7 now gets none.
+    """
+    print("\n=== T3.8: q7 Training Margin (2026-09-18 stall regression) ===")
+
+    check("q7 margin is zero", SAFETY_MARGIN_RAD[6] == 0.0,
+          f"margin={SAFETY_MARGIN_RAD[6]}")
+    check("q7 action bound equals the training bound",
+          abs(ACTION_LIMIT_LOWER[6] - TRAIN_ARM_MIN[6]) < 1e-9,
+          f"bound={ACTION_LIMIT_LOWER[6]}, train_min={TRAIN_ARM_MIN[6]}")
+
+    # The exact pose the arm stalled in must now be clipped back into range.
+    stall = np.array([-0.3650, 0.0435, 0.2047, -1.8977, -0.1036, 2.0165, 0.4579])
+    clipped, warnings = check_action_safety(stall, stall, 0)
+    check("the stalled q7 is clipped up to the training bound",
+          clipped[6] >= TRAIN_ARM_MIN[6] - 1e-9,
+          f"clipped q7={clipped[6]:.4f}, train_min={TRAIN_ARM_MIN[6]:.4f}")
+    check("clipping the stalled pose is reported as OUT-OF-TRAIN",
+          any("OUT-OF-TRAIN" in w for w in warnings),
+          f"warnings={warnings}")
+    # q1 = -0.3650 is inside the full training set's range; only the local
+    # 8-episode subset is narrower, so it must not be clipped.
+    check("q1 of the stalled pose is left alone",
+          abs(clipped[0] - stall[0]) < 1e-9,
+          f"clipped q1={clipped[0]:.4f} vs {stall[0]:.4f}")
+
+    # Sitting just inside the bound is legal but reported.
+    edge = HOME_JOINTS.copy()
+    edge[6] = TRAIN_ARM_MIN[6] + 0.5 * TRAIN_EDGE_WARN_RAD[6]
+    clipped, warnings = check_action_safety(edge, edge, 1)
+    check("q7 just inside the bound is not clipped",
+          abs(clipped[6] - edge[6]) < 1e-9,
+          f"clipped q7={clipped[6]:.4f} vs {edge[6]:.4f}")
+    check("q7 just inside the bound raises TRAIN-EDGE",
+          any("TRAIN-EDGE" in w for w in warnings),
+          f"warnings={warnings}")
+
+    mid = HOME_JOINTS.copy()
+    _clipped, warnings = check_action_safety(mid, mid, 2)
+    check("HOME raises no TRAIN-EDGE warning",
+          not any("TRAIN-EDGE" in w for w in warnings),
+          f"warnings={warnings}")
+    check("HOME q7 is at least the edge threshold inside the bound",
+          HOME_JOINTS[6] - TRAIN_ARM_MIN[6] >= TRAIN_EDGE_WARN_RAD[6],
+          f"gap={HOME_JOINTS[6] - TRAIN_ARM_MIN[6]:.4f}")
+
+    # The other six joints keep their margins, so this change cannot have
+    # narrowed the reachable set anywhere else.
+    for i in range(6):
+        check(f"q{i+1} margin unchanged at 0.15", SAFETY_MARGIN_RAD[i] == 0.15,
+              f"margin={SAFETY_MARGIN_RAD[i]}")
+    check("upper bounds are unchanged for q1-q6",
+          np.allclose(ACTION_LIMIT_UPPER[:6],
+                      np.minimum(TRAIN_ARM_MAX[:6] + 0.15, JOINT_LIMITS_UPPER[:6])))
+
+
 def test_motion_guard_tripped_exception():
     """MotionGuardTripped is a RuntimeError subclass."""
     print("\n=== T3.7: MotionGuardTripped Exception ===")
@@ -173,6 +236,7 @@ if __name__ == "__main__":
     test_franky_joint_env_dummy()
     test_action_space_bounds()
     test_home_joints_in_bounds()
+    test_q7_has_no_training_margin()
     test_motion_guard_tripped_exception()
     print(f"\n=== Results: {PASS} passed, {FAIL} failed ===")
     sys.exit(1 if FAIL > 0 else 0)
