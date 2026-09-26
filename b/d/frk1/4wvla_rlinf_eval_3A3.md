@@ -5416,3 +5416,757 @@ pgrep -af franka_vla_client
 | Franky 容器启动 | `RLmm/b/x/4dwvla_ext/configs/docker_run_4dwvla_franky.sh` |
 
 离线 alias 测试与 `bash -n setup_container_input.sh` 已通过。每次真机评估以脚本打印 `[setup-input] OK` 为准，再进入 Level 1。
+
+---
+
+## 19. Client-Server 交互深入分析
+
+> **版本**: v19.1 | **日期**: 2026-09-26
+> **适用范围**: 深入分析 `franka_vla_client.py` (Franky 容器) 与 `vla_inference_server.py` (GPU 容器) 之间的 IPC 交互机制、各自的输入输出、数据处理细节、以及它们所依赖的全部代码的调用关系.
+
+### 19.1 系统全景: 双容器 IPC 架构
+
+Client 与 Server 运行在两个独立的 Docker 容器中, 通过 Python 标准库 `multiprocessing.connection` 在 `localhost:5555` 上建立经认证的 TCP 连接. 这是一个典型的 **请求-响应** 模式: Client 发送观测数据, Server 返回动作序列.
+
+```mermaid
+sequenceDiagram
+    participant Op as 操作员 (键盘)
+    participant KW as KeyboardVLAEvalWrapper
+    participant Env as FrankyJointEnv
+    participant Ctrl as VLAEvalController
+    participant IPC as TCP:5555 (multiprocessing.connection)
+    participant Srv as vla_inference_server
+    participant Model as InternVLAA15Policy
+    participant FK as FKKeypointComputer
+
+    Note over KW, Env: Franky 容器 (CPU, franky-0.19.0)
+    Note over Srv, FK: GPU 容器 (CUDA, RTX 5090 D)
+
+    Op ->> KW: 按 'a' 启动 rollout
+    KW ->> Env: reset()
+    Ctrl ->> IPC: {"command": "reset"}
+    IPC ->> Srv: 重置 policy + FK 历史
+    Srv -->> IPC: {"status": "ok"}
+
+    loop 每 n_exec 步请求一次推理
+        Ctrl ->> Env: get_camera_frames()
+        Env -->> Ctrl: {"global": img_480x640x3, "wrist": img_480x640x3}
+        Ctrl ->> IPC: {images, state, state_history, task, protocol:2}
+        IPC ->> Srv: 解析请求
+        Srv ->> FK: replay executed_history + snapshot()
+        FK -->> Srv: (his_kpts [H,8,7], his_len)
+        Srv ->> Srv: build_sample() → input_transforms() → to_batch()
+        Srv ->> Model: predict_action_chunk(batch)
+        Model -->> Srv: action_pred [1, 50, 32]
+        Srv ->> Srv: unnormalize → 截取前 n_exec 个 → tolist()
+        Srv -->> IPC: {"status": "ok", "actions": [[8D]×n_exec]}
+        IPC -->> Ctrl: actions
+
+        loop 逐个执行 n_exec 个 action
+            Ctrl ->> Ctrl: state_history.record(state_before[:7])
+            Ctrl ->> Env: step(action_8D)
+            Env ->> Env: check_action_safety (L1-L3)
+            Env ->> Env: move_joints + gripper_command
+            Env -->> Ctrl: (obs, reward, terminated, truncated, info)
+        end
+    end
+
+    Op ->> KW: 按 'c' (成功) / 'b' (失败) / 'r' (中止)
+```
+
+### 19.2 IPC 通信协议详解
+
+#### 19.2.1 连接层
+
+Client 和 Server 共用认证密钥 `AUTHKEY = b"4dwvla-eval"` (`franka_vla_client.py:55`, `vla_inference_server.py:88`). 底层使用 `multiprocessing.connection.Listener` / `Client`, 通过 `pickle` 自动序列化 Python 对象 (dict, list, numpy array).
+
+**Server 端 (Listener)**:
+```python
+# vla_inference_server.py:384
+listener = Listener(("0.0.0.0", 5555), authkey=AUTHKEY)
+conn = listener.accept()  # 阻塞等待连接
+```
+
+**Client 端 (Client)**:
+```python
+# franka_vla_client.py:96-97
+self._conn = Client((host, port), authkey=AUTHKEY)
+```
+
+每当一个新 Client 连接时, Server 重置 policy 的 KV cache 和 FK keypoint 历史 (`vla_inference_server.py:391-394`).
+
+#### 19.2.2 消息类型
+
+通信协议共 3 种消息类型:
+
+| 消息方向 | 类型 | 结构 | 用途 |
+|:---:|:---|:---|:---|
+| C→S | **推理请求** | `{images, state, state_history, task, protocol}` | 请求模型推理, 返回动作序列 |
+| C→S | **重置命令** | `{"command": "reset"}` | 修复 E: episode 边界清除 policy 状态 |
+| C→S | **关闭命令** | `{"command": "shutdown"}` | 断开连接 |
+
+#### 19.2.3 推理请求的完整字段
+
+Client 发送的推理请求 (`franka_vla_client.py:172-178`):
+
+```python
+{
+    "images": {
+        "global": np.ndarray,  # shape (480, 640, 3), dtype uint8
+        "wrist":  np.ndarray,  # shape (480, 640, 3), dtype uint8
+    },
+    "state": {
+        "arm":     [float × 7],  # 7 个关节角 (弧度)
+        "gripper": [float × 1],  # 夹爪宽度 (米)
+    },
+    "state_history": [[float × 7], ...],  # 自上次推理以来执行过的关节角序列
+    "task": "plug into socket",            # 任务描述文本
+    "protocol": 2,                         # 协议版本 (2 = append+snapshot)
+}
+```
+
+Server 返回的响应 (`vla_inference_server.py:507`):
+
+```python
+{
+    "status": "ok",
+    "actions": [[float × 8] × n_exec],  # n_exec 个绝对关节角+夹爪动作
+}
+```
+
+每个 action 是 8 维向量: `[q1, q2, q3, q4, q5, q6, q7, gripper]`, 其中前 7 维是绝对关节角 (弧度), 第 8 维是 [0, 1] 范围的归一化夹爪动作.
+
+### 19.3 Client 端详细分析
+
+#### 19.3.1 组件层次与调用关系
+
+```mermaid
+classDiagram
+    class main {
+        +main() : 入口函数
+    }
+    class VLAEvalController {
+        -_env : gym.Env
+        -_conn : Connection
+        -_action_queue : deque
+        -_state_history : ExecutedStateBuffer
+        -_step_count : int
+        +connect()
+        +disconnect()
+        +run()
+        -_request_inference(images, state) : list
+        -_reset_episode() : tuple
+        -_notify_server_reset()
+        -_track_control_interval()
+    }
+    class KeyboardVLAEvalWrapper {
+        -listener : KeyboardListener
+        -_running : bool
+        -_abort_requested : bool
+        +reset() : 阻塞等 'a' 键
+        +step(action) : 检查键盘事件
+    }
+    class FrankyJointEnv {
+        -_controller : FrankyControllerDirect
+        -_camera : dict~str, Pipeline~
+        +step(action_8D) : 安全检查 + 执行
+        +reset() : HOME 位 + 开夹爪
+        +get_camera_frames() : dict~str, ndarray~
+    }
+    class FrankyControllerDirect {
+        -_robot : franky.Robot
+        -_gripper : FrankaLibfrankaGripper
+        +move_joints(q7)
+        +open_gripper() / close_gripper()
+        +set_motion_guard(min, max)
+        +guard_tripped() : str | None
+    }
+    class ExecutedStateBuffer {
+        -_buffer : deque
+        +record(arm_q7)
+        +drain() : list
+        +clear()
+    }
+
+    main --> VLAEvalController
+    main --> KeyboardVLAEvalWrapper
+    main --> FrankyJointEnv
+    VLAEvalController --> KeyboardVLAEvalWrapper : _env
+    VLAEvalController --> ExecutedStateBuffer : _state_history
+    KeyboardVLAEvalWrapper --> FrankyJointEnv : env (Wrapper)
+    KeyboardVLAEvalWrapper --> KeyboardListener : listener
+    FrankyJointEnv --> FrankyControllerDirect : _controller
+    FrankyControllerDirect --> FrankaLibfrankaGripper : _gripper
+```
+
+#### 19.3.2 `main()` 启动流程
+
+`franka_vla_client.py:277-363` 的启动流程:
+
+1. **解析参数**: `--robot-ip`, `--task`, `--n-exec`, `--control-hz`, `--max-steps`, `--use-realsense`, `--global-camera-serial`, `--wrist-camera-serial`, `--server-host`, `--server-port`, `--dry-run`, `--log-dir`.
+2. **创建 FrankyJointEnv**: 连接 Franka 机器人 + 初始化 RealSense 相机.
+3. **包裹 KeyboardVLAEvalWrapper**: 仅在非 dry-run 模式下启用键盘控制 (按 `'a'` 才开始).
+4. **创建 VLAEvalController**: 持有 env 引用, 负责推理调度和动作执行.
+5. **连接 Server**: 通过 TCP 5555 建立 IPC 连接.
+6. **执行 `ctrl.run()`**: 进入主循环.
+
+Camera serial 的解析优先级 (`franka_vla_client.py:293-302`):
+- CLI `--global-camera-serial` / `--wrist-camera-serial` 优先
+- 环境变量 `$RS_GLOBAL_SERIAL` / `$RS_WRIST_SERIAL` 兜底
+- 无 serial 时 RealSense SDK 自动分配 (有交换风险)
+
+#### 19.3.3 `VLAEvalController.run()` 主循环
+
+核心循环 (`franka_vla_client.py:202-274`):
+
+```
+while step_count < max_steps and not abort:
+    if action_queue 为空:
+        1. 获取相机帧: env.get_camera_frames()
+        2. 获取当前状态: obs["state"]  (8D: 7关节+夹爪)
+        3. 发送推理请求: _request_inference(images, state)
+        4. 收到 actions, 放入 action_queue
+
+    从 action_queue 取出一个 action
+    记录 state_before 到 state_history
+    执行 env.step(action)
+    追踪控制频率
+    step_count++
+```
+
+**关键设计**: 推理不是每步都调用, 而是每 `n_exec` 步调用一次. 模型一次预测 `chunk_size=50` 个动作, 但只执行前 `n_exec=10` 个. 执行完后再请求下一批.
+
+#### 19.3.4 `_request_inference()` 数据准备
+
+`franka_vla_client.py:158-200`:
+
+1. **State 拆分**: `state_arr[:7]` 为 arm 关节角, `state_arr[7]` 为夹爪宽度.
+2. **History 收集**: `self._state_history.drain()` 返回自上次推理以来的所有中间关节角.
+3. **发送**: 将 images (numpy), state (dict of list), state_history (list of list), task (str) 打包发送.
+4. **接收验证**: 确认 `status == "ok"`, 验证 actions shape 为 `[N, 8]`, 确认无 NaN/Inf.
+
+#### 19.3.5 `ExecutedStateBuffer`: 修复 A 的核心机制
+
+`state_history_buffer.py` 实现了一个简单的 FIFO 缓冲区:
+
+```python
+class ExecutedStateBuffer:
+    def record(self, arm_q7):     # 每个 control step 调用
+        self._buffer.append([float(v) for v in arm_q7[:7]])
+
+    def drain(self):              # 每次推理前调用
+        drained = list(self._buffer)
+        self._buffer.clear()
+        return drained
+```
+
+**为什么需要它**: 训练时 `Extract3DKeypointTransformFn` 每 30 Hz 帧 (即每个 control step) 推进一次 `observation.his_len`. 但推理时只有每 `n_exec` 步才调用一次 `FKKeypointComputer`, 导致 `his_len` 推进速度慢了 `n_exec` 倍. Client 记录每个 control step 的关节角, Server 在收到推理请求时先将这些历史关节角逐一 replay 到 FK 计算器中, 使 `his_len` 以正确速率推进.
+
+#### 19.3.6 `FrankyJointEnv.step()`: 8 级安全层
+
+`franky_joint_env.py:372-521` 的 `step()` 执行流程:
+
+```
+输入: action = [q1,...,q7, gripper] (8D, 绝对值)
+        │
+        ├── L1: 硬件关节限位 clip (JOINT_LIMITS_LOWER/UPPER)
+        ├── L2: 训练范围 + margin clip (ACTION_LIMIT_LOWER/UPPER)
+        ├── L2b: 训练边缘警告 (TRAIN_EDGE_WARN_RAD)
+        ├── L3: 速度限制 (MAX_JOINT_STEP_RAD = 0.15 rad/step)
+        │
+        ├── L4-L5: Motion Guard trip 检查 (TCP fence, 关节速度)
+        │
+        ├── move_joints(clipped_arm)  ← 阻塞执行
+        │
+        ├── 夹爪控制 (3 种模式):
+        │     ├── binary_abs:   action_grip ≥ 0.5 → close
+        │     ├── binary_delta: delta_w 基于 hysteresis
+        │     └── continuous:   position-control ramp + force-grasp handoff
+        │
+        ├── sleep(1/control_hz)  ← 控制频率节流
+        │
+        └── 再次检查 Motion Guard
+输出: (obs, reward, terminated, truncated, info)
+```
+
+**Safety Margin 的非对称设计** (`franky_joint_env.py:88-89`):
+```python
+SAFETY_MARGIN_LOWER_RAD = np.array([0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.08])
+SAFETY_MARGIN_UPPER_RAD = np.array([0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.1])
+```
+q7 (wrist roll) 的 margin 特别窄: 下界 0.08 rad (防止漂出训练分布导致策略反转), 上界 0.1 rad (模型在插入阶段主动请求 q7≈1.04-1.05, 需要允许).
+
+#### 19.3.7 `KeyboardVLAEvalWrapper`: 人机交互层
+
+`keyboard_vla_eval.py` 包裹 `FrankyJointEnv`, 提供操作员控制:
+
+| 按键 | 功能 | 代码位置 |
+|:---:|:---|:---|
+| `a` | 启动 rollout (reset 后阻塞等待) | `keyboard_vla_eval.py:77-80` |
+| `r` | 中止 episode, 停止机器人, truncated=True | `keyboard_vla_eval.py:105-114` |
+| `b` | 标记失败, terminated=True, reward=0 | `keyboard_vla_eval.py:116-120` |
+| `c` | 标记成功, terminated=True, reward=1 | `keyboard_vla_eval.py:122-128` |
+| `h` | 回 HOME 位, 不结束 episode | `keyboard_vla_eval.py:130-141` |
+
+`reset()` 中的阻塞等待 (`keyboard_vla_eval.py:65-80`): 先让 env.reset() 完成 (机器人回 HOME), 然后进入循环每 50ms 轮询键盘, 直到操作员按 `'a'` 才返回. 这给操作员时间布置场景.
+
+### 19.4 Server 端详细分析
+
+#### 19.4.1 组件层次与调用关系
+
+```mermaid
+classDiagram
+    class serve {
+        +serve(args) : 主循环
+    }
+    class InternVLAA15Policy {
+        +predict_action_chunk(batch) : Tensor
+        +reset()
+        -model : InternVLAA15Model
+    }
+    class FKKeypointComputer {
+        -_chain : pk.Chain (URDF)
+        -_history : deque
+        +compute(arm_q7) : ndarray [8,7]
+        +append(arm_q7) : int
+        +snapshot() : tuple[ndarray, int]
+        +step(arm_q7) : tuple[ndarray, int]
+        +reset()
+    }
+    class TransformPipeline {
+        +input_transforms : CompositeTransform
+        +unnormalize_fn : UnNormalizeTransformFn
+    }
+    class DatasetSchema {
+        +robot_type : str
+        +feature_mapping : dict
+        +image_mapping : dict
+        +action_mask_spec : list
+    }
+
+    serve --> InternVLAA15Policy
+    serve --> FKKeypointComputer
+    serve --> TransformPipeline
+    serve --> DatasetSchema
+    TransformPipeline --> ResizeImagesWithPadFn
+    TransformPipeline --> RemapImageKeyTransformFn
+    TransformPipeline --> NormalizeTransformFn
+    TransformPipeline --> InternVLAA15ChatProcessorTransformFn
+    TransformPipeline --> PadStateAndActionTransformFn
+    TransformPipeline --> ReorderStateActionTransform
+    TransformPipeline --> UnNormalizeTransformFn
+```
+
+#### 19.4.2 `serve()` 初始化流程 (6 步)
+
+`vla_inference_server.py:323-385`:
+
+**Step 1 — Schema 注册** (`ensure_schema`, L327-329):
+```python
+schema = ensure_schema(Path(args.schema_path))
+```
+如果 `franka_plug` schema 已注册则直接返回, 否则从 YAML 文件加载或使用硬编码默认值. 默认 schema 定义了:
+- `feature_mapping`: `observation.state` = `[observation.state.arm, observation.state.gripper]`
+- `image_mapping`: `observation.images.global` → `observation.images.image0`, `observation.images.wrist` → `observation.images.image1`
+- `action_mask_spec`: `[7, -1]` (前 7 维 delta, 最后 1 维绝对)
+
+**Step 2 — Stats 加载** (`load_stats`, L333-348):
+从 `stats.json` 加载归一化统计量. 训练时 stats 按子字段存储 (`observation.state.arm`, `observation.state.gripper`), 推理时需要组合成完整的 `observation.state` 向量. `pick_or_compose()` (`vla_inference_server.py:149-152`) 优先查找组合键, 不存在时自动拼接子字段:
+```python
+# vla_inference_server.py:133-137
+composed["mean"] = np.concatenate([sub_stats_arm["mean"], sub_stats_gripper["mean"]])
+composed["std"]  = np.concatenate([sub_stats_arm["std"],  sub_stats_gripper["std"]])
+```
+
+**Step 3 — 模型加载** (`load_model`, L351):
+```python
+config = PreTrainedConfig.from_pretrained(ckpt_path)  # 从 config.json 重建 InternVLAA15Config
+config.action_loss_only = True                         # 不加载 WAN 视频分支
+config.inference_backend = "standard"                  # 有 keypoint 时必须用 standard
+policy = policy_cls.from_pretrained(ckpt_path, config=config)
+policy.to(device="cuda", dtype=bfloat16)
+policy.eval()
+```
+
+**Step 4 — Transform Pipeline 构建** (`build_transforms`, L354-357):
+
+输入变换链 (`vla_inference_server.py:194-217`), 6 个 transform 顺序执行:
+
+| # | Transform | 输入 → 输出 | 作用 |
+|:---:|:---|:---|:---|
+| 1 | `ResizeImagesWithPadFn` | `(H,W,3)` → `(224,224,3)` | 图像 resize + letterbox padding |
+| 2 | `RemapImageKeyTransformFn` | `images.global` → `images.image0` | 相机名映射到训练时的 canonical 名 |
+| 3 | `NormalizeTransformFn` | `observation.state` raw → normalized | 均值/标准差归一化 |
+| 4 | `InternVLAA15ChatProcessorTransformFn` | 多模态 → Qwen3.5 token | 图像+文本+状态编码为 VLM 输入 |
+| 5 | `PadStateAndActionTransformFn` | `(8D)` → `(32D)` | 零填充到 max_state_dim=32 |
+| 6 | `ReorderStateActionTransform` | 按 schema.state_reorder 重排 | 对齐训练时的维度顺序 |
+
+输出反归一化:
+```python
+unnormalize_fn = UnNormalizeTransformFn(selected_keys=[ACTION], mode="mean_std", norm_stats=action_stat)
+```
+
+**Step 5 — FK Keypoint 计算器** (`fk_keypoints.py`, L359-379):
+当 `config.enable_keypoint_predictor=True` 时, 创建 `FKKeypointComputer`:
+- 加载 URDF (`fr3v2_1_franka_hand.urdf`) 建立运动链
+- 加载 `keypoints_meta.json` 获取 keypoint 链接名、归一化 bbox_radius、维度
+- 初始化 sliding-window history 缓冲区 (默认 200 帧)
+
+**Step 6 — 开始监听** (L382-385):
+```python
+listener = Listener(("0.0.0.0", args.port), authkey=AUTHKEY)
+```
+
+#### 19.4.3 请求处理流程
+
+每收到一个推理请求 (`vla_inference_server.py:418-507`), Server 执行以下步骤:
+
+**Step A — 解析输入** (L420-433):
+```python
+arm_q = np.asarray(msg["state"]["arm"], dtype=np.float32)     # [7]
+gripper = np.asarray(msg["state"]["gripper"], dtype=np.float32) # [1]
+input_state = np.concatenate([arm_q, gripper])                  # [8]
+```
+
+**Step B — FK Keypoint 计算** (L434-454):
+
+根据 `protocol` 版本:
+- **Protocol 2** (当前): 对 `state_history` 中的每个关节角调用 `fk_computer.append()`, 然后调用 `fk_computer.snapshot()` 获取当前历史快照. `append()` 只入队不包含当前帧 (与训练语义一致: `his_kpts` 不含当前帧).
+- **Protocol 1** (旧): 对 `state_history` 和当前 `arm_q` 都调用 `fk_computer.step()`.
+
+```python
+# vla_inference_server.py:438-445 (Protocol 2)
+for executed_q in executed_history:
+    fk_computer.append(np.asarray(executed_q, dtype=np.float32))
+kpt_data = fk_computer.snapshot()
+# kpt_data = (his_kpts: ndarray [200, 8, 7], his_len: int)
+```
+
+`FKKeypointComputer.compute()` 的处理细节 (`fk_keypoints.py:58-76`):
+1. 构造全零关节角向量, 填入 7 个 arm 关节角
+2. 调用 `pytorch_kinematics` 做正运动学 (FK), 得到每个 link 的 4×4 齐次变换矩阵
+3. 提取位置 `pos = mat[:3, 3] / bbox_radius` (归一化)
+4. 提取四元数 `quat = Rotation.from_matrix(mat[:3,:3]).as_quat()` (xyzw, 半球归一化 qw≥0)
+5. 拼接为 `[px, py, pz, qx, qy, qz, qw]` × 8 个关键点
+
+**Step C — 构建 Sample** (`build_sample`, L456-465):
+```python
+sample = {
+    "observation.state":      torch.from_numpy([q1,...,q7, grip]),  # [8]
+    "action":                 torch.zeros(50, 8),                   # placeholder
+    "task":                   "plug into socket",
+    "observation.images.global": (img_tensor / 255.0).permute(2,0,1),  # [3,H,W]
+    "observation.images.wrist":  (img_tensor / 255.0).permute(2,0,1),
+    "observation.his_kpts":  torch.from_numpy(his_kpts),            # [200, 8, 7]
+    "observation.his_len":   torch.tensor(his_len),                 # scalar
+}
+```
+
+**Step D — Transform Pipeline** (L467-468):
+```python
+sample = input_transforms(sample)   # 6 步变换
+batch = to_batch(sample, device, dtype)  # unsqueeze(0) + to(cuda, bfloat16)
+```
+
+Transform 链的详细数据变化:
+
+1. **ResizeImagesWithPadFn**: `(480,640,3) → (224,224,3)`, letterbox padding 保持宽高比
+2. **RemapImageKeyTransformFn**: key 重命名 `images.global → images.image0`
+3. **NormalizeTransformFn**: `state = (state - mean) / std`, 使用 `stats.json` 中的统计量
+4. **InternVLAA15ChatProcessorTransformFn** (eval mode):
+   - 将 state 离散化为 256 bin 文本
+   - 构造 Qwen3.5 chat 格式: system + user (images + task + state) → `input_ids`, `attention_mask`, `pixel_values`, `image_grid_thw`
+   - `add_generation_prompt=True` (推理模式, 无 label)
+5. **PadStateAndActionTransformFn**: state `[8] → [32]` 零填充
+6. **ReorderStateActionTransform**: 按 schema 定义重排维度
+
+**Step E — 模型推理** (L470-471):
+```python
+with torch.no_grad():
+    action_pred = policy.predict_action_chunk(batch)
+# action_pred shape: [1, 50, 32] (batch=1, chunk_size=50, max_action_dim=32)
+```
+
+`predict_action_chunk` 内部 (`modeling_internvla_a1_5.py:2286-2309`):
+1. 从 batch 提取: `pixel_values`, `image_grid_thw`, `input_ids`, `attention_mask`, `fast_token_mask`, `state`, `his_kpts`, `his_len`
+2. 调用 `self.model.sample_actions(...)`: Qwen3.5 VLM forward → action expert → flow matching 采样
+3. 截断到 `original_action_dim` (8 维)
+
+**Step F — 反归一化 + 截取** (L476-488):
+```python
+# 对完整 chunk (50步) 反归一化, 用于日志
+full_chunk = unnormalize_fn({ACTION: action_pred[:, :actual_action_dim]})[ACTION]
+
+# 只取前 n_exec (10步) 反归一化后发送给 Client
+normalized_action = action_pred[:n_exec, :actual_action_dim]  # [10, 8]
+physical_action = unnormalize_fn({ACTION: normalized_action})[ACTION]
+actions = physical_action.detach().float().cpu().numpy()       # [10, 8]
+```
+
+反归一化公式 (mean_std 模式):
+$$a_{\text{physical}} = a_{\text{normalized}} \times \sigma_{\text{action}} + \mu_{\text{action}}$$
+
+其中 $\mu_{\text{action}}$ 和 $\sigma_{\text{action}}$ 来自 `stats.json` 中 `action` 字段的 `mean` 和 `std`, 均为 8 维向量.
+
+**Step G — 返回响应** (L507):
+```python
+conn.send({"status": "ok", "actions": actions.tolist()})
+```
+
+### 19.5 数据流全景: 从传感器到关节电机
+
+下图展示一次完整推理-执行周期中, 数据从原始传感器到关节电机的全部变换:
+
+```
+┌──────────────── Franky 容器 (Client) ────────────────┐
+│                                                       │
+│  RealSense 相机                Franka 关节编码器       │
+│  ┌──────────┐                  ┌──────────────┐       │
+│  │ RGB 帧   │                  │ q=[q1..q7]   │       │
+│  │ 480×640×3│                  │ grip_width   │       │
+│  │ uint8    │                  │ float64      │       │
+│  └────┬─────┘                  └──────┬───────┘       │
+│       │ get_camera_frames()           │ _get_observation()
+│       │                               │               │
+│       ▼                               ▼               │
+│  images: dict                  state: ndarray [8]     │
+│  {"global": np, "wrist": np}   [q1,...,q7, grip_w]    │
+│       │                               │               │
+│       │    ┌── state_history.drain() ──┘               │
+│       │    │   list[list[7 floats]]                    │
+│       ▼    ▼                                           │
+│  ═══ TCP pickle ═══════════════════════════════►       │
+│                                                        │
+└────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────── GPU 容器 (Server) ─────────────────────┐
+│                                                        │
+│  ┌─── FK Keypoint ───┐  ┌─── build_sample() ────────┐ │
+│  │ state_history →   │  │ images / 255.0 → CHW      │ │
+│  │ fk_computer       │  │ state → float32 concat    │ │
+│  │ .append() × N     │  │ his_kpts, his_len → torch │ │
+│  │ .snapshot()       │  │ action = zeros(50,8)      │ │
+│  │ → (his_kpts,      │  │ task = str                │ │
+│  │    his_len)       │  └──────────┬────────────────┘ │
+│  └───────────────────┘             │                   │
+│                                    ▼                   │
+│  ┌─── input_transforms (6 步) ─────────────────────┐  │
+│  │ 1. Resize 480×640 → 224×224 (letterbox pad)     │  │
+│  │ 2. RemapImageKey: global→image0, wrist→image1   │  │
+│  │ 3. Normalize state: (x - μ) / σ                 │  │
+│  │ 4. ChatProcessor: → input_ids, pixel_values...  │  │
+│  │ 5. PadState: [8] → [32]                         │  │
+│  │ 6. ReorderState: 按 schema 重排                  │  │
+│  └──────────────────────┬──────────────────────────┘  │
+│                         ▼                              │
+│  ┌─── to_batch() ──────────────┐                      │
+│  │ unsqueeze(0) → batch dim    │                      │
+│  │ .to(cuda, bfloat16)         │                      │
+│  └──────────────┬──────────────┘                      │
+│                 ▼                                      │
+│  ┌─── predict_action_chunk() ──────────────────────┐  │
+│  │ Qwen3.5 VLM → action expert → flow matching    │  │
+│  │ output: [1, 50, 32] normalized actions          │  │
+│  └──────────────┬──────────────────────────────────┘  │
+│                 ▼                                      │
+│  ┌─── unnormalize_fn ──────────┐                      │
+│  │ a_phys = a_norm × σ + μ    │                      │
+│  │ 截取前 n_exec=10 个         │                      │
+│  │ → [10, 8] float32          │                      │
+│  └──────────────┬──────────────┘                      │
+│                 │                                      │
+│  ═══ TCP pickle ◄══════════════════════                │
+│                                                        │
+└────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────── Franky 容器 (Client) ────────────────┐
+│                                                       │
+│  action_queue: 10 个 [8D] 动作                        │
+│       │                                               │
+│       │  逐个出队                                      │
+│       ▼                                               │
+│  ┌─── check_action_safety() ──────────────────────┐  │
+│  │ L1: clip to JOINT_LIMITS                       │  │
+│  │ L2: clip to TRAIN_RANGE ± SAFETY_MARGIN        │  │
+│  │ L3: velocity limit Δq < 0.15 rad/step          │  │
+│  └──────────────┬─────────────────────────────────┘  │
+│                 ▼                                     │
+│  ┌─── move_joints(clipped_arm) ───────────────────┐  │
+│  │ franky.JointWaypointMotion → Robot.move()      │  │
+│  │ (阻塞直到运动完成)                                │  │
+│  └──────────────┬─────────────────────────────────┘  │
+│                 ▼                                     │
+│  ┌─── gripper_command ────────────────────────────┐  │
+│  │ binary_abs: grip ≥ 0.5 → close                │  │
+│  │ binary_delta: delta_w + hysteresis             │  │
+│  │ continuous: position ramp + force handoff      │  │
+│  └────────────────────────────────────────────────┘  │
+│                                                       │
+│  state_history.record(state_before[:7])               │
+│  sleep(1/control_hz)                                  │
+│                                                       │
+└───────────────────────────────────────────────────────┘
+```
+
+### 19.6 Episode 生命周期与状态管理
+
+#### 19.6.1 Episode 开始
+
+```
+Client                              Server
+───────                             ──────
+KeyboardVLAEvalWrapper.reset()
+  → FrankyJointEnv.reset()
+    → open_gripper()
+    → reset_joint(HOME_JOINTS)
+    → open_gripper()
+  ← obs, info
+VLAEvalController._reset_episode()
+  → state_history.clear()
+  → _notify_server_reset()
+    → conn.send({"command": "reset"})  ──►  policy.reset()       # 清空 KV cache
+                                             fk_computer.reset()  # 清空 keypoint 历史
+                                        ◄──  {"status": "ok"}
+  → last_step_ts = None
+← obs, info
+
+KeyboardVLAEvalWrapper:
+  打印 "press 'a' to start"
+  轮询键盘...
+  操作员按 'a'
+← obs, info (返回给 VLAEvalController.run())
+```
+
+#### 19.6.2 Episode 中止 (按 'r')
+
+```
+KeyboardVLAEvalWrapper.step():
+  检测到 'r' 键
+  → ctrl.stop()  # 立即停止机器人运动
+  → truncated = True
+  → info["abort_reset"] = True
+
+VLAEvalController.run():
+  收到 truncated=True
+  → action_queue.clear()  # 丢弃未执行的动作
+  → 等待操作员按 Enter
+  → _reset_episode()      # 重新 HOME + 通知 Server reset
+```
+
+#### 19.6.3 Episode 正常结束 (按 'c'/'b')
+
+```
+KeyboardVLAEvalWrapper.step():
+  检测到 'c' → reward=1, terminated=True
+  检测到 'b' → reward=0, terminated=True
+  → _running = False
+
+VLAEvalController.run():
+  terminated=True 时循环不会继续 (但代码中实际没有检查 terminated,
+  而是由 step_count >= max_steps 或 abort 退出)
+```
+
+### 19.7 关键修复 (Fixes) 汇总
+
+以下修复在 Client-Server 交互中均有体现, 源自 `b/d/frk1/grperr_1.md`:
+
+| 修复 | 问题 | 实现位置 | 机制 |
+|:---:|:---|:---|:---|
+| **A** | `his_len` 推进速度慢 `n_exec` 倍, 导致夹爪永远不闭合 | Client: `state_history_buffer.py`, Server: `fk_keypoints.py` | Client 记录每步关节角, Server replay 到 FK 计算器 |
+| **B** | 控制频率不可观测, Robot.move() 阻塞导致实际 Hz 远低于请求 | Client: `_track_control_interval()` | 仅测量和警告, 不修改运动行为 |
+| **C** | q7 margin 太宽 (0.15 rad), 让关节漂出训练分布 | Client: `franky_joint_env.py` SAFETY_MARGIN | q7 下界 margin=0.08, 上界=0.1 |
+| **E** | 中止 episode 后 Server 侧的 policy KV cache / FK 历史泄漏到下一 episode | Client: `_notify_server_reset()`, Server: 处理 `{"command": "reset"}` | 每次 reset() 通知 Server 清除所有状态 |
+| **F** | Camera serial 硬编码, 每次启动需手动输入 | Client: `--global-camera-serial` 回退 `$RS_GLOBAL_SERIAL` | 环境变量兜底 |
+
+### 19.8 文件依赖关系总览
+
+```mermaid
+graph TD
+    subgraph "Franky 容器 (Client)"
+        FC[franka_vla_client.py] --> KW[keyboard_vla_eval.py]
+        FC --> FJE[franky_joint_env.py]
+        FC --> SHB[state_history_buffer.py]
+        FC --> VDL[vla_debug_logging.py]
+        KW --> KL[rlinf/.../keyboard_listener.py]
+        KW --> FJE
+        FJE --> FCD[franky_controller_direct.py]
+        FJE --> HP[franky_ext/dsplug/home_pose.py]
+        FJE --> ML[franky_ext/motion_limits.py]
+        FCD --> ML
+        FCD --> FLG[franky_ext/franka_libfranka_gripper.py]
+        FCD --> FK_LIB[franky Python binding]
+    end
+
+    subgraph "GPU 容器 (Server)"
+        VS[vla_inference_server.py] --> VDL2[vla_debug_logging.py]
+        VS --> FKK[fk_keypoints.py]
+        VS --> POL[InternVLAA15Policy]
+        VS --> TF[transforms/core.py]
+        VS --> TF2[transform_internvla_a1_5.py]
+        VS --> SCH[dataset_schemas/]
+        VS --> CFG[configs/policies.py]
+        VS --> FAC[policies/factory.py]
+        FKK --> PK[pytorch_kinematics]
+        FKK --> SP[scipy.spatial.transform]
+        POL --> QW[Qwen3.5 VLM backbone]
+        POL --> AE[Action Expert]
+        POL --> FM[Flow Matching sampler]
+    end
+
+    FC -.->|TCP 5555<br/>multiprocessing.connection| VS
+
+    style FC fill:#e6f3ff
+    style VS fill:#fff3e6
+```
+
+### 19.9 性能与延迟分析
+
+#### 19.9.1 一次推理请求的延迟分解
+
+| 阶段 | 估计耗时 | 瓶颈 |
+|:---|:---:|:---|
+| TCP 序列化 + 传输 (localhost) | ~1-5 ms | pickle 序列化两张 480×640 RGB 图 |
+| FK Keypoint 计算 (N=10 次 append) | ~5-10 ms | URDF FK + 四元数转换 |
+| build_sample + input_transforms | ~10-30 ms | 图像 resize + ChatProcessor tokenize |
+| `predict_action_chunk` (GPU) | ~50-200 ms | Qwen3.5 forward + flow matching 采样 |
+| unnormalize + TCP 返回 | ~1-3 ms | numpy + pickle |
+| **总计** | **~70-250 ms** | **GPU 模型推理** |
+
+Server 日志中可看到精确计时:
+```python
+# vla_inference_server.py:494
+t_ms = (time.perf_counter() - t0) * 1000
+```
+
+#### 19.9.2 控制循环频率
+
+Client 每个 control step 包含:
+1. `move_joints()` — 阻塞 (franky 发送 waypoint 给 libfranka, 等 1 kHz 控制器执行完)
+2. 夹爪命令 — 可能阻塞 (close_gripper 最长 6 秒超时)
+3. `sleep(1/control_hz)` — 固定等待 (control_hz=10 时 100ms)
+
+实际频率由 `_track_control_interval()` 测量 (`franka_vla_client.py:134-156`), 每 50 步打印一次. 如果实际 Hz < 请求 Hz 的 50%, 输出 WARNING.
+
+### 19.10 代码出处与引用索引
+
+| 代码文件 | 来源仓库 | 角色 |
+|:---|:---|:---|
+| `franka_vla_client.py` | RLmm/b/x/4dwvla_ext/ | Client 主程序 |
+| `vla_inference_server.py` | RLmm/b/x/4dwvla_ext/ | Server 主程序 |
+| `franky_joint_env.py` | RLmm/b/x/4dwvla_ext/ | Gym 环境 (8 级安全) |
+| `franky_controller_direct.py` | RLmm/b/x/4dwvla_ext/ | 安全控制器 (复用 FrankyControllerExtended 逻辑) |
+| `keyboard_vla_eval.py` | RLmm/b/x/4dwvla_ext/ | 键盘交互 wrapper |
+| `state_history_buffer.py` | RLmm/b/x/4dwvla_ext/ | 执行状态缓冲 (修复 A) |
+| `fk_keypoints.py` | RLmm/b/x/4dwvla_ext/ | FK keypoint + 历史 |
+| `vla_debug_logging.py` | RLmm/b/x/4dwvla_ext/ | 日志格式化 |
+| `modeling_internvla_a1_5.py` | 4WVLA/src/lerobot/ | InternVLA-A1.5 模型 |
+| `transform_internvla_a1_5.py` | 4WVLA/src/lerobot/ | Chat processor transform |
+| `transforms/core.py` | 4WVLA/src/lerobot/ | 通用 transform 原语 |
+| `configs/policies.py` | 4WVLA/src/lerobot/ | PreTrainedConfig 基类 |
+| `policies/factory.py` | 4WVLA/src/lerobot/ | Policy 工厂 |
+| `dataset_schemas/` | 4WVLA/src/lerobot/ | Schema 注册与查找 |
+| `keyboard_listener.py` | RLinf/rlinf/ | evdev 键盘监听 (复用) |
+| `franky_ext/motion_limits.py` | RLmm/b/x/franky_ext/ | 安全常数 (复用) |
+| `franky_ext/franka_libfranka_gripper.py` | RLmm/b/x/franky_ext/ | 夹爪控制 (复用) |
