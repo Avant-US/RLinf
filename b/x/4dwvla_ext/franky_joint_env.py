@@ -75,10 +75,20 @@ HOME_JOINTS = load_home_joints()
 # 600-step run that stalled sat at q7 = 0.4579, i.e. 0.026 rad below the bound
 # and squarely inside what a 0.05 margin permits, and it was the only joint out
 # of range. Restoring q7 alone recovered 78% of the action lead and flipped the
-# cosine to +0.756, more than any other joint. So q7 gets no margin at all.
-SAFETY_MARGIN_RAD = np.array([0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.0])
-ACTION_LIMIT_LOWER = np.maximum(TRAIN_ARM_MIN - SAFETY_MARGIN_RAD, JOINT_LIMITS_LOWER)
-ACTION_LIMIT_UPPER = np.minimum(TRAIN_ARM_MAX + SAFETY_MARGIN_RAD, JOINT_LIMITS_UPPER)
+# cosine to +0.756, more than any other joint. So q7 LOWER margin stays at 0.
+#
+# Asymmetric q7 margin (A2_1_6 finding): the model consistently requests
+# q7 ≈ 1.04-1.05 during insertion but gets clamped at 0.9807, causing
+# ~1 mm plug-tip misalignment and socket-entry failure. The UPPER bound
+# behaviour is different from the lower: the model is actively commanding
+# those values (not drifting), so allowing 0.08 rad above TRAIN_ARM_MAX
+# lets q7 reach 1.06 for insertion while the lower bound stays tight.
+# SAFETY_MARGIN_LOWER_RAD = np.array([0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.08])
+# SAFETY_MARGIN_UPPER_RAD = np.array([0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.08])
+SAFETY_MARGIN_LOWER_RAD = np.array([0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.08])
+SAFETY_MARGIN_UPPER_RAD = np.array([0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.1])
+ACTION_LIMIT_LOWER = np.maximum(TRAIN_ARM_MIN - SAFETY_MARGIN_LOWER_RAD, JOINT_LIMITS_LOWER)
+ACTION_LIMIT_UPPER = np.minimum(TRAIN_ARM_MAX + SAFETY_MARGIN_UPPER_RAD, JOINT_LIMITS_UPPER)
 MAX_JOINT_STEP_RAD = 0.15
 
 #: Clamping at the bound stops the inversion but leaves the policy on a weak

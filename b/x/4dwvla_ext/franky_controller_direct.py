@@ -379,7 +379,7 @@ class FrankyControllerDirect:
             return
         self._gripper.open(speed=0.05)
 
-    def close_gripper(self, force: float = 20.0):
+    def close_gripper(self, force: float = 40.0):
         """Calibrated-width grasp via FrankaLibfrankaGripper.
 
         Skip-if-holding, 6 s timeout, and 20 N hold force live in that class.
